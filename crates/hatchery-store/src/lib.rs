@@ -1,6 +1,6 @@
 //! Session storage: append-only item tree, branches, writer actor.
 //!
-//! Layer **L1** (docs/architecture.md §3). The daemon depends on the `SessionStore` trait only;
+//! Layer **L2** (docs/architecture.md §3). The daemon depends on the `SessionStore` trait only;
 //! the embedded SQL engine behind it is an implementation detail (ADR-0002), which keeps the
 //! escape hatch to a future remote server open.
 //!

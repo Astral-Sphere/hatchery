@@ -1,6 +1,6 @@
 //! Built-in agent tools.
 //!
-//! Layer **L2** (docs/architecture.md §3). Tools implement the `Tool` trait from
+//! Layer **L3** (docs/architecture.md §3). Tools implement the `Tool` trait from
 //! `hatchery-capabilities` and receive everything they may touch through `ToolCtx`.
 //!
 //! Invariant 4 is enforced at compile time here: direct `std::fs` / `std::process` use is a

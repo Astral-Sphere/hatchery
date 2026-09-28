@@ -1,6 +1,6 @@
 //! Runtime host: the single owner of agent runtimes and of the database write path.
 //!
-//! Layer **L3** (docs/architecture.md §3). The daemon discovers or spawns itself as a
+//! Layer **L4** (docs/architecture.md §3). The daemon discovers or spawns itself as a
 //! single instance per user, accepts JSON-RPC clients over UDS and stdio, assembles one runtime
 //! per session, and fans every event out through the live hub so that several frontends can watch
 //! the same session. Leases plus a monotonic generation number keep a stale runtime's late events

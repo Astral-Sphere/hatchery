@@ -1,6 +1,6 @@
 //! LLM provider adapters implementing the kernel's `LlmProvider` trait.
 //!
-//! Layer **L1** (docs/architecture.md §3), built solely on `openai-interface` (ADR-0007): this
+//! Layer **L2** (docs/architecture.md §3), built solely on `openai-interface` (ADR-0007): this
 //! crate is the only place where kernel messages are translated to and from wire types, and the
 //! only place that knows about provider quirks — reasoning field names, effort ladders,
 //! signature blocks.

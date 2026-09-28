@@ -1,9 +1,14 @@
 //! The workspace layering contract: `docs/architecture.md` §3 made machine-checkable.
 //!
-//! Dependencies must point strictly downwards (`L0` → `L1` → `L2` → `L3` → frontends), never
-//! sideways between crates of the same layer and never upwards, and the graph must be acyclic.
-//! Dev-only crates sit above everything and may depend on any product crate, but no product crate
-//! may take a dev crate as a normal dependency — that would ship test code.
+//! Dependencies must point strictly downwards (`L0` → `L1` → `L2` → `L3` → `L4` → frontends),
+//! never sideways between crates of the same layer and never upwards, and the graph must be
+//! acyclic. Dev-only crates sit above everything and may depend on any product crate, but no
+//! product crate may take a dev crate as a normal dependency — that would ship test code.
+//!
+//! `hatchery-protocol` sits at the bottom because its vocabulary (ids, `Content`, `ToolOutput`,
+//! `ApprovalRequest`, `Usage`) is shared: the kernel needs those types too, and a sideways `L0`
+//! edge would be a cycle waiting to happen. The "kernel must not see `capabilities`" rule from
+//! ADR-0004 is unaffected — that edge points *upwards* and stays forbidden.
 //!
 //! Runs as `cargo xtask layering` and as an integration test on every `cargo nextest run`.
 
@@ -19,13 +24,13 @@ use serde::Deserialize;
 /// fails when a workspace member is missing from this table or a listed crate is not a member.
 pub const LAYERS: &[(&str, Layer)] = &[
     ("hatchery-protocol", Layer::L0),
-    ("hatchery-kernel", Layer::L0),
-    ("hatchery-llm", Layer::L1),
-    ("hatchery-store", Layer::L1),
-    ("hatchery-capabilities", Layer::L1),
-    ("hatchery-tools", Layer::L2),
-    ("hatchery-acp", Layer::L2),
-    ("hatchery-daemon", Layer::L3),
+    ("hatchery-kernel", Layer::L1),
+    ("hatchery-llm", Layer::L2),
+    ("hatchery-store", Layer::L2),
+    ("hatchery-capabilities", Layer::L2),
+    ("hatchery-tools", Layer::L3),
+    ("hatchery-acp", Layer::L3),
+    ("hatchery-daemon", Layer::L4),
     ("hatchery-cli", Layer::Frontend),
     ("hatchery-gui", Layer::Frontend),
     ("hatchery-testkit", Layer::Dev),
@@ -35,14 +40,16 @@ pub const LAYERS: &[(&str, Layer)] = &[
 /// Position in the dependency order. Higher may depend on lower, never the reverse.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Layer {
-    /// Wire types and the neutral agent loop.
+    /// The shared vocabulary: wire types, ids, content, tool and approval value types.
     L0,
-    /// Provider adapters, storage, capability seam.
+    /// The neutral agent loop: turn state machine plus its injected traits.
     L1,
-    /// Tools and ACP.
+    /// Provider adapters, storage, capability seam.
     L2,
-    /// Runtime host.
+    /// Tools and ACP.
     L3,
+    /// Runtime host.
+    L4,
     /// CLI and GTK frontends.
     Frontend,
     /// Dev-only crates (`hatchery-testkit`, `xtask`): exempt from the downward rule.
@@ -70,6 +77,7 @@ impl fmt::Display for Layer {
             Self::L1 => "L1",
             Self::L2 => "L2",
             Self::L3 => "L3",
+            Self::L4 => "L4",
             Self::Frontend => "frontend",
             Self::Dev => "dev",
         };

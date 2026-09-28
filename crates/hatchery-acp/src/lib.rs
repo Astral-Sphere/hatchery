@@ -1,6 +1,6 @@
 //! Agent Client Protocol server and client (docs/design/acp.md).
 //!
-//! Layer **L2** (docs/architecture.md §3). As a *server*, each ACP connection maps onto one
+//! Layer **L3** (docs/architecture.md §3). As a *server*, each ACP connection maps onto one
 //! daemon runtime session, and the client's advertised capabilities decide which backends the
 //! session binds: host-delegated `AcpClientFs` / `AcpClientTerminal` / `AcpPermission`, or the
 //! local ones as fallback. As a *client*, hatchery spawns external harnesses and drives them as
