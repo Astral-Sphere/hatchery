@@ -1,0 +1,31 @@
+[package]
+name = "hatchery-store"
+description = "Session storage: append-only item tree, edit-as-fork branches and a single writer actor"
+keywords = ["agent", "storage", "database", "sqlite", "hatchery"]
+categories = ["database"]
+readme = "README.md"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+hatchery-protocol.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+hatchery-testkit.workspace = true
+insta.workspace = true
+proptest.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true

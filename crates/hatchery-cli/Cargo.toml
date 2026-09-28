@@ -1,0 +1,32 @@
+[package]
+name = "hatchery-cli"
+description = "Terminal frontend: ratatui TUI and headless exec, both as thin protocol clients"
+keywords = ["agent", "cli", "tui", "hatchery"]
+categories = ["command-line-utilities"]
+readme = "README.md"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+
+[lib]
+name = "hatchery_cli"
+path = "src/lib.rs"
+
+[[bin]]
+name = "hatchery"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+hatchery-protocol.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+hatchery-testkit.workspace = true
+insta.workspace = true
+
+[lints]
+workspace = true

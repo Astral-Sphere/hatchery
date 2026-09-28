@@ -1,0 +1,39 @@
+[package]
+name = "hatchery-daemon"
+description = "Runtime host: session manager, UDS/stdio listeners, live hub and profile-based assembly"
+keywords = ["agent", "daemon", "runtime", "hatchery"]
+categories = ["asynchronous"]
+readme = "README.md"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+hatchery-acp.workspace = true
+hatchery-capabilities.workspace = true
+hatchery-kernel.workspace = true
+hatchery-llm.workspace = true
+hatchery-protocol.workspace = true
+hatchery-store.workspace = true
+hatchery-tools.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+hatchery-testkit.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true

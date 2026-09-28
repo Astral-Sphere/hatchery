@@ -1,6 +1,54 @@
 [workspace]
 resolver = "3"
-edition = "2024"
-members = []
+members = ["crates/*", "xtask"]
 
-[dependencies]
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+license = "GPL-3.0-only"
+repository = "https://github.com/Astral-Sphere/hatchery"
+homepage = "https://github.com/Astral-Sphere/hatchery#readme"
+authors = ["Hatchery contributors"]
+
+[workspace.dependencies]
+hatchery-protocol = { path = "crates/hatchery-protocol", version = "0.0.0" }
+hatchery-kernel = { path = "crates/hatchery-kernel", version = "0.0.0" }
+hatchery-llm = { path = "crates/hatchery-llm", version = "0.0.0" }
+hatchery-store = { path = "crates/hatchery-store", version = "0.0.0" }
+hatchery-capabilities = { path = "crates/hatchery-capabilities", version = "0.0.0" }
+hatchery-tools = { path = "crates/hatchery-tools", version = "0.0.0" }
+hatchery-acp = { path = "crates/hatchery-acp", version = "0.0.0" }
+hatchery-daemon = { path = "crates/hatchery-daemon", version = "0.0.0" }
+hatchery-cli = { path = "crates/hatchery-cli", version = "0.0.0" }
+hatchery-gui = { path = "crates/hatchery-gui", version = "0.0.0" }
+hatchery-testkit = { path = "crates/hatchery-testkit", version = "0.0.0" }
+
+anyhow = "1.0.104"
+async-trait = "0.1.92"
+futures = "0.3.34"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+thiserror = "2.0.21"
+tokio = { version = "1.53.1", features = ["macros", "rt", "rt-multi-thread", "sync", "time"] }
+tokio-util = "0.7.19"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+uuid = { version = "1.26.1", features = ["v7", "serde"] }
+
+insta = { version = "1.48.0", features = ["json"] }
+proptest = "1.11.0"
+tempfile = "3.27.0"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+dbg_macro = "warn"
+todo = "warn"
+# clippy.toml's disallowed lists are workspace-wide, but only tool implementations must go
+# through the capability seam (invariant 4, ADR-0004). daemon, store, capabilities and xtask touch
+# the OS legitimately, and hatchery-acp spawns external agent processes, so the lint is allowed
+# here and denied by a crate attribute in hatchery-tools only.
+disallowed_methods = "allow"
+disallowed_types = "allow"
