@@ -33,6 +33,10 @@ tokio = { version = "1.53.1", features = ["macros", "rt", "rt-multi-thread", "sy
 tokio-util = "0.7.19"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+# default-features off: drops mimalloc (system allocator is fine) and fts (tantivy is a heavy
+# dependency we do not use). Turso is the spike's leading candidate — see the engine gate tests in
+# crates/hatchery-store/tests/spike_engine.rs before relying on it.
+turso = { version = "0.7.2", default-features = false }
 uuid = { version = "1.26.1", features = ["v7", "serde"] }
 
 insta = { version = "1.48.0", features = ["json"] }

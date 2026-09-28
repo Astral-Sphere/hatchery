@@ -42,12 +42,12 @@
                         │  │  └─────────┘  └─────────┘   │  │   client (subagent) 由
                         │  └─────────────────────────────┘  │   runtime 作为工具驱动
                         │  ┌─────────────────────────────┐  │
-                        │  │ Store: writer actor(libSQL) │  │
+                        │  │ Store: writer actor(turso)  │  │
                         │  └─────────────────────────────┘  │
                         └───────────────────────────────────┘
 ```
 
-- **单 daemon 单写者**：每个用户一个 daemon 实例（attach-or-spawn），全系统只有 daemon 一个进程写数据库，规避 libSQL 跨进程写竞争（ADR-0002）。
+- **单 daemon 单写者**：每个用户一个 daemon 实例（attach-or-spawn），全系统只有 daemon 一个进程写数据库，规避跨进程写竞争（ADR-0002；引擎选型见 ADR-0010）。
 - **前端是瘦客户端**：CLI TUI、GTK、headless exec 都通过 `hatchery-protocol` 定义的 JSON-RPC 协议与 daemon 通信，不内嵌 agent runtime（ADR-0001）。会话生命周期独立于任何前端：关掉终端，任务继续跑。
 - **CLI 的启动路径**：`hatchery` 命令先探测 UDS；daemon 不在则 spawn 一个（daemonize），再 attach。也支持 `--embedded` 在同进程内起 daemon（测试与单机简化场景）。
 - **ACP server** 是 daemon 内的一个适配层：每个 ACP 连接映射到一个 runtime 会话；stdio 传输。`hatchery acp` 子命令可独立以 stdio 方式起一个单连接进程（宿主直接 spawn 的场景）。
@@ -60,7 +60,7 @@
 L0  hatchery-protocol      wire 类型：Thread/Turn/Item、JSON-RPC 方法与事件、代际号
     hatchery-kernel        中立 agent 循环：Turn 状态机、LlmProvider trait、StreamEvent
 L1  hatchery-llm           openai-interface 之上的 provider adapter（实现 kernel 的 trait）
-    hatchery-store         SessionStore trait + libSQL 实现（分支模型、writer actor）
+    hatchery-store         SessionStore trait + turso 实现（分支模型、writer actor）
     hatchery-capabilities  capability seam：FsBackend / TerminalBackend / ApprovalGate、
                            影子 Git 检查点、工具注册表框架
 L2  hatchery-tools         内置工具（read/write/edit/glob/grep/shell/web_fetch/MCP client）
@@ -142,7 +142,7 @@ dev hatchery-testkit       测试基建：fake 后端 / ScriptedProvider / TestD
 ```
 ~/.config/hatchery/config.toml        # 用户配置（见 design/platform.md）
 ~/.config/hatchery/prompts/           # 用户 prompt 覆盖
-~/.local/share/hatchery/hatchery.db   # libSQL 主数据库
+~/.local/share/hatchery/hatchery.db   # turso 主数据库（ADR-0010）
 ~/.local/share/hatchery/checkpoints/<workspace-hash>/  # 影子 Git 仓库
 ~/.local/state/hatchery/daemon/       # UDS socket、daemon 锁与端口文件
 <project>/.hatchery/config.toml       # 项目级配置

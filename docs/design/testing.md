@@ -5,7 +5,7 @@
 ## 0. 测试纪律（全项目强制）
 
 1. **不变量必测**：architecture.md §5 的 6 条核心不变量，每条至少一个专属集成测试（§5 给出映射表）；CI 中归入 `invariants` 分组，永不 skip。
-2. **实测优先**：涉及第三方行为的断言（libSQL WAL/触发器、git CLI 边界、provider SSE 怪癖、ACP 宿主行为）必须来自真实执行或真实录制 fixture，禁止按文档/记忆推断后直接写死预期。spike 结论（worklog 各方向）沉淀为回归测试。
+2. **实测优先**：涉及第三方行为的断言（SQL 引擎的 WAL/触发器/pragma、git CLI 边界、provider SSE 怪癖、ACP 宿主行为）必须来自真实执行或真实录制 fixture，禁止按文档/记忆推断后直接写死预期。**上游文档本身也会过时**——M0a 实测：turso 的 COMPAT.md 称 `synchronous` 只支持 OFF/FULL，实际 NORMAL 可用。spike 结论（worklog 各方向）沉淀为回归测试。
 3. **Bug 修复必附回归测试**：先写复现测试（红），再修（绿）；worklog 条目引用测试名。
 4. **文档示例可运行**：公共 API 的 rustdoc 示例必须是 doctest 且进 CI；不可运行的示例不写「ignore」了事——要么改成可运行，要么改成 `text` 代码块并说明原因。
 5. **测试不碰真实用户环境**：一切文件/进程/数据库操作在 tempdir、内存或专用 fixture 工作区内；网络默认禁止，live 测试单独标记（§8）。
@@ -25,9 +25,14 @@
 组织与命名约定：
 
 - 单元测试：crate 内 `#[cfg(test)]`，文件名 `测试对象::行为::预期`（如 `edit_fork_on_tool_result_starts_new_turn`）。
-- 集成测试：各 crate `tests/`；跨 crate e2e 与不变量套件在 workspace 顶层 `tests/`（独立 test crate，dev-depend 全家）。
+- 集成测试：各 crate `tests/`。跨 crate 的 e2e 与不变量套件放独立成员 crate `hatchery-tests`（dev-depend 全家）——workspace 根是虚拟 manifest，不能有顶层 `tests/`；该 crate 在 M1 第一条 e2e 落地时才建（反预拆分刹车：M0 的不变量测试都能待在 store/capabilities 自己的 `tests/` 里）。
 - runner：**cargo-nextest**（分组、重试标记、JUnit 输出）；快照断言：**insta**（golden file，`INSTA_UPDATE=always` 审阅流）；属性测试：**proptest**。
-- 标记：`#[live]`（真实网络，需 secrets）、`#[slow]`（>5s）、`#[gui]`（需显示环境）。PR CI 只跑默认组；live/slow/gui 进 nightly 或手动。
+- 分组：Rust 无法按属性过滤测试，所以用**命名前缀** + `.config/nextest.toml` 的 `default-filter` 实现（原设计的 `#[live]` 属性标记不可行）：
+  - `live_*` 真实网络/需 secrets，另外再用 `live-tests` cargo feature 双保险（默认不编译）；
+  - `slow_*` >5s；`gui_*` 需显示环境；
+  - `invariant_*` 核心不变量套件（§5），**始终在默认组里跑**，永不 skip。
+  - 默认组过滤掉 live/slow/gui；PR CI 跑默认组，其余进 nightly 或手动。
+  - 实测（nextest 0.9.146）：profile 匹配不到任何测试时 `--no-tests` 默认 `auto → fail`（退出码 4），所以 nightly 跑空的 slow/gui 组必须显式传 `--no-tests=warn`。
 
 ## 2. 测试基建：hatchery-testkit（dev-only crate）
 
@@ -94,9 +99,10 @@ pub fn assert_golden(value: impl Debug);      // insta 封装，统一快照命�
 
 风险：分支树 SQL 错误、并发丢失、崩溃损坏——数据层错误最不可原谅，测试最重。
 
-- **属性测试（核心投入）**：随机操作序列（append/edit_fork/switch/delete_branch/compaction）作用于 libSQL 实现与纯 `Vec`/树参考模型，每步后断言 `rebuild_history(active_head)` 与参考模型一致。参考模型是显式写出的第二实现（不复用生产代码）。
-- 级联删除：`delete_branch_cascades_items_and_checkpoints`、`delete_branch_refuses_when_active_head_inside`、共享祖先不被误删。
-- append-only：`items_update_trigger_aborts`（直接发 UPDATE 断言 RAISE）。
+- **引擎门槛（M0a 已落地）**：`crates/hatchery-store/tests/spike_engine.rs` 12 项，锁定 turso 0.7.2 的真实行为——append-only 触发器、外键级联、WAL 下写事务与并发读、`user_version`、写入延迟、`WITH RECURSIVE` 缺失（tripwire 常量，上游补上就主动失败）。引擎升级必须重跑（ADR-0010）。
+- **属性测试（核心投入）**：随机操作序列（append/edit_fork/switch/delete_branch/compaction）作用于 turso 实现与纯 `Vec`/树参考模型，每步后断言 `rebuild_history(active_head)` 与参考模型一致。参考模型是显式写出的第二实现（不复用生产代码），放 testkit。
+- 级联删除：`delete_branch_cascades_items_and_checkpoints`、`delete_branch_refuses_when_active_head_inside`（引擎级兜底已于 M0a 实测：`sessions.active_head` 的外键会拒绝该删除）、共享祖先不被误删。
+- append-only：`invariant_items_update_trigger_aborts`（引擎级已于 M0a 实测通过；store 层还要断言 `SessionStore` API 根本没有 update item 的入口）。
 - 并发：N reader + writer actor 压测（1k items）无 busy 错误、顺序保证；背压（channel 满时 await 而非丢弃）。
 - **崩溃测试**：spawn 真实子进程写库，`kill -9`，重启断言「已提交 item 全在、至多丢当前 item、WAL 自动恢复」；每种 StoreCmd 各一次。
 - 迁移：v(N-1) 库文件 fixture → 自动迁移 → schema 断言。
@@ -175,14 +181,16 @@ GUI 是测试最薄弱层，策略 = 「逻辑出 GTK，GTK 只做投影」+ 分
 
 ## 5. 不变量 → 测试映射（CI `invariants` 分组）
 
+测试名一律带 `invariant_` 前缀，nextest 的 `invariants` profile 就是靠这个前缀选出来的（§1）。
+
 | 不变量（architecture.md §5） | 专属测试 |
 |---|---|
-| 1 单一 runtime 所有者 | `stale_runtime_events_are_dropped`、`session_lease_blocks_second_runtime`、单实例竞态 |
+| 1 单一 runtime 所有者 | `invariant_stale_runtime_events_are_dropped`、`invariant_session_lease_blocks_second_runtime`、单实例竞态 |
 | 2 模型可见=已记录 | e2e 每场景收尾断言「重建上下文 == MockWire 实际收到的请求体」（逐 turn） |
-| 3 items append-only | `items_update_trigger_aborts`、store 属性测试 |
-| 4 工具只经接缝 | clippy `disallowed_methods`（编译期）+ 工具单测只注入 Memory 后端（运行期证明） |
-| 5 安全门不可覆盖 | `project_config_cannot_disable_hard_gates` + prompts 覆盖正反用例 |
-| 6 影子 Git 不碰用户仓库 | `shadow_git_never_touches_user_repo` |
+| 3 items append-only | `invariant_items_update_trigger_aborts`（**引擎级已于 M0a 实测通过**，store 层再断言 API 无 update 入口）、store 属性测试 |
+| 4 工具只经接缝 | clippy `disallowed_methods`（编译期；**实测**：workspace 级 allow + `hatchery-tools` crate 属性 deny，违规确实报错）+ 工具单测只注入 Memory 后端（运行期证明） |
+| 5 安全门不可覆盖 | `invariant_project_config_cannot_disable_hard_gates` + prompts 覆盖正反用例 |
+| 6 影子 Git 不碰用户仓库 | `invariant_shadow_git_never_touches_user_repo` |
 
 不变量 2 的实现方式值得单列：TestDaemon 里 MockWire 记录**实际发出的请求体字节**，测试收尾从 store rebuild 上下文并序列化，两者必须逐字节一致——这一条测试同时锁死了组装、存储、回放三层。
 
