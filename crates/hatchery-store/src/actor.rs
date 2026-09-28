@@ -38,6 +38,10 @@ const PAYLOAD_CHUNK: usize = 200;
 /// A reply slot.
 pub type Reply<T> = oneshot::Sender<Result<T, StoreError>>;
 
+/// One consistent read of everything a whole-tree export needs: every item oldest-first, and
+/// each item's descendant tips.
+pub type ExportSnapshot = (Vec<Item>, HashMap<ItemId, Vec<ItemId>>);
+
 /// A session's whole tree: positions, plus which items are on the active branch.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BranchTree {
@@ -187,19 +191,17 @@ pub enum StoreCmd {
         /// Done.
         reply: Reply<()>,
     },
-    /// Every item of a session, oldest first, for a whole-tree export.
-    AllItems {
-        /// Which session.
+    /// Everything a whole-tree export needs, read in one pass: every item oldest-first, and
+    /// each item's descendant tips.
+    ///
+    /// One command rather than two (`AllItems` + `Tips`) so the export cannot describe two
+    /// different snapshots of a session that is being written while it runs — an audit artifact
+    /// whose `branches` annotations contradict its own item rows is worse than no artifact.
+    ExportBody {
+        /// Which session. Refused with `SessionNotFound` when it does not exist.
         session: SessionId,
-        /// The items.
-        reply: Reply<Vec<Item>>,
-    },
-    /// Every item's descendant tips, for a whole-tree export.
-    Tips {
-        /// Which session.
-        session: SessionId,
-        /// Item id to the tips of the branches it is an ancestor of.
-        reply: Reply<HashMap<ItemId, Vec<ItemId>>>,
+        /// The items and the tips map.
+        reply: Reply<ExportSnapshot>,
     },
     /// Flush and stop.
     Shutdown {
@@ -311,11 +313,8 @@ impl Writer {
                 } => {
                     reply_send(reply, self.finish_turn(session, turn, completion).await);
                 }
-                StoreCmd::AllItems { session, reply } => {
-                    reply_send(reply, self.all_items(session).await);
-                }
-                StoreCmd::Tips { session, reply } => {
-                    reply_send(reply, self.tips(session).await);
+                StoreCmd::ExportBody { session, reply } => {
+                    reply_send(reply, self.export_body(session).await);
                 }
                 StoreCmd::Shutdown { reply } => {
                     reply_send(reply, Ok(()));
@@ -368,12 +367,18 @@ impl Writer {
             .query(sql, [session.to_string()])
             .await
             .map_err(StoreError::database)?;
-        let found = match rows.next().await.map_err(StoreError::database)? {
-            Some(row) => Some(sql::read_session(&row, 0)?),
-            None => None,
-        };
+        // The parse result is carried out of the match so the drain runs on every path: an
+        // early `?` inside the arm would drop the statement with rows still pending, the shape
+        // `sql::collect` exists to prevent.
+        let found = rows
+            .next()
+            .await
+            .map_err(StoreError::database)?
+            .map(|row| sql::read_session(&row, 0));
         sql::drain(rows).await?;
-        found.ok_or(StoreError::SessionNotFound(session))
+        found
+            .transpose()?
+            .ok_or(StoreError::SessionNotFound(session))
     }
 
     async fn update_session(
@@ -382,6 +387,12 @@ impl Writer {
         patch: SessionPatch,
     ) -> Result<Session, StoreError> {
         let mut current = self.session(session).await?;
+        // The patch type promises this — `SessionPatch::is_empty` documents "the store skips the
+        // write". Honouring it keeps a no-op patch from bumping `updated_at`, which would
+        // reorder the session in every newest-first list for no reason.
+        if patch.is_empty() {
+            return Ok(current);
+        }
         if let Some(title) = patch.title {
             current.title = title;
         }
@@ -470,15 +481,12 @@ impl Writer {
         sql.push_str(" ORDER BY updated_at DESC, id ASC");
         sql.push_str(&format!(" LIMIT {}", limit + 1));
 
-        let mut rows = self
+        let rows = self
             .conn
             .query(sql, params_from_iter(args))
             .await
             .map_err(StoreError::database)?;
-        let mut sessions = Vec::new();
-        while let Some(row) = rows.next().await.map_err(StoreError::database)? {
-            sessions.push(sql::read_session(&row, 0)?);
-        }
+        let mut sessions = sql::collect(rows, |row| sql::read_session(row, 0)).await?;
 
         let next_cursor = if sessions.len() > limit as usize {
             sessions.pop();
@@ -591,12 +599,14 @@ impl Writer {
             .query(sql, [item.to_string()])
             .await
             .map_err(StoreError::database)?;
-        let found = match rows.next().await.map_err(StoreError::database)? {
-            Some(row) => Some(sql::read_item(&row, 0)?),
-            None => None,
-        };
+        // Parse result carried out of the match, drain on every path — see `session`.
+        let found = rows
+            .next()
+            .await
+            .map_err(StoreError::database)?
+            .map(|row| sql::read_item(&row, 0));
         sql::drain(rows).await?;
-        let found = found.ok_or(StoreError::ItemNotFound(item))?;
+        let found = found.transpose()?.ok_or(StoreError::ItemNotFound(item))?;
         if found.session != session {
             return Err(StoreError::SessionMismatch { item, session });
         }
@@ -608,11 +618,26 @@ impl Writer {
         session: SessionId,
         head: Option<ItemId>,
     ) -> Result<Vec<Item>, StoreError> {
-        let skeleton = self.skeleton(session).await?;
         let head = match head {
-            Some(head) => Some(head),
+            Some(head) => {
+                // Validate ownership BEFORE the walk: the skeleton is filtered by session, so a
+                // foreign or unknown head would surface as `MissingHead` and be misreported as a
+                // corrupt tree. A caller naming the wrong item is the caller's mistake, not the
+                // database's — `switch_branch` and `delete_branch` already classify it this way.
+                match self.item_session(head).await? {
+                    None => return Err(StoreError::ItemNotFound(head)),
+                    Some(owner) if owner == session => Some(head),
+                    Some(_) => {
+                        return Err(StoreError::SessionMismatch {
+                            item: head,
+                            session,
+                        });
+                    }
+                }
+            }
             None => self.session(session).await?.active_branch_head,
         };
+        let skeleton = self.skeleton(session).await?;
         let ids = tree::chain(&skeleton, head).map_err(|error| self.tree_error(error))?;
 
         let mut items = Vec::with_capacity(ids.len());
@@ -623,14 +648,12 @@ impl Writer {
                 .join(", ");
             let sql = format!("SELECT {ITEM_COLUMNS} FROM items WHERE id IN ({placeholders})");
             let params = params_from_iter(chunk.iter().map(ToString::to_string));
-            let mut rows = self
+            let rows = self
                 .conn
                 .query(sql, params)
                 .await
                 .map_err(StoreError::database)?;
-            while let Some(row) = rows.next().await.map_err(StoreError::database)? {
-                items.push(sql::read_item(&row, 0)?);
-            }
+            items.extend(sql::collect(rows, |row| sql::read_item(row, 0)).await?);
         }
 
         // The rows come back in whatever order the engine chose; the chain's order is the point.
@@ -646,21 +669,21 @@ impl Writer {
             "SELECT {SKELETON_COLUMNS}, created_at FROM items WHERE session_id = ?1 \
              ORDER BY created_at ASC, id ASC"
         );
-        let mut rows = self
+        let rows = self
             .conn
             .query(sql, [session.to_string()])
             .await
             .map_err(StoreError::database)?;
-        let mut nodes = Vec::new();
-        while let Some(row) = rows.next().await.map_err(StoreError::database)? {
-            nodes.push(BranchNode {
-                row: sql::read_skeleton(&row)?,
+        let mut nodes = sql::collect(rows, |row| {
+            Ok(BranchNode {
+                row: sql::read_skeleton(row)?,
                 created_at: Timestamp::from_unix_millis(
                     as_int(&row.get_value(4).map_err(StoreError::database)?).unwrap_or_default(),
                 ),
                 active: false,
-            });
-        }
+            })
+        })
+        .await?;
 
         let session_row = self.session(session).await?;
         let head = session_row.active_branch_head;
@@ -719,7 +742,6 @@ impl Writer {
     }
 
     async fn delete_branch(&self, session: SessionId, head: ItemId) -> Result<u64, StoreError> {
-        let before = self.count(session, "items").await?;
         match self.item_session(head).await? {
             None => return Err(StoreError::ItemNotFound(head)),
             Some(owner) if owner == session => {}
@@ -743,8 +765,12 @@ impl Writer {
             .unchecked_transaction()
             .await
             .map_err(StoreError::database)?;
-        // The cascade walks parent_id for us; the walk above exists to know what it will do and to
-        // refuse a dangling head before the database has to.
+        // The cascade walks parent_id for us; the walk above exists to know what it will do and
+        // to refuse a dangling head before the database has to. Both counts are taken INSIDE the
+        // transaction so the cross-check runs before the commit: a disagreement means one of the
+        // two walks is wrong, and the answer is to keep the database as it was, not to report a
+        // count that no longer describes it after an irreversible delete.
+        let before = self.count(session, "items").await?;
         tx.execute("DELETE FROM items WHERE id = ?1", [head.to_string()])
             .await
             .map_err(StoreError::database)?;
@@ -754,18 +780,17 @@ impl Writer {
         )
         .await
         .map_err(StoreError::database)?;
-        tx.commit().await.map_err(StoreError::database)?;
-
         let after = self.count(session, "items").await?;
         let removed = before - after;
         if removed != doomed.len() as i64 {
-            // Our walk and the engine's cascade disagree, which means one of them is wrong. Say so
-            // instead of reporting a count that does not describe the database.
+            // Dropping `tx` uncommitted is the rollback.
             return Err(StoreError::Database(format!(
-                "the cascade removed {removed} items but the tree walk expected {}",
+                "the cascade removed {removed} items but the tree walk expected {}; \
+                 the delete was rolled back",
                 doomed.len()
             )));
         }
+        tx.commit().await.map_err(StoreError::database)?;
         Ok(removed as u64)
     }
 
@@ -830,16 +855,12 @@ impl Writer {
 
     async fn skeleton(&self, session: SessionId) -> Result<Vec<SkeletonRow>, StoreError> {
         let sql = format!("SELECT {SKELETON_COLUMNS} FROM items WHERE session_id = ?1");
-        let mut rows = self
+        let rows = self
             .conn
             .query(sql, [session.to_string()])
             .await
             .map_err(StoreError::database)?;
-        let mut skeleton = Vec::new();
-        while let Some(row) = rows.next().await.map_err(StoreError::database)? {
-            skeleton.push(sql::read_skeleton(&row)?);
-        }
-        Ok(skeleton)
+        sql::collect(rows, sql::read_skeleton).await
     }
 
     /// Every item of a session, oldest first, for a whole-tree export.
@@ -847,22 +868,30 @@ impl Writer {
         let sql = format!(
             "SELECT {ITEM_COLUMNS} FROM items WHERE session_id = ?1 ORDER BY created_at ASC, id ASC"
         );
-        let mut rows = self
+        let rows = self
             .conn
             .query(sql, [session.to_string()])
             .await
             .map_err(StoreError::database)?;
-        let mut items = Vec::new();
-        while let Some(row) = rows.next().await.map_err(StoreError::database)? {
-            items.push(sql::read_item(&row, 0)?);
-        }
-        Ok(items)
+        sql::collect(rows, |row| sql::read_item(row, 0)).await
     }
 
     /// Every item's descendant tips, for a whole-tree export.
     async fn tips(&self, session: SessionId) -> Result<HashMap<ItemId, Vec<ItemId>>, StoreError> {
         let skeleton = self.skeleton(session).await?;
         tree::tips_map(&skeleton).map_err(|error| self.tree_error(error))
+    }
+
+    /// The items and tips for a whole-tree export, read in one pass.
+    ///
+    /// Validates the session first: an all-branches export of a session that does not exist must
+    /// fail the way the active-branch export does, not silently produce an empty file that a
+    /// retry with the correct id is then refused from overwriting.
+    async fn export_body(&self, session: SessionId) -> Result<ExportSnapshot, StoreError> {
+        self.session(session).await?;
+        let items = self.all_items(session).await?;
+        let tips = self.tips(session).await?;
+        Ok((items, tips))
     }
 
     async fn item_session(&self, item: ItemId) -> Result<Option<SessionId>, StoreError> {

@@ -263,32 +263,65 @@ async fn kill_and_reopen(spec: &str) -> Recovered {
     let mut guard = ChildGuard { child };
 
     let stdout = guard.child.stdout.take().expect("stdout is piped");
-    let mut reader = BufReader::new(stdout);
+    // The reader lives on its own thread. `read_line` blocks, so a deadline checked only between
+    // reads could never fire while the child hangs *before* printing: the parent would park
+    // indefinitely and stall the whole run instead of failing at `READY_TIMEOUT` with a
+    // diagnosis. `recv_timeout` is the only wait here that a deadline can actually interrupt.
+    let (lines, received) = std::sync::mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) => break,
+                Ok(_) => {
+                    if lines.send(line.clone()).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
     let deadline = Instant::now() + READY_TIMEOUT;
-    let mut report = None;
-    let mut line = String::new();
-    while Instant::now() < deadline {
-        line.clear();
-        match reader.read_line(&mut line) {
-            Ok(0) => break,
-            Ok(_) => {
+    let mut seen = Vec::new();
+    let report = loop {
+        let wait = deadline.saturating_duration_since(Instant::now());
+        match received.recv_timeout(wait) {
+            Ok(line) => {
                 if let Some(json) = line.trim().strip_prefix("ready ") {
-                    report = Some(
-                        serde_json::from_str::<ProbeReport>(json)
-                            .unwrap_or_else(|error| panic!("unreadable report {json:?}: {error}")),
-                    );
-                    break;
+                    break serde_json::from_str::<ProbeReport>(json)
+                        .unwrap_or_else(|error| panic!("unreadable report {json:?}: {error}"));
                 }
                 // Anything else the child printed, e.g. libtest's own output.
+                seen.push(line.trim().to_owned());
             }
-            Err(error) => panic!("reading the child's stdout failed: {error}"),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                let _ = guard.child.kill();
+                let _ = guard.child.wait();
+                panic!(
+                    "the probe child never reported ready within {READY_TIMEOUT:?}; \
+                     its output so far: {seen:?}"
+                );
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                // stdout closed: the child is gone. Say how it went, which the old EOF path
+                // could not — "never reported ready" read like a hang even for a dead child.
+                let status = guard.child.wait();
+                panic!(
+                    "the probe child exited before reporting ready (wait: {status:?}); \
+                     its output: {seen:?}"
+                );
+            }
         }
-    }
-    let report = report
-        .unwrap_or_else(|| panic!("the probe child never reported ready within {READY_TIMEOUT:?}"));
+    };
 
-    // The kill is the experiment: no destructor, no shutdown, no checkpoint.
-    guard.child.kill().expect("kill the child");
+    // The kill is the experiment: no destructor, no shutdown, no checkpoint. A failure to kill
+    // is not a failure of the experiment — a child that died on its own right after reporting
+    // ready still crashed, and the assertions below are what the test is for.
+    let _ = guard.child.kill();
     let status = guard.child.wait().expect("reap the child");
     assert!(
         !status.success(),

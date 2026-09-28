@@ -66,12 +66,27 @@ pub fn render(lines: &[ExportLine<'_>]) -> Result<String, StoreError> {
 /// # Errors
 ///
 /// [`StoreError::ExportExists`] when the target is already there — an audit export must never
-/// silently replace an earlier one.
+/// silently replace an earlier one. The refusal is `create_new` (O_CREAT|O_EXCL), which is
+/// atomic: an `exists()` check followed by a write is a TOCTOU race, and this write runs outside
+/// the writer actor, so two concurrent exports of the same session are possible.
 pub fn write(path: &Path, body: &str) -> Result<u64, StoreError> {
-    if path.exists() {
-        return Err(StoreError::ExportExists(path.to_path_buf()));
+    use std::fs::OpenOptions;
+    use std::io::{ErrorKind, Write};
+
+    let mut file = match OpenOptions::new().write(true).create_new(true).open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+            return Err(StoreError::ExportExists(path.to_path_buf()));
+        }
+        Err(error) => return Err(StoreError::database(error)),
+    };
+    if let Err(error) = file.write_all(body.as_bytes()) {
+        // Take the half-written file back out: leaving it would refuse the retry (`create_new`
+        // now sees it) and leave the operator guessing which artifact is the broken one.
+        drop(file);
+        let _ = std::fs::remove_file(path);
+        return Err(StoreError::database(error));
     }
-    std::fs::write(path, body).map_err(StoreError::database)?;
     Ok(body.lines().count() as u64)
 }
 

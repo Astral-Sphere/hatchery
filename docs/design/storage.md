@@ -46,7 +46,7 @@ pub trait SessionStore: Send + Sync {
 ```rust
 pub enum StoreCmd { /* CreateSession, Session, UpdateSession, ListSessions, DeleteSession,
                        AppendItem, AppendItems, Item, RebuildChain, BranchTree, EditFork,
-                       SwitchBranch, DeleteBranch, StartTurn, FinishTurn, AllItems, Tips, Shutdown */ }
+                       SwitchBranch, DeleteBranch, StartTurn, FinishTurn, ExportBody, Shutdown */ }
 pub type Reply<T> = oneshot::Sender<Result<T, StoreError>>;
 ```
 

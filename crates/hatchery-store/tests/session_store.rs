@@ -97,6 +97,20 @@ async fn open_directly(path: &std::path::Path) -> turso::Connection {
     database.connect().expect("connect")
 }
 
+/// Waits until the millisecond clock advances.
+///
+/// `Timestamp::now()` is millisecond-resolution and `list_sessions` orders by
+/// `updated_at DESC, id ASC`. Three in-process round trips can land in the same millisecond,
+/// and then the tiebreak — a UUIDv7's random tail — decides the order a test is trying to
+/// assert. Advancing the clock between writes makes recency assertions deterministic instead of
+/// usually-right.
+async fn next_millisecond() {
+    let now = Timestamp::now();
+    while Timestamp::now() == now {
+        tokio::task::yield_now().await;
+    }
+}
+
 // ---------------------------------------------------------------- sessions
 
 #[tokio::test]
@@ -161,6 +175,21 @@ async fn update_session_patches_and_can_clear_the_title() {
     // And it survives a reopen, which is the point of storing it.
     let again = fixture.store.session(session.id).await.expect("read back");
     assert_eq!(again, cleared);
+
+    // An empty patch is the no-op `SessionPatch::is_empty` documents: the store skips the
+    // write, so `updated_at` must not move — a heartbeat patch would otherwise keep re-sorting
+    // the session to the top of every newest-first list.
+    next_millisecond().await;
+    let untouched = fixture
+        .store
+        .update_session(session.id, SessionPatch::default())
+        .await
+        .expect("an empty patch is still accepted");
+    assert_eq!(
+        untouched.updated_at, again.updated_at,
+        "an empty patch skips the write"
+    );
+    assert_eq!(untouched, again);
 }
 
 #[tokio::test]
@@ -170,6 +199,9 @@ async fn list_sessions_pages_newest_first() {
     for index in 0..3 {
         let mut session = fixture.new_session().await;
         session.title = Some(format!("session {index}"));
+        // Distinct milliseconds, or the `updated_at DESC, id ASC` order falls to a UUIDv7's
+        // random tail and this assertion becomes a coin flip on a fast machine.
+        next_millisecond().await;
         let session = fixture
             .store
             .update_session(
@@ -631,6 +663,82 @@ async fn deleting_a_branch_leaves_a_sibling_alone() {
 }
 
 #[tokio::test]
+async fn delete_branch_rolls_back_when_the_cascade_disagrees_with_the_walk() {
+    // The cross-check is the store's only detector of a walk/cascade disagreement, and nothing
+    // the store writes itself can ever trigger it — so without this test, deleting the check
+    // turns no test red. The sandwich is inserted behind the store's back: a cross-session
+    // parent the FK cannot express, which lets the cascade reach rows the session-filtered walk
+    // cannot see. Detection must happen BEFORE the commit — an error returned after an
+    // irreversible delete describes a database that no longer exists.
+    let fixture = Fixture::new().await;
+    let session_a = fixture.new_session().await;
+    let session_b = fixture.new_session().await;
+    let root = say(&fixture.store, &session_b, "root of b", None).await;
+    // A second root becomes b's head, parked outside the cascade. The head must not be inside
+    // the doomed subtree — not because of the store's own refusal (the walk cannot see the
+    // cross-session rows), but because `sessions.active_head` has a foreign key: deleting the
+    // head row trips the engine's constraint before the cross-check ever runs.
+    let parked = say(&fixture.store, &session_b, "parked head", None).await;
+
+    // x belongs to session a but hangs off b's root; y belongs to b but hangs off x. Deleting
+    // root cascades root -> x -> y (3 rows), while b's own tree walk sees only {root} (1 row).
+    let x = ItemId::new();
+    let y = ItemId::new();
+    let conn = open_directly(&fixture.path).await;
+    for (index, (id, session, parent)) in [(x, session_a.id, root.id), (y, session_b.id, x)]
+        .into_iter()
+        .enumerate()
+    {
+        conn.execute(
+            "INSERT INTO items (id, session_id, parent_id, kind, payload, created_at) \
+             VALUES (?1, ?2, ?3, 'user_message', '{\"text\":\"sandwich\",\"parts\":[]}', ?4)",
+            (
+                id.to_string(),
+                session.to_string(),
+                parent.to_string(),
+                (index + 1) as i64,
+            ),
+        )
+        .await
+        .expect("insert behind the store's back");
+    }
+    drop(conn);
+
+    let error = fixture
+        .store
+        .delete_branch(session_b.id, root.id)
+        .await
+        .expect_err("the walk sees one item; the cascade would take three");
+    assert!(
+        matches!(error, StoreError::Database(ref message) if message.contains("rolled back")),
+        "the disagreement must be reported as such: {error}"
+    );
+
+    // The rollback is the point: every row the cascade would have taken is still there, and
+    // the connection still works — the disagreement was caught before the commit, not after.
+    fixture
+        .store
+        .item(session_b.id, root.id)
+        .await
+        .expect("the root survived the rolled-back delete");
+    fixture
+        .store
+        .item(session_b.id, parked.id)
+        .await
+        .expect("the parked head survived");
+    fixture
+        .store
+        .item(session_b.id, y)
+        .await
+        .expect("y survived");
+    fixture
+        .store
+        .item(session_a.id, x)
+        .await
+        .expect("x survived");
+}
+
+#[tokio::test]
 async fn a_branch_view_marks_the_active_chain() {
     let (fixture, session) = Fixture::with_session().await;
     let first = say(&fixture.store, &session, "one", None).await;
@@ -867,6 +975,72 @@ async fn migrations_run_once_and_both_records_agree() {
         .expect("chain after reopen");
     assert_eq!(texts(&chain), vec!["survives"]);
     again.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn a_database_from_a_newer_build_is_refused() {
+    // Reading a schema this build does not know is worse than refusing to start
+    // (docs/design/storage.md §3). The refusal is behaviour, so it gets a test: without one,
+    // inverting the comparison ships silently and old binaries start misreading new databases.
+    let fixture = Fixture::new().await;
+    fixture.store.shutdown().await.expect("shutdown");
+
+    let conn = open_directly(&fixture.path).await;
+    conn.execute("PRAGMA user_version = 99", ())
+        .await
+        .expect("pretend a newer hatchery wrote this file");
+    drop(conn);
+
+    let error = match TursoStore::open(&fixture.path).await {
+        // `expect_err` would need `TursoStore: Debug`; the match says the same thing.
+        Ok(_) => panic!("a newer schema must be refused, not guessed at"),
+        Err(error) => error,
+    };
+    assert!(
+        matches!(error, StoreError::Migration { version: 99, .. }),
+        "the refusal must name the version it saw: {error}"
+    );
+}
+
+#[tokio::test]
+async fn dropping_rows_mid_result_does_not_wedge_the_next_write() {
+    // The engine contract `sql::drain` exists for, pinned so an upgrade that changes it fails
+    // here rather than in production: a statement dropped with rows still pending must not roll
+    // back a LATER write on the same connection. Measured benign on turso 0.7.2 for this shape
+    // (the vendor comment lives at the `Statement::query_row` implementation, which this path
+    // does not go through) — the store drains on every path anyway, because "benign on the
+    // version we tested" is not a contract, and the failure mode if it ever bites is a store
+    // that errors on every write until it is restarted.
+    let (fixture, session) = Fixture::with_session().await;
+    let first = say(&fixture.store, &session, "one", None).await;
+    say(&fixture.store, &session, "two", Some(first.id)).await;
+
+    let conn = open_directly(&fixture.path).await;
+    let mut rows = conn
+        .query(
+            "SELECT id, kind, payload FROM items WHERE session_id = ?1",
+            [session.id.to_string()],
+        )
+        .await
+        .expect("query");
+    {
+        // Consume one row of a multi-row result…
+        let row = rows.next().await.expect("the first row");
+        assert!(row.is_some(), "two items were written");
+    }
+    // …then drop the statement with the rest still pending: the exact shape an early `?` inside
+    // a row loop used to produce.
+    drop(rows);
+
+    conn.execute(
+        "INSERT INTO schema_meta (key, value) VALUES ('tripwire', '1')",
+        (),
+    )
+    .await
+    .expect("a write after an undrained drop must still succeed on this engine");
+    conn.execute("DELETE FROM schema_meta WHERE key = 'tripwire'", ())
+        .await
+        .expect("cleanup");
 }
 
 #[tokio::test]

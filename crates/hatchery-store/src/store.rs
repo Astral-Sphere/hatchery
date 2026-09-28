@@ -189,27 +189,16 @@ impl TursoStore {
         all_branches: bool,
     ) -> Result<String, StoreError> {
         if all_branches {
-            let items = self.all_items(session).await?;
-            let tips = self.tips(session).await?;
+            // One command, one read pass: items and tips fetched separately could describe two
+            // different snapshots of a session that is being written while the export runs.
+            let (items, tips) = self
+                .ask(|reply| StoreCmd::ExportBody { session, reply })
+                .await?;
             export::render_all_branches(&items, &tips)
         } else {
             let items = self.rebuild_chain(session, None).await?;
             export::render_chain(&items)
         }
-    }
-
-    /// Every item of a session, oldest first.
-    async fn all_items(&self, session: SessionId) -> Result<Vec<Item>, StoreError> {
-        self.ask(|reply| StoreCmd::AllItems { session, reply })
-            .await
-    }
-
-    /// Every item's descendant tips.
-    async fn tips(
-        &self,
-        session: SessionId,
-    ) -> Result<std::collections::HashMap<ItemId, Vec<ItemId>>, StoreError> {
-        self.ask(|reply| StoreCmd::Tips { session, reply }).await
     }
 }
 

@@ -39,12 +39,20 @@ pub async fn apply_pragmas(conn: &Connection) -> Result<(), StoreError> {
         .query("PRAGMA journal_mode = WAL", ())
         .await
         .map_err(StoreError::database)?;
-    let row = rows
+    // The value is lifted out and the result set drained BEFORE the check and the next execute:
+    // a statement dropped with rows pending can roll back a later write (ADR-0010), and both the
+    // error path and the `synchronous` pragma below run on this same connection.
+    let value = rows
         .next()
         .await
         .map_err(StoreError::database)?
+        .map(|row| row.get_value(0));
+    drain(rows).await?;
+    let value = value
+        .transpose()
+        .map_err(StoreError::database)?
         .ok_or_else(|| StoreError::Database("journal_mode returned no row".to_owned()))?;
-    if as_text(&row.get_value(0).map_err(StoreError::database)?) != Some("wal") {
+    if as_text(&value) != Some("wal") {
         return Err(StoreError::Database(
             "journal_mode did not switch to wal; the design assumes WAL (ADR-0002)".to_owned(),
         ));
@@ -260,6 +268,44 @@ pub fn parse_json(text: &str) -> Result<Json, StoreError> {
 pub async fn drain(mut rows: turso::Rows) -> Result<(), StoreError> {
     while rows.next().await.map_err(StoreError::database)?.is_some() {}
     Ok(())
+}
+
+/// Reads every row through `read`, draining the result set even when a row fails to parse.
+///
+/// The loop shape this replaces — `while let Some(row) = rows.next().await? { out.push(read(&row)?) }`
+/// — returns early on a parse error with rows still pending, which is exactly the drop-with-
+/// pending-rows shape [`drain`] exists to prevent. A corrupt payload must be reported as the
+/// corrupt payload it is, not as a wedged connection two writes later. Whether the engine of the
+/// day actually punishes the undrained drop is beside the point: `tests/session_store.rs` pins
+/// the contract, so the discipline cannot silently rot when the engine is upgraded.
+pub async fn collect<T>(
+    mut rows: turso::Rows,
+    mut read: impl FnMut(&turso::Row) -> Result<T, StoreError>,
+) -> Result<Vec<T>, StoreError> {
+    let mut out = Vec::new();
+    let mut failure = None;
+    loop {
+        match rows.next().await.map_err(StoreError::database) {
+            Ok(Some(row)) => match read(&row) {
+                Ok(value) => out.push(value),
+                Err(error) => {
+                    failure = Some(error);
+                    break;
+                }
+            },
+            Ok(None) => break,
+            Err(error) => {
+                failure = Some(error);
+                break;
+            }
+        }
+    }
+    let drained = drain(rows).await;
+    if let Some(error) = failure {
+        return Err(error);
+    }
+    drained?;
+    Ok(out)
 }
 
 /// Column access that reports the engine's own error.
