@@ -24,8 +24,6 @@ tracing.workspace = true
 
 [dev-dependencies]
 hatchery-testkit.workspace = true
-insta.workspace = true
-tokio.workspace = true
 
 [features]
 # Live tests hit a real provider and need credentials; they never run in CI (testing.md §8).

@@ -34,7 +34,6 @@ tracing-subscriber.workspace = true
 [dev-dependencies]
 hatchery-testkit.workspace = true
 tempfile.workspace = true
-tokio.workspace = true
 
 [lints]
 workspace = true

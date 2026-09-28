@@ -13,7 +13,8 @@
 #
 # Environment:
 #   SKIP_STEPS   space-separated step names to skip locally, e.g. SKIP_STEPS="doctests"
-#   INSTA_UPDATE forced to "no" below, so snapshot mismatches fail instead of rewriting goldens
+#   INSTA_UPDATE forced to "no" below: the protocol's golden-fixture gate reads it, so a CI run
+#                can never rewrite the fixtures it is checking (tests/golden_fixtures.rs)
 
 set -euo pipefail
 
@@ -112,7 +113,7 @@ check_determinism() {
     dirty=$(git status --porcelain | grep -E '(tests/(fixtures|snapshots)/|\.snap(\.new)?$)' || true)
     if [ -n "$dirty" ]; then
         printf 'the test run modified committed fixtures or snapshots:\n%s\n' "$dirty" >&2
-        printf 'review with `cargo insta review`, then commit the change intentionally\n' >&2
+        printf 'review with `git diff -- crates/hatchery-protocol/tests/fixtures`, then commit the change intentionally\n' >&2
         return 1
     fi
 }

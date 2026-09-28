@@ -46,7 +46,6 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 turso = { version = "0.7.2", default-features = false }
 uuid = { version = "1.26.1", features = ["v7", "serde"] }
 
-insta = { version = "1.48.0", features = ["json"] }
 proptest = "1.11.0"
 tempfile = "3.27.0"
 
