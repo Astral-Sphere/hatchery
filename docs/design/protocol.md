@@ -11,8 +11,9 @@
 ## 2. 数据模型
 
 ```rust
-pub struct Thread {              // 会话
-    pub id: ThreadId,
+pub struct Session {             // 会话（wire 类型名统一用 Session：方法名 session/*、表名 sessions；
+                                 //  早期草稿里的 Thread 已废弃，避免一物两名）
+    pub id: SessionId,           // UUIDv7（时间有序，无需协调；开放问题 3 的结论）
     pub title: Option<String>,
     pub mode: SessionModeId,     // "chat" | "code" | 自定义
     pub workspace: Option<PathBuf>,
@@ -113,5 +114,5 @@ JSON-RPC error + 结构化 `code`：`SessionNotFound` / `GenerationMismatch` / `
 
 1. 事件 coalescing 的具体策略（按帧时间窗还是按 delta 数）——M1 实测后定。
 2. 是否需要 `session/watch`（观察他人会话而不注入）与 `session/takeover`（多前端抢占输入权）——倾向 M4 GTK 多窗口时再设计。
-3. ItemId 用 ULID 还是自增 + session 前缀——ULID 倾向（有序、无需协调），M0 定。
+3. ~~ItemId 用 ULID 还是自增 + session 前缀~~ → **已定（2026-09-28）：UUIDv7**（`uuid` crate 的 `v7` + `serde` feature，wire 上是小写带连字符的 36 字符字符串）。理由：时间有序（字典序 = 时间序）、无需协调、生态工具（SQL/JSON/日志）都认 UUID；ULID 的 26 字符可读性优势不足以抵消「引入第二种 id 格式」的成本。
 4. 大工具输出（如 shell 日志 >1MB）是否走「存库 + 事件带引用」而非内联——倾向带引用（借鉴 dsh spill），M2 定。

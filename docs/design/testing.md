@@ -154,7 +154,7 @@ GUI 是测试最薄弱层，策略 = 「逻辑出 GTK，GTK 只做投影」+ 分
 - **view-model 单测**（主力）：所有状态变换（事件→列表模型、分支树→可视化结构、审批弹层状态机）为不依赖 GTK 的纯 Rust 类型，全覆盖单测。
 - GTK 冒烟（`#[gui]`，CI 用 GNOME SDK 容器 + xvfb-run）：窗口构建、导航、空会话渲染不 panic；每个 milestone 扩一条路径。
 - 性能 fixture：10k items 会话的 ListStore 构建耗时基准（criterion）+ 滚动冒烟。
-- RTL/i18n：`GTK_TEXT_DIR=rtl` + `LANGUAGE=ar` 截图冒烟（人工比对存档）；gettext 完整性——xtask 断言源码无未包裹的用户可见字符串（启发式 lint）+ pot 无 fuzzy。
+- RTL/i18n：`GTK_TEXT_DIR=rtl` + `LANGUAGE=ar` 截图冒烟（人工比对存档）；catalog 完整性（fluent，ADR-0011）——FTL 解析无错、每个 message id 在所有语言都存在、`xtask i18n-extract` 断言源码无未包裹的用户可见字符串（启发式 lint）；golden 里的 bidi 隔离符 U+2068/U+2069 要显式保留。
 - 手动走查清单（M4 验收）：完整 Code 会话、审批、rewind 面板、分支时间线、设置窗全项。
 
 ### 3.10 platform（配置/提示词/i18n）

@@ -57,25 +57,30 @@
 依赖方向严格单向，下层不知道上层存在：
 
 ```
-L0  hatchery-protocol      wire 类型：Thread/Turn/Item、JSON-RPC 方法与事件、代际号
-    hatchery-kernel        中立 agent 循环：Turn 状态机、LlmProvider trait、StreamEvent
+L0  hatchery-protocol      wire 类型：Session/Item、JSON-RPC 方法与事件、代际号
+    hatchery-kernel        中立 agent 循环：Turn 状态机、LlmProvider / ToolHost trait、StreamEvent
 L1  hatchery-llm           openai-interface 之上的 provider adapter（实现 kernel 的 trait）
     hatchery-store         SessionStore trait + turso 实现（分支模型、writer actor）
-    hatchery-capabilities  capability seam：FsBackend / TerminalBackend / ApprovalGate、
-                           影子 Git 检查点、工具注册表框架
+    hatchery-capabilities  capability seam：Tool / ToolCtx 与 FsBackend / TerminalBackend /
+                           ApprovalGate、影子 Git 检查点、工具注册表框架（实现 kernel 的 ToolHost）
 L2  hatchery-tools         内置工具（read/write/edit/glob/grep/shell/web_fetch/MCP client）
     hatchery-acp           ACP server + client（实现 capabilities 的 trait，绑定宿主后端）
 L3  hatchery-daemon        runtime 宿主：会话管理、监听 UDS/stdio、事件扇出（live hub）
+                           配置加载与 prompt 装配也在这里（前端一律经协议访问，无第二个消费者）
 D   hatchery-cli           ratatui TUI + headless exec
     hatchery-gui           gtk4-rs + libadwaita 桌面端
 
 dev hatchery-testkit       测试基建：fake 后端 / ScriptedProvider / TestDaemon / fixture 加载，
                            仅作 dev-dependency，不发布（见 design/testing.md §2）
+    xtask                  开发者任务：layering 契约检查、coverage、i18n 提取、fixture 录制
 ```
+
+**12 个 workspace member = 上面 11 个 crate（10 个产品 crate + dev-only 的 testkit）+ `xtask`**。`cargo xtask layering`（以及同名集成测试）把这张图当契约检查：成员清单必须与 `xtask/src/layering.rs` 的 `LAYERS` 表一致、依赖必须严格向下、dev crate 不得成为产品 crate 的正常依赖、图中不得有环。改这张图就要同时改那张表。
 
 分层纪律（借鉴 atomcode 的 L0–D 分层与 codex 的「TUI 也是协议客户端」）：
 
 - **kernel 零业务语义**：不知道 Chat/Code 模式、不知道工作区、不知道存储格式。它只驱动「LLM 请求 → 流事件 → 工具调用 → 结果回填」循环，通过 trait 与外界交互。
+- **kernel 只见窄接口 `ToolHost`**（defs 快照 / 是否需要审批 / 调用）：`Tool`、`ToolCtx` 与 `FsBackend`/`TerminalBackend`/`ApprovalGate` 都住在 L1 的 capabilities。否则 kernel 的 `ToolCtx` 要引用 capabilities 的 trait，L0 就反过来依赖 L1 成环（M0a 修正，见 worklog/architecture.md）。
 - **capabilities 定义接缝，tools/acp 提供实现**：工具永远通过 `FsBackend`/`TerminalBackend`/`ApprovalGate` trait 操作外界，绝不直接 touch 文件系统或进程。这是 ACP 完整适配（ADR-0004）与将来远程执行后端（docker/ssh）的前提。
 - **daemon 是唯一的 runtime 所有者**：前端不重建任何生命周期状态，只投影事件流（view projection）。
 - **Disposer 纪律**（ADR-0009）：一切有副作用的注册（runtime 装配、hub 订阅、adapter 注册、检查点句柄）必须返回 disposer（Drop guard 或显式 dispose），teardown 严格逆序；有测试锁定。
@@ -127,7 +132,7 @@ dev hatchery-testkit       测试基建：fake 后端 / ScriptedProvider / TestD
 
 | 术语 | 含义 |
 |---|---|
-| **Thread / Session** | 一次会话。含元数据（模式、工作区、模型配置）与 item 树。 |
+| **Session** | 一次会话。含元数据（模式、工作区、模型配置）与 item 树。类型名统一为 `Session`（方法 `session/*`、表 `sessions`）；早期文档里的 "Thread" 已废弃，避免一物两名。 |
 | **Turn** | 一次「用户输入 → agent 完成响应」的完整轮次，可含多次 LLM 请求与工具调用。 |
 | **Item** | 历史的最小单元：message / tool_call / tool_result / reasoning 块 / checkpoint 记录，带 `parent_item_id` 构成树。 |
 | **Branch** | item 树上从某节点分叉出的一条链；`active_branch_head` 决定当前生效历史。 |

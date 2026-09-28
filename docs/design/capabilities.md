@@ -7,10 +7,26 @@
 三个核心 trait（完整签名见 ADR-0004）+ 检查点与工具注册表框架：
 
 ```rust
+// 工具契约住在这一层：kernel 只见 ToolHost 窄接口（kernel.md §5），否则 L0 会反过来依赖 L1 成环
+pub trait Tool: Send + Sync {
+    fn def(&self) -> ToolDef;                       // ToolDef 是 kernel 类型（要进 LLM 请求）
+    fn needs_approval(&self, args: &Value) -> Option<ApprovalRequest>;
+    async fn execute(&self, ctx: ToolCtx<'_>, args: Value) -> Result<ToolOutput>;
+}
+
+pub struct ToolCtx<'a> {          // 工具能拿到的全部外界能力 = 接缝
+    pub fs: &'a dyn FsBackend,
+    pub terminal: &'a dyn TerminalBackend,
+    pub cancel: CancellationToken,
+    pub emit: &'a dyn Fn(ToolProgress),   // 进度上报 → ToolCallProgress 事件
+}
+
 pub trait FsBackend      // read_text_file / write_text_file / metadata（+M2: list/glob 支持）
 pub trait TerminalBackend // create → TerminalHandle { output stream, wait_for_exit, kill, release }
 pub trait ApprovalGate   // request(ApprovalRequest) → ApprovalOutcome
 
+// ApprovalRequest / ApprovalOutcome / ToolOutput / ToolProgress 定义在 kernel（M0a 修正）：
+// kernel 的 ToolHost::approval_for 与事件投影都要用它们，capabilities 只消费与构造。
 pub struct ApprovalRequest {
     pub tool: String,
     pub args_digest: String,          // 人类可读摘要（如 "edit src/main.rs (+12 -3)"）
@@ -18,7 +34,7 @@ pub struct ApprovalRequest {
     pub options: Vec<ApprovalOption>, // AllowOnce | AllowAlways | Deny | DenyAlways（→ 持久化规则）
 }
 
-pub struct ToolRegistry { /* name → Arc<dyn Tool>；turn 开始冻结快照（kernel.md §5） */ }
+pub struct ToolRegistry { /* name → Arc<dyn Tool>；实现 kernel::ToolHost，turn 开始冻结快照 */ }
 ```
 
 **注册句柄模式**（ADR-0009 纪律 3，借鉴 dsh `registerAdapter()` → handle）：`register()` 返回 `RegistrationHandle { dispose(), replace() }`——`replace()` 用新实现整表原子替换旧实现（进行中的 turn 不受影响，因为 kernel 持有的是冻结快照），`dispose()` 摘除注册。MCP 工具、用户自定义工具、运行中换 provider adapter 全部走这一模式；禁止对注册表的原地突变。

@@ -7,7 +7,7 @@
 kernel 只做一件事：驱动「组装上下文 → LLM 流式请求 → 解析工具调用 → 经接缝执行 → 结果回填 → 循环」直到 turn 终结。它**不知道**：Chat/Code 模式、工作区、存储格式、前端、ACP。外界交互全部经注入的 trait：
 
 - `LlmProvider`（hatchery-llm 实现）
-- `ToolRegistry` / `Tool`（hatchery-tools 提供，经 capabilities 接缝执行）
+- `ToolHost`（capabilities 的 `ToolRegistry` 实现；工具经接缝执行，见 §5）
 - `HistorySource`（daemon 侧用 hatchery-store 实现：按 active 分支重建消息序列）
 - `EventSink`（daemon 侧接 live hub + writer actor）
 - `CancellationToken`（tokio-util）
@@ -80,23 +80,33 @@ pub struct ChatOptions {          // 「中立旋钮」：kernel 只转发不解
 
 ## 5. 工具调用接缝
 
+kernel 只认一个**窄接口**。`Tool`、`ToolCtx` 与 `FsBackend`/`TerminalBackend`/`ApprovalGate` 全部住在 L1 的
+capabilities（design/capabilities.md §1）——否则 kernel 的 `ToolCtx` 要引用上层 trait，L0 反过来依赖 L1 成环
+（M0a 修正）。
+
 ```rust
 #[async_trait]
-pub trait Tool: Send + Sync {
-    fn def(&self) -> ToolDef;                       // JSON Schema
-    fn needs_approval(&self, args: &Value) -> ApprovalRequest; // 或 AutoApproved
-    async fn execute(&self, ctx: ToolCtx<'_>, args: Value) -> Result<ToolOutput>;
-}
-
-pub struct ToolCtx<'a> {          // 工具能拿到的全部外界能力 = 接缝
-    pub fs: &'a dyn FsBackend,
-    pub terminal: &'a dyn TerminalBackend,
-    pub cancel: CancellationToken,
-    pub emit: &'a dyn Fn(ToolProgress),   // 进度上报 → ToolCallProgress 事件
+pub trait ToolHost: Send + Sync {
+    /// turn 开始时冻结的工具表快照；同时是发给 LLM 的 tool_defs 来源
+    fn snapshot(&self) -> Vec<ToolDef>;
+    /// 这次调用是否需要审批（None = 自动放行）
+    fn approval_for(&self, name: &str, args: &Value) -> Option<ApprovalRequest>;
+    /// 执行工具；进度经 emit 上报 → ToolCallProgress 事件
+    async fn invoke(
+        &self,
+        name: &str,
+        args: Value,
+        cancel: CancellationToken,
+        emit: Arc<dyn Fn(ToolProgress) + Send + Sync>,
+    ) -> Result<ToolOutput, KernelError>;
 }
 ```
 
-- **Turn Tool Snapshot**（借鉴 atomcode）：turn 开始时冻结工具表快照，turn 中模式/配置变化不影响进行中的 turn。
+`ToolDef`（name / description / JSON Schema）、`ToolOutput`、`ToolProgress`、`ApprovalRequest` 是 **kernel 类型**：
+组装 LLM 请求与投影事件都要用它们。capabilities 的 `ToolRegistry` 实现 `ToolHost`，负责把调用分派给具体 `Tool`
+并注入 `ToolCtx`（fs / terminal / cancel / emit）。
+
+- **Turn Tool Snapshot**（借鉴 atomcode）：turn 开始时冻结 `snapshot()` 的结果，turn 中模式/配置变化不影响进行中的 turn；注册表的 `replace()` 是整表原子替换（ADR-0009 纪律 3）。
 - 工具并行：同一 round 的多个 tool call 默认串行执行（输出顺序确定性利于回放）；显式标记 `parallel_safe` 的只读工具可并行（M2+ 优化）。
 - 工具输出超限：`ToolOutput::Spilled { path, preview }` 落盘 + 引用（M2，借鉴 dsh spill）。
 
