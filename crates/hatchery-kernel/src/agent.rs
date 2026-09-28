@@ -230,6 +230,13 @@ enum Decision {
     Interrupted,
 }
 
+/// What a guarded startup await woke up on.
+enum Startup<T> {
+    Done(Result<T, KernelError>),
+    Cancelled,
+    Command(Option<AgentCommand>),
+}
+
 impl Agent {
     /// Runs until every [`AgentHandle`] is dropped.
     ///
@@ -263,9 +270,47 @@ impl Agent {
 
         let completion = match outcome {
             Ok(reason) => TurnCompletion::Completed { reason, usage },
-            Err(error) => TurnCompletion::Failed { error },
+            // The rounds that ran before the failure were paid for; dropping their usage would
+            // under-report exactly the turns a retry will pay for again.
+            Err(error) => TurnCompletion::Failed { error, usage },
         };
         self.emit(KernelEvent::TurnEnded { turn, completion }).await;
+    }
+
+    /// Awaits a startup future while staying interruptible.
+    ///
+    /// `history.view()` and the provider's `chat_stream()` both run inside the same select as the
+    /// cancel token and the command channel: a startup awaited outside it could not be
+    /// interrupted, and a provider that hung while connecting would wedge the agent with no
+    /// escape but an abort — which skips the terminal event the contract promises. `None` means
+    /// the startup was interrupted; the future is dropped, never resumed.
+    async fn guarded_startup<T, E, F>(&mut self, startup: F) -> Result<Option<T>, KernelError>
+    where
+        E: Into<KernelError>,
+        F: std::future::Future<Output = Result<T, E>>,
+    {
+        tokio::pin!(startup);
+        loop {
+            let step = {
+                // Scoped so the select's borrows of `self` end before the body runs.
+                let cancel = self.cancel.clone();
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => Startup::Cancelled,
+                    command = self.commands.recv() => Startup::Command(command),
+                    result = &mut startup => Startup::Done(result.map_err(Into::into)),
+                }
+            };
+            match step {
+                Startup::Done(result) => return result.map(Some),
+                Startup::Cancelled => return Ok(None),
+                Startup::Command(command) => {
+                    if self.apply_command(command).await == CommandFlow::Stop {
+                        return Ok(None);
+                    }
+                }
+            }
+        }
     }
 
     /// The turn itself: assemble, then loop over rounds until a stop reason.
@@ -275,7 +320,10 @@ impl Agent {
         usage: &mut Usage,
     ) -> Result<StopReason, KernelError> {
         self.transition(TurnState::Assembling).await;
-        let view = self.ports.history.view().await?;
+        let history = Arc::clone(&self.ports.history);
+        let Some(view) = self.guarded_startup(history.view()).await? else {
+            return Ok(StopReason::Interrupted);
+        };
         self.tail = view.head;
         let mut messages = view.messages;
 
@@ -327,7 +375,7 @@ impl Agent {
 
             self.transition(TurnState::Executing { round }).await;
             for request in requests {
-                match self.run_call(&request).await? {
+                match self.run_call(&request, round).await? {
                     None => return Ok(StopReason::Interrupted),
                     Some(invocation) => {
                         messages.push(Message::tool_result(
@@ -358,9 +406,12 @@ impl Agent {
             ..self.options.clone()
         };
         let provider = Arc::clone(&self.ports.provider);
-        let mut stream = provider
-            .chat_stream(options, messages.to_vec(), self.cancel.clone())
-            .await?;
+        let startup = provider.chat_stream(options, messages.to_vec(), self.cancel.clone());
+        let Some(mut stream) = self.guarded_startup(startup).await? else {
+            // Interrupted while the provider was still starting up: nothing was streamed, so
+            // there is no open item to commit.
+            return Ok(None);
+        };
 
         let mut round = Round::default();
         let mut failure = None;
@@ -441,10 +492,12 @@ impl Agent {
     /// Runs one tool call: announce it, ask for approval, invoke, record.
     ///
     /// `None` means the turn was interrupted; the call is still recorded, with its cancelled
-    /// status, so history says what happened.
+    /// status, so history says what happened. `round` is the round executing it, so an answered
+    /// approval can report the transition back to [`TurnState::Executing`].
     async fn run_call(
         &mut self,
         request: &ToolCallRequest,
+        round: u32,
     ) -> Result<Option<ToolInvocation>, KernelError> {
         let id = ItemId::new();
         let parent = self.tail;
@@ -467,7 +520,15 @@ impl Agent {
                 let request_id = ApprovalId::new();
                 match self.await_approval(request_id, approval).await? {
                     Decision::Interrupted => None,
-                    Decision::Chosen(option) => Some(option),
+                    Decision::Chosen(option) => {
+                        // The design's edge back (docs/design/kernel.md §3): the wait ended when
+                        // the answer arrived. A frontend projects `SessionStatus` from
+                        // `StateChanged`, so without this the tools that run now — and every
+                        // later call in the round — would report "waiting for approval" under a
+                        // request id that is no longer pending.
+                        self.transition(TurnState::Executing { round }).await;
+                        Some(option)
+                    }
                 }
             }
         };
@@ -573,6 +634,10 @@ impl Agent {
     ) -> Result<Decision, KernelError> {
         self.transition(TurnState::AwaitingApproval { request_id })
             .await;
+        // The offers outlive the event: an answer that was not on the list is refused below, so
+        // a hard gate (`ApprovalRequest::once_only`, which omits the remembered options) cannot
+        // be answered with `allow_always` by a buggy or hostile frontend.
+        let offers = request.options.clone();
         self.emit(KernelEvent::ApprovalNeeded {
             request_id,
             request,
@@ -599,12 +664,19 @@ impl Agent {
                 StreamStep::Command(Some(AgentCommand::ApprovalDecision {
                     request_id: answered,
                     option,
-                })) if answered == request_id => return Ok(Decision::Chosen(option)),
-                StreamStep::Command(Some(AgentCommand::ApprovalDecision {
-                    request_id: other,
-                    ..
                 })) => {
-                    tracing::warn!(%other, "approval decision for a different request; ignored");
+                    if answered != request_id {
+                        tracing::warn!(%answered, "approval decision for a different request; ignored");
+                    } else if !offers.contains(&option) {
+                        tracing::warn!(
+                            %request_id,
+                            answer = ?option,
+                            offers = ?offers,
+                            "approval answer was not one of the offered options; ignored"
+                        );
+                    } else {
+                        return Ok(Decision::Chosen(option));
+                    }
                 }
                 StreamStep::Command(Some(AgentCommand::Interrupt)) => {
                     self.cancel.cancel();
@@ -773,10 +845,12 @@ fn merge_call(calls: &mut Vec<PartialCall>, delta: ToolCallDelta) {
 fn stop_reason(finish: FinishReason) -> StopReason {
     match finish {
         FinishReason::Length => StopReason::MaxTokens,
-        FinishReason::Stop
-        | FinishReason::ToolCalls
-        | FinishReason::ContentFilter
-        | FinishReason::Other(_) => StopReason::ModelDone,
+        // A refusal on policy grounds is not a clean finish: the user must be able to tell that
+        // the answer was cut by the filter rather than completed by the model.
+        FinishReason::ContentFilter => StopReason::ContentFilter,
+        FinishReason::Stop | FinishReason::ToolCalls | FinishReason::Other(_) => {
+            StopReason::ModelDone
+        }
     }
 }
 
@@ -846,6 +920,11 @@ mod tests {
         assert_eq!(stop_reason(FinishReason::Length), StopReason::MaxTokens);
         assert_eq!(stop_reason(FinishReason::Stop), StopReason::ModelDone);
         assert_eq!(stop_reason(FinishReason::ToolCalls), StopReason::ModelDone);
+        assert_eq!(
+            stop_reason(FinishReason::ContentFilter),
+            StopReason::ContentFilter,
+            "a filtered answer is not a clean finish"
+        );
         assert_eq!(
             stop_reason(FinishReason::Other("weird".to_owned())),
             StopReason::ModelDone

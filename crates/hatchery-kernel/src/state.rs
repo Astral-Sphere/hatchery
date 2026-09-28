@@ -97,6 +97,10 @@ pub enum TurnCompletion {
     Failed {
         /// What stopped it.
         error: KernelError,
+        /// What the turn cost before it failed. Empty only when no provider ever answered:
+        /// rounds that completed were paid for, and a failed turn is exactly the one whose cost
+        /// a retry will pay again.
+        usage: Usage,
     },
 }
 
@@ -110,17 +114,12 @@ impl TurnCompletion {
         }
     }
 
-    /// The accumulated usage; empty for a turn that failed before a provider answered.
+    /// The accumulated usage. A failed turn keeps whatever its rounds reported before the
+    /// failure; it is empty only when nothing was ever reported.
     #[must_use]
     pub const fn usage(&self) -> Usage {
         match self {
-            Self::Completed { usage, .. } => *usage,
-            Self::Failed { .. } => Usage {
-                prompt_tokens: None,
-                completion_tokens: None,
-                reasoning_tokens: None,
-                requests: 0,
-            },
+            Self::Completed { usage, .. } | Self::Failed { usage, .. } => *usage,
         }
     }
 
@@ -196,13 +195,33 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_turn_reports_no_reason_and_no_usage() {
+    fn a_failed_turn_reports_no_reason_but_keeps_its_usage() {
         let failed = TurnCompletion::Failed {
             error: KernelError::history("gone"),
+            usage: Usage::default(),
         };
         assert_eq!(failed.stop_reason(), None);
-        assert!(failed.usage().is_empty());
+        assert!(
+            failed.usage().is_empty(),
+            "a turn that failed before any provider answered cost nothing"
+        );
         assert!(!failed.is_ok());
+
+        let spent = Usage {
+            prompt_tokens: Some(10),
+            completion_tokens: Some(4),
+            reasoning_tokens: None,
+            requests: 2,
+        };
+        let failed_late = TurnCompletion::Failed {
+            error: KernelError::history("gone"),
+            usage: spent,
+        };
+        assert_eq!(
+            failed_late.usage(),
+            spent,
+            "rounds that completed were paid for; a retry pays again, so the cost must survive"
+        );
 
         let completed = TurnCompletion::Completed {
             reason: StopReason::ModelDone,

@@ -9,7 +9,7 @@ use serde_json::json;
 
 use hatchery_kernel::{
     Agent, AgentBuilder, AgentCommand, AgentHandle, ChatOptions, FinishReason, KernelError,
-    KernelEvent, LlmError, Ports, StreamEvent, TurnCompletion, TurnLimits, TurnState,
+    KernelEvent, LlmError, Message, Ports, StreamEvent, TurnCompletion, TurnLimits, TurnState,
 };
 use hatchery_protocol::{
     Item, ItemId, ItemKind, ItemKindTag, RiskLevel, SessionId, SignatureBlock, StopReason,
@@ -26,6 +26,9 @@ struct Harness {
     sink: Arc<RecordingSink>,
     provider: Arc<ScriptedProvider>,
     tools: Arc<ScriptedToolHost>,
+    /// Kept so a test can play the store between turns: commit what a turn produced, as the
+    /// daemon's sink-to-store-to-history loop would.
+    history: Arc<MemoryHistory>,
     handle: AgentHandle,
     running: tokio::task::JoinHandle<()>,
 }
@@ -62,6 +65,7 @@ impl Harness {
             sink,
             provider,
             tools,
+            history,
             handle,
             running,
         }
@@ -92,14 +96,22 @@ impl Drop for Harness {
 }
 
 fn completion(events: &[KernelEvent]) -> TurnCompletion {
-    events
+    // Exactly one terminal event per turn is part of the contract, so it is checked here rather
+    // than trusted: `find_map` alone would silently accept a duplicate `TurnEnded`.
+    let ended: Vec<&TurnCompletion> = events
         .iter()
-        .rev()
-        .find_map(|event| match event {
-            KernelEvent::TurnEnded { completion, .. } => Some(completion.clone()),
+        .filter_map(|event| match event {
+            KernelEvent::TurnEnded { completion, .. } => Some(completion),
             _ => None,
         })
-        .expect("the turn must end with a TurnEnded event")
+        .collect();
+    assert_eq!(
+        ended.len(),
+        1,
+        "a turn must end with exactly one TurnEnded event, got {}",
+        ended.len()
+    );
+    ended.into_iter().next().expect("one event").clone()
 }
 
 fn reason(events: &[KernelEvent]) -> Option<StopReason> {
@@ -108,7 +120,7 @@ fn reason(events: &[KernelEvent]) -> Option<StopReason> {
 
 fn error(events: &[KernelEvent]) -> Option<KernelError> {
     match completion(events) {
-        TurnCompletion::Failed { error } => Some(error),
+        TurnCompletion::Failed { error, .. } => Some(error),
         TurnCompletion::Completed { .. } => None,
     }
 }
@@ -480,6 +492,21 @@ async fn an_approval_request_pauses_the_turn_until_it_is_answered() {
     assert_eq!(reason(&events), Some(StopReason::ModelDone));
     assert_eq!(harness.tools.call_names(), vec!["write_file"]);
     assert_eq!(tool_result_texts(&events), vec!["wrote a.rs".to_owned()]);
+    // The design's edge back (docs/design/kernel.md §3): the answer ends the wait, and the tools
+    // that run afterwards are executing — a frontend projecting `SessionStatus` from the last
+    // `StateChanged` must not be left showing a stale "waiting for approval".
+    assert_eq!(
+        states(&events),
+        vec![
+            "assembling",
+            "streaming",
+            "executing",
+            "awaiting_approval",
+            "executing",
+            "streaming",
+            "idle"
+        ]
+    );
 }
 
 #[tokio::test]
@@ -613,7 +640,9 @@ async fn interrupt_during_streaming_ends_the_turn_early_and_keeps_what_was_said(
 
 #[tokio::test]
 async fn interrupt_during_tool_execution_cancels_the_tool() {
-    let (tools, gate) = ScriptedToolHost::new()
+    // The gate is held but never released: the tool parks on it, and the interrupt is what ends
+    // the invocation. Dropping the handle would not release the fake's own clone.
+    let (tools, _gate) = ScriptedToolHost::new()
         .advertising(&["slow"])
         .answering("slow", ToolOutput::text("finished"))
         .gated();
@@ -642,8 +671,6 @@ async fn interrupt_during_tool_execution_cancels_the_tool() {
         .await
         .expect("the agent is running");
     let events = harness.finish().await;
-    // Let the (cancelled) tool return so the host records the call.
-    gate.release(1);
 
     assert_eq!(reason(&events), Some(StopReason::Interrupted));
     let call = finished_items(&events)
@@ -653,6 +680,15 @@ async fn interrupt_during_tool_execution_cancels_the_tool() {
     assert!(
         matches!(call.kind, ItemKind::ToolCall(ref call) if call.status == ToolStatus::Cancelled),
         "an interrupted call is cancelled, not failed"
+    );
+    // The seam contract, observed from the host side: the invocation the kernel dropped saw a
+    // cancelled token. The record is written on entry and the verdict by the fake's drop guard,
+    // because a kernel that never polls the future again is exactly what cancellation means.
+    let recorded = harness.tools.calls();
+    assert_eq!(recorded.len(), 1, "the tool was invoked exactly once");
+    assert!(
+        recorded[0].cancelled,
+        "the host must see the cancellation, not just the kernel's bookkeeping"
     );
 }
 
@@ -704,7 +740,7 @@ async fn interrupt_while_awaiting_approval_ends_the_turn() {
 #[tokio::test]
 async fn an_interrupt_with_no_turn_running_is_ignored() {
     let harness = Harness::new(
-        ScriptedProvider::new(vec![]),
+        ScriptedProvider::new(vec![ScriptedProvider::text_round("still here")]),
         ScriptedToolHost::new(),
         MemoryHistory::empty(),
         TurnLimits::default(),
@@ -714,9 +750,204 @@ async fn an_interrupt_with_no_turn_running_is_ignored() {
         .interrupt()
         .await
         .expect("the agent is running");
-    // Nothing should have been emitted, and the agent is still usable.
-    assert!(harness.sink.names().is_empty());
+    // The interrupt above resolves without suspending (the command channel has capacity), so on
+    // a current-thread runtime the agent task has not been polled yet — asserting right here
+    // would prove nothing, which is what made this test vacuous. Driving a real turn through the
+    // same FIFO channel forces the idle interrupt to be handled first: a panic or a wedge in
+    // that path now surfaces as a failed or timed-out turn instead of passing silently.
+    harness.prompt("hello").await;
+    let events = harness.finish().await;
+
+    assert_eq!(
+        reason(&events),
+        Some(StopReason::ModelDone),
+        "the agent is still usable after an ignored interrupt"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, KernelEvent::TurnStarted { .. }))
+            .count(),
+        1,
+        "the ignored interrupt must not start a turn of its own"
+    );
     assert!(!harness.handle.is_closed());
+}
+
+// ---------------------------------------------------------- turn discipline
+
+#[tokio::test]
+async fn a_mid_turn_prompt_is_dropped_not_queued() {
+    // One turn at a time: the daemon rejects a second prompt with `TurnInProgress`, so a
+    // `TurnInput` that reaches the kernel mid-turn is a caller bug — warned about and dropped,
+    // never queued into a second turn (queueing would invent one).
+    let (provider, gate) = ScriptedProvider::new(vec![vec![
+        StreamEvent::TextDelta {
+            text: "first answer".to_owned(),
+        },
+        StreamEvent::Done {
+            finish_reason: FinishReason::Stop,
+        },
+    ]])
+    .gated();
+    let harness = Harness::new(
+        provider,
+        ScriptedToolHost::new(),
+        MemoryHistory::empty(),
+        TurnLimits::default(),
+    );
+    harness.prompt("first").await;
+    gate.release(1);
+    harness
+        .sink
+        .wait_for("the first delta", |event| {
+            matches!(event, KernelEvent::TextDelta { .. })
+        })
+        .await;
+
+    // Mid-stream: a second prompt arrives while the turn is still running.
+    harness.prompt("second").await;
+    gate.release(1);
+    let events = harness.finish().await;
+
+    assert_eq!(reason(&events), Some(StopReason::ModelDone));
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, KernelEvent::TurnStarted { .. }))
+            .count(),
+        1,
+        "the mid-turn prompt must not start a second turn"
+    );
+    let user_messages: Vec<Item> = finished_items(&events)
+        .into_iter()
+        .filter(|item| item.kind_tag() == ItemKindTag::UserMessage)
+        .collect();
+    assert_eq!(
+        user_messages.len(),
+        1,
+        "only the running turn's prompt was recorded"
+    );
+    assert!(
+        matches!(user_messages[0].kind, ItemKind::UserMessage(ref content) if content.text == "first"),
+        "the dropped prompt never became an item"
+    );
+}
+
+#[tokio::test]
+async fn a_second_turn_chains_onto_the_first_turns_head() {
+    let provider = ScriptedProvider::new(vec![
+        ScriptedProvider::text_round("first answer"),
+        ScriptedProvider::text_round("second answer"),
+    ]);
+    let harness = Harness::new(
+        provider,
+        ScriptedToolHost::new(),
+        MemoryHistory::empty(),
+        TurnLimits::default(),
+    );
+    harness.prompt("one").await;
+    let after_one = harness.finish().await;
+    let boundary = after_one.len();
+    let committed = finished_items(&after_one);
+    let head = committed.last().expect("the first turn committed items").id;
+
+    // Play the daemon: what the sink committed is what the next turn's history sees. Without
+    // this the kernel would re-read an empty head and the second turn would chain onto nothing.
+    harness.history.push_item(Message::user("one"), head);
+
+    harness.prompt("two").await;
+    // From the boundary: `finish()` scans from the beginning and would match turn one's
+    // `TurnEnded` again, returning a stale snapshot before turn two ever ran.
+    let all = harness.sink.wait_for_end_from(boundary).await;
+    let second = &all[boundary..];
+
+    assert_eq!(reason(second), Some(StopReason::ModelDone));
+    let user_two = finished_items(second)
+        .into_iter()
+        .find(|item| item.kind_tag() == ItemKindTag::UserMessage)
+        .expect("the second turn records its prompt");
+    assert_eq!(
+        user_two.parent,
+        Some(head),
+        "turn two chains onto turn one's committed head"
+    );
+    assert_eq!(
+        all.iter()
+            .filter(|event| matches!(event, KernelEvent::TurnEnded { .. }))
+            .count(),
+        2,
+        "each turn ends exactly once"
+    );
+}
+
+#[tokio::test]
+async fn the_documented_event_sequence_is_emitted_exactly() {
+    // The full literal sequence, not a subsequence: `ItemStarted` and the delta events are what
+    // a frontend renders in-flight items from, and no other test pinned their presence, order
+    // or count.
+    let provider = ScriptedProvider::new(vec![ScriptedProvider::text_round("hello back")]);
+    let harness = Harness::new(
+        provider,
+        ScriptedToolHost::new(),
+        MemoryHistory::empty(),
+        TurnLimits::default(),
+    );
+    harness.prompt("hello").await;
+    harness.finish().await;
+    assert_eq!(
+        harness.sink.names(),
+        vec![
+            "turn_started",
+            "state_changed", // idle -> assembling
+            "item_finished", // the user message is committed whole, never streamed
+            "state_changed", // assembling -> streaming
+            "item_started",  // the answer opens on its first delta
+            "text_delta",
+            "item_finished",
+            "state_changed", // streaming -> idle
+            "turn_ended",
+        ]
+    );
+
+    // Reasoning then text: the reasoning item closes when the text starts, so the sequence
+    // shows the close-and-reopen that keeps the item tree a chain.
+    let provider = ScriptedProvider::new(vec![vec![
+        StreamEvent::ReasoningDelta {
+            text: "thinking".to_owned(),
+        },
+        StreamEvent::TextDelta {
+            text: "answering".to_owned(),
+        },
+        StreamEvent::Done {
+            finish_reason: FinishReason::Stop,
+        },
+    ]]);
+    let harness = Harness::new(
+        provider,
+        ScriptedToolHost::new(),
+        MemoryHistory::empty(),
+        TurnLimits::default(),
+    );
+    harness.prompt("hello").await;
+    harness.finish().await;
+    assert_eq!(
+        harness.sink.names(),
+        vec![
+            "turn_started",
+            "state_changed",
+            "item_finished",
+            "state_changed",
+            "item_started", // the reasoning item opens
+            "reasoning_delta",
+            "item_finished", // text closes it …
+            "item_started",  // … and opens the answer
+            "text_delta",
+            "item_finished",
+            "state_changed",
+            "turn_ended",
+        ]
+    );
 }
 
 // --------------------------------------------------------------------- fuses

@@ -196,25 +196,37 @@ impl ToolHost for ScriptedToolHost {
         // release the gate first.
         let _ = progress.send(ToolProgress::from(format!("{name} started")));
 
-        let mut cancelled = false;
+        // The call is recorded on ENTRY, and its cancellation verdict is written by a drop
+        // guard. The kernel's tool select is cancel-first: an interrupted invocation is dropped
+        // without ever being polled again, so a record written only after the gate could never
+        // exist for the case that matters most. The guard is what makes "an interrupt cancels
+        // the tool" observable from the host side at all.
+        let index = {
+            let mut calls = self.calls.lock().expect("the mutex is never poisoned");
+            calls.push(RecordedCall {
+                name: name.to_owned(),
+                args,
+                cancelled: false,
+            });
+            calls.len() - 1
+        };
+        let _guard = CancelGuard {
+            calls: &self.calls,
+            index,
+            cancel: cancel.clone(),
+        };
+
         if let Some(gate) = &self.gate {
             tokio::select! {
                 biased;
-                _ = cancel.cancelled() => cancelled = true,
+                _ = cancel.cancelled() => {
+                    return Ok(ToolInvocation::failed(ToolOutput::text(format!(
+                        "{name} was cancelled"
+                    ))));
+                }
                 _ = gate.acquire() => {}
             }
-        }
-
-        self.calls
-            .lock()
-            .expect("the mutex is never poisoned")
-            .push(RecordedCall {
-                name: name.to_owned(),
-                args,
-                cancelled,
-            });
-
-        if cancelled {
+        } else if cancel.is_cancelled() {
             return Ok(ToolInvocation::failed(ToolOutput::text(format!(
                 "{name} was cancelled"
             ))));
@@ -227,6 +239,28 @@ impl ToolHost for ScriptedToolHost {
             None => Ok(ToolInvocation::failed(ToolOutput::text(format!(
                 "ScriptedToolHost has no scripted response for `{name}`"
             )))),
+        }
+    }
+}
+
+/// Writes the cancellation verdict into a recorded call when the invocation ends.
+///
+/// This includes the case the host cannot otherwise see: the kernel dropping the future while it
+/// is parked, because the turn was interrupted. `cancelled` then records that the token was
+/// cancelled by the time the future died — which is exactly the seam contract under test.
+struct CancelGuard<'a> {
+    calls: &'a Mutex<Vec<RecordedCall>>,
+    index: usize,
+    cancel: CancellationToken,
+}
+
+impl Drop for CancelGuard<'_> {
+    fn drop(&mut self) {
+        if self.cancel.is_cancelled() {
+            let mut calls = self.calls.lock().expect("the mutex is never poisoned");
+            if let Some(call) = calls.get_mut(self.index) {
+                call.cancelled = true;
+            }
         }
     }
 }
