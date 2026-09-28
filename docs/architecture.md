@@ -68,6 +68,9 @@ L2  hatchery-tools         内置工具（read/write/edit/glob/grep/shell/web_fe
 L3  hatchery-daemon        runtime 宿主：会话管理、监听 UDS/stdio、事件扇出（live hub）
 D   hatchery-cli           ratatui TUI + headless exec
     hatchery-gui           gtk4-rs + libadwaita 桌面端
+
+dev hatchery-testkit       测试基建：fake 后端 / ScriptedProvider / TestDaemon / fixture 加载，
+                           仅作 dev-dependency，不发布（见 design/testing.md §2）
 ```
 
 分层纪律（借鉴 atomcode 的 L0–D 分层与 codex 的「TUI 也是协议客户端」）：
@@ -107,6 +110,8 @@ D   hatchery-cli           ratatui TUI + headless exec
 ```
 
 ## 5. 核心不变量（所有实现必须遵守）
+
+每条不变量都有专属测试锁定，映射表见 [design/testing.md §5](design/testing.md)。
 
 1. **单一 runtime 所有者**：一个会话在任意时刻至多绑定一个 runtime 实例；`SessionLease`（advisory 文件锁）+ 单调代际号（generation）保证旧实例的迟到事件不会污染新实例（借鉴 atomcode `RuntimeGeneration`）。
 2. **模型可见 = 已记录**（借鉴 deepseek-harness "model-visible means logged"）：发给 LLM 的上下文必须能从数据库 active 分支完整重建；不允许存在只活在内存里的历史。

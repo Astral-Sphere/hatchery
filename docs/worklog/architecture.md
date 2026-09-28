@@ -10,8 +10,8 @@
 
 ## 待办
 
-- [ ] (M0) Cargo workspace 脚手架：11 crate 空壳 + workspace Cargo.toml（共享依赖版本）+ rust-toolchain.toml
-- [ ] (M0) CI：fmt + clippy(-D warnings) + test；`disallowed_methods` lint 配置（不变量 4 的强制）
+- [ ] (M0) Cargo workspace 脚手架：12 crate 空壳（含 dev-only `hatchery-testkit`）+ workspace Cargo.toml（共享依赖版本）+ rust-toolchain.toml
+- [ ] (M0) CI：PR 门禁全套（design/testing.md §8：fmt + clippy -D warnings + nextest 默认组 + doctests + fixture 确定性）+ nightly 占位；`disallowed_methods` lint 配置（不变量 4 的强制）
 - [ ] (M0) xtask：i18n-extract、录制回放 fixture 工具的骨架
 - [ ] (M0) 三个 spike 并按结论更新对应文档：libSQL、git CLI vs git2、gettext vs fluent
 - [ ] (M0) 顶层 README 扩写：项目定位、快速开始占位、文档链接
@@ -29,3 +29,4 @@
 - 项目启动设计：深读四款参考项目（分析结论存 ../references.md），与用户对齐 8 项关键决策（ADR-0001~0008），产出 architecture/roadmap + 9 份方向设计文档 + 本 worklog 体系。
 - 用户明确的核心差异化诉求：完整 ACP（含 fs/terminal 委派，atomcode 的反面教材）、reasoning_content 可配置回传、历史可编辑（分叉+删除）、提示词透明、CLI+GTK 双前端。
 - 下一步：单独对 M0 做细化规划（用户明确要求先停下来对齐）。
+- 补充测试体系设计（用户要求「详尽的测试，确保所有代码都能如期运行」）：新增 design/testing.md + worklog/testing.md；crate 清单加入 dev-only 的 `hatchery-testkit`（12 个）；architecture.md 不变量节与 roadmap DoD 挂接测试文档。

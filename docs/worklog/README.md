@@ -32,3 +32,4 @@
 | [cli.md](cli.md) | CLI TUI + headless | ../design/frontends.md §2 |
 | [gui.md](gui.md) | GTK 桌面端 | ../design/frontends.md §3 |
 | [platform.md](platform.md) | 配置/提示词/i18n | ../design/platform.md |
+| [testing.md](testing.md) | 测试体系 | ../design/testing.md |

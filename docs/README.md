@@ -25,6 +25,7 @@ Hatchery 是一个用 Rust 编写的开源 AI Agent Harness，支持 CLI 与原�
 | ACP（server + client） | [design/acp.md](design/acp.md) | [worklog/acp.md](worklog/acp.md) | `hatchery-acp` |
 | 前端（CLI TUI + GTK 桌面端） | [design/frontends.md](design/frontends.md) | [worklog/cli.md](worklog/cli.md), [worklog/gui.md](worklog/gui.md) | `hatchery-cli`, `hatchery-gui` |
 | 配置 / 提示词 / i18n | [design/platform.md](design/platform.md) | [worklog/platform.md](worklog/platform.md) | 横切 |
+| 测试体系 | [design/testing.md](design/testing.md) | [worklog/testing.md](worklog/testing.md) | 横切（`hatchery-testkit` + 所有 crate） |
 
 ## 约定
 
