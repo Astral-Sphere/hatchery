@@ -1,6 +1,6 @@
 # 路线图（M0–M5）
 
-> 每个里程碑的完成定义（DoD）都包含：`cargo test`/`clippy` 全绿 + 列出的端到端验证 + worklog 更新。测试分层、CI 门禁与「不变量 → 测试」映射见 [design/testing.md](design/testing.md)；各里程碑的测试交付物已列入其范围与 [worklog/testing.md](worklog/testing.md)。当前进度：**M0a 已落地**（脚手架 + 门禁 + CI + 三个 spike），M0b（protocol/kernel/store 实现）未开工；M0a 的「三平台 CI 全绿」还在修首轮跑出的问题，尚未闭环。
+> 每个里程碑的完成定义（DoD）都包含：`cargo test`/`clippy` 全绿 + 列出的端到端验证 + worklog 更新。测试分层、CI 门禁与「不变量 → 测试」映射见 [design/testing.md](design/testing.md)；各里程碑的测试交付物已列入其范围与 [worklog/testing.md](worklog/testing.md)。当前进度：**M0a 完成**（脚手架 + 门禁 + 三平台 CI 已跑通 + 三个 spike），M0b（protocol/kernel/store 实现）未开工。
 
 ## M0 — 地基（scaffold + 核心类型）
 

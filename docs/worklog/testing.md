@@ -15,7 +15,7 @@
 - [x] (M0) clippy `disallowed_methods`/`disallowed_types` 配置 + 作用域实测（见下「实测记录」）
 - [x] (M0) 两个 spike 的结论沉淀为回归测试：`crates/hatchery-store/tests/spike_engine.rs`、`crates/hatchery-capabilities/tests/spike_shadow_git.rs`（i18n spike 是纯选型裁决，M4 落地时才有可测物）
 - [x] (M0) `cargo-llvm-cov` 未装时 `xtask coverage` fail-loud 报安装命令（不静默跳过）
-- [ ] **(需要用户 push)** 三平台 CI 首跑；windows MSYS2 ucrt64 job 是最高风险项
+- [x] (M0) 三平台 CI 首跑通过（第 2 次尝试；windows MSYS2 ucrt64 那条也过了）
 - [ ] (M0b) store 属性测试参考模型（testkit 里独立写的纯 Vec/树实现）+ kill -9 崩溃测试框架（需专用 writer 子进程）
 - [ ] (M1) testkit v1：ScriptedProvider/MockWire(sse fixture)/Memory 后端三件套/TempWorkspace/TestDaemon/ClientProbe
 - [ ] (M1) 建 `hatchery-tests` 成员 crate（跨 crate e2e 与不变量套件的家）

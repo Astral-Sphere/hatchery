@@ -8,7 +8,7 @@
 
 **M0a 完成（2026-09-28）**：workspace 脚手架（12 member）、门禁脚本、三平台 CI、xtask layering 契约、三个 spike 全部落地并实测通过。M0b（protocol/kernel/store 的实现）未开工。
 
-仓库现状：`crates/`（11 crate）+ `xtask/` + `scripts/ci.sh` + `.github/workflows/{pr,nightly}.yml` + `docs/`。本地 `./scripts/ci.sh` 全绿；三平台 CI **第 1 次跑失败**（windows job 的 rustup 安装命令，已修待重跑；unix 两个 job 的结果尚未回传，不能假定已绿）——M0a 的门禁 DoD 要等这一次重跑才算闭环。
+仓库现状：`crates/`（11 crate）+ `xtask/` + `scripts/ci.sh` + `.github/workflows/{pr,nightly}.yml` + `docs/`。本地 `./scripts/ci.sh` 全绿；**三平台 CI 已跑通**（2026-09-28，第 2 次尝试）——M0a 的门禁 DoD 闭环。
 
 ## 待办
 
@@ -19,7 +19,7 @@
 - [x] (M0) MSRV 实测：`rust-version = "1.90"`（1.85/1.88 均失败，1.90.0 编译通过）
 - [x] (M0) CI 工具链改为**源码编译**（`cargo install cargo-nextest --version 0.9.146 --locked`，三平台一致；nightly 的 audit/llvm-cov 同）——用户裁决，避免预构建二进制在 MSYS2 下的不确定性
 - [x] (M0) 编译 flags：`.cargo/config.toml` 加 `[build] rustflags = ["-C", "target-cpu=native"]`（用户偏好；已实测进入 rustc 调用）。**纪律**：发布产物与交叉编译必须覆盖（`RUSTFLAGS=""`），否则二进制不可跨 CPU 移植
-- [ ] **(需要用户 push)** 三平台 CI 验证：**第 1 次跑失败**——windows job 的 `rustup-init --component rustfmt clippy` 参数不合法（该选项只吃一个逗号分隔值）。已修，并补上 `rustup set default-host` 与 windows-gnu 的 ABI 断言；细节见 worklog/testing.md「实测记录 · CI 首跑」。剩余风险按发生顺序：`cargo install` 源码编译 nextest 的耗时、libgit2 的 cc 构建、turso 在 windows-gnu 下能否编译、actions/cache 的 `C:/msys64/*` 路径
+- [x] (M0) 三平台 CI 跑通（第 1 次失败于 windows 的 `rustup-init --component` 参数 arity，已在 5b953fb 修复并补 windows-gnu 的 ABI 断言；细节见 worklog/testing.md「实测记录 · CI 首跑」）
 - [x] (M0) 顶层 README 扩写：项目定位、快速开始、文档链接、MSYS2 ucrt64 环境清单、仓库布局；docs/README.md 加「代码布局」节
 - [ ] (M1) 建立 docs/glossary.md 术语表
 - [ ] (M1) MSRV CI job（`cargo +1.90.0 check`）加进 nightly，防止依赖升级悄悄抬高 MSRV
