@@ -61,7 +61,10 @@ fn every_frame_kind_classifies_as_itself_and_survives_re_encoding() {
                 (stem, &incoming),
                 ("frame_request", Incoming::Request(_))
                     | ("frame_notification", Incoming::Notification(_))
-                    | ("frame_response_ok" | "frame_response_err", Incoming::Response(_))
+                    | (
+                        "frame_response_ok" | "frame_response_err",
+                        Incoming::Response(_)
+                    )
             ),
             "{stem} classified as {incoming:?}"
         );

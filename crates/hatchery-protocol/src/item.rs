@@ -46,8 +46,18 @@ impl Item {
     /// A root item with a freshly minted id and the current time.
     #[must_use]
     pub fn new(session: SessionId, kind: ItemKind) -> Self {
+        Self::with_id(ItemId::new(), session, kind)
+    }
+
+    /// An item with a specific id.
+    ///
+    /// For callers that had to announce the id before the payload existed: the kernel emits
+    /// `ItemStarted` with a stub when a streamed item opens and completes it with `ItemFinished`
+    /// once the text is in, and the id must not change in between.
+    #[must_use]
+    pub fn with_id(id: ItemId, session: SessionId, kind: ItemKind) -> Self {
         Self {
-            id: ItemId::new(),
+            id,
             session,
             parent: None,
             turn: None,
