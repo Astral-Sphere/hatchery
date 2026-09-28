@@ -860,14 +860,13 @@ dependencies = [
 name = "hatchery-testkit"
 version = "0.0.0"
 dependencies = [
- "anyhow",
+ "async-trait",
+ "futures",
  "hatchery-kernel",
  "hatchery-protocol",
- "insta",
- "serde",
  "serde_json",
- "tempfile",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]
