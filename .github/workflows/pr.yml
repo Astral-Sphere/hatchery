@@ -1,0 +1,148 @@
+name: PR
+
+# Three platforms on every pull request and on main (project decision, 2026-09-28).
+# Windows builds the x86_64-pc-windows-gnu toolchain inside MSYS2 UCRT64 rather than MSVC.
+#
+# The gate sequence lives in scripts/ci.sh so that "green locally" and "green in CI" are the
+# same statement; this file only prepares the toolchain.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: pr-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+  # Snapshot mismatches must fail the run instead of rewriting committed goldens.
+  INSTA_UPDATE: "no"
+  # Pinned to the version developers install locally (docs/design/testing.md §1).
+  NEXTEST_VERSION: 0.9.146
+
+jobs:
+  unix:
+    name: gate (${{ matrix.platform }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux
+            os: ubuntu-latest
+          - platform: macos
+            os: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # No toolchain action on purpose: rust-toolchain.toml names the channel and components, and
+      # the runner's preinstalled rustup installs them on the first cargo invocation.
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@${{ env.NEXTEST_VERSION }}
+
+      - name: Cache cargo and target
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: gate-${{ matrix.platform }}
+
+      - name: Gate
+        run: bash scripts/ci.sh
+
+      - name: Upload test report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: junit-${{ matrix.platform }}
+          path: target/nextest/ci/junit.xml
+          if-no-files-found: warn
+
+  windows:
+    name: gate (windows-msys2-ucrt64)
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    env:
+      # Kept outside the MSYS2 home so actions/cache can address them, and written with forward
+      # slashes because bash would eat backslashes. Native tools (rustup, cargo) accept these as
+      # Windows paths; bash-side file operations use the POSIX form below.
+      RUSTUP_HOME: C:/msys64/rustup
+      CARGO_HOME: C:/msys64/cargo
+      CARGO_BIN_POSIX: /c/msys64/cargo/bin
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          # gcc and pkg-config are only needed if the storage spike lands on a C-based engine
+          # (libsql-sys or rusqlite bundled); turso is pure Rust. pkg-config is also needed by
+          # GTK4 in M4.
+          pacboy: >-
+            gcc:p
+            pkg-config:p
+            make:p
+          install: >-
+            git
+            curl
+            unzip
+
+      - name: Cache cargo and target
+        uses: actions/cache@v6
+        with:
+          path: |
+            C:/msys64/cargo/registry
+            C:/msys64/cargo/git
+            target
+          key: ${{ runner.os }}-ucrt64-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-ucrt64-cargo-
+
+      - name: Install rustup with the windows-gnu host
+        run: |
+          set -euo pipefail
+          mkdir -p "$CARGO_BIN_POSIX"
+          export PATH="$CARGO_BIN_POSIX:$PATH"
+          if ! command -v rustup >/dev/null 2>&1; then
+            curl -sSfL https://sh.rustup.rs | sh -s -- -y \
+              --default-host x86_64-pc-windows-gnu \
+              --default-toolchain stable \
+              --profile minimal \
+              --component rustfmt clippy
+          fi
+          uname -a
+          rustup show active-toolchain
+          rustc -vV
+          cargo --version
+          cargo fmt --version
+          cargo clippy --version
+
+      - name: Install cargo-nextest (prebuilt)
+        run: |
+          set -euo pipefail
+          export PATH="$CARGO_BIN_POSIX:$PATH"
+          # Upstream publishes no windows-gnu build; the MSVC-built exe is a native Windows
+          # binary and runs fine from MSYS2 bash while driving our gnu-toolchain cargo.
+          curl -sSL -o /tmp/cargo-nextest.zip \
+            "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-${NEXTEST_VERSION}/cargo-nextest-${NEXTEST_VERSION}-x86_64-pc-windows-msvc.zip"
+          unzip -o /tmp/cargo-nextest.zip -d "$CARGO_BIN_POSIX"
+          cargo nextest --version
+
+      - name: Gate
+        run: |
+          set -euo pipefail
+          export PATH="$CARGO_BIN_POSIX:$PATH"
+          pwd
+          bash scripts/ci.sh
+
+      - name: Upload test report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: junit-windows-msys2-ucrt64
+          path: target/nextest/ci/junit.xml
+          if-no-files-found: warn
