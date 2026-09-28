@@ -77,7 +77,7 @@ dev hatchery-testkit       测试基建：fake 后端 / ScriptedProvider / TestD
     xtask                  开发者任务：layering 契约检查、coverage、i18n 提取、fixture 录制
 ```
 
-**12 个 workspace member = 上面 11 个 crate（10 个产品 crate + dev-only 的 testkit）+ `xtask`**。`cargo xtask layering`（以及同名集成测试）把这张图当契约检查：成员清单必须与 `xtask/src/layering.rs` 的 `LAYERS` 表一致、依赖必须严格向下、dev crate 不得成为产品 crate 的正常依赖、图中不得有环。改这张图就要同时改那张表。
+**12 个 workspace member = 上面 11 个 crate（10 个产品 crate + dev-only 的 testkit）+ `xtask`**。`cargo xtask layering`（以及同名集成测试）把这张图当契约检查，normal/build/dev **三种依赖边都查**：成员清单必须与 `xtask/src/layering.rs` 的 `LAYERS` 表一致；所有指向产品 crate 的边必须严格向下，dev 边也不例外——cargo 允许 dev 依赖向上甚至成环，方向规则是契约唯一的防线；产品 crate 不得以 normal/build 依赖 dev crate（`[dev-dependencies]` 是 testkit 的合法用法，而 build 脚本在用户机器上跑，等同交付测试代码）；构建图（normal + build）不得有环——dev 边不进环检测，因为 kernel dev→testkit、testkit normal→kernel 是合法模式，dev 边不在 cargo 实际编译的构建图里。改这张图就要同时改那张表。
 
 分层纪律（借鉴 atomcode 的 L0–D 分层与 codex 的「TUI 也是协议客户端」）：
 
