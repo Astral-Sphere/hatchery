@@ -51,6 +51,8 @@ jobs:
       # one fewer platform-compatibility surface, and the same on all three runners. The cache
       # above keeps ~/.cargo/bin, so this is a no-op on a warm run.
       - name: Install cargo-nextest
+        env:
+          RUSTFLAGS: -C target-cpu=native
         run: |
           if ! cargo nextest --version >/dev/null 2>&1; then
             cargo install cargo-nextest --version "${NEXTEST_VERSION}" --locked
@@ -155,6 +157,8 @@ jobs:
       # MSVC-built binary has to run under MSYS2, and no release asset has to be trusted. The cache
       # step above keeps C:/msys64/cargo/bin, so a warm run skips the build.
       - name: Install cargo-nextest
+        env:
+          RUSTFLAGS: -C target-cpu=native
         run: |
           set -euo pipefail
           export PATH="$CARGO_BIN_POSIX:$PATH"
