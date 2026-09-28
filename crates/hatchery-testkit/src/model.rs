@@ -60,11 +60,22 @@ impl ReferenceTree {
         item
     }
 
-    /// Forks: inserts a sibling of `target` and moves the head onto it.
+    /// Forks: inserts a sibling of `target` with the *same kind*, and moves the head onto it.
     ///
-    /// The old branch is untouched, which is what makes an edit undoable (ADR-0003).
-    pub fn edit_fork(&mut self, target: ItemId, kind: ItemKind) -> Option<Item> {
-        let parent = self.items.get(&target)?.parent;
+    /// Keeping the kind is the point of an edit — the user rewrote what that item said, they did
+    /// not turn a message into a tool call. The content itself is the editor's business; this model
+    /// tracks structure only.
+    ///
+    /// Returns `None` for an unknown item, and for a kind that carries no editable content — the
+    /// same rule the store enforces with `StoreError::NotEditable`.
+    pub fn edit_fork(&mut self, target: ItemId) -> Option<Item> {
+        let original = self.items.get(&target)?;
+        match original.kind {
+            ItemKind::UserMessage(_) | ItemKind::AssistantMessage(_) => {}
+            _ => return None,
+        }
+        let parent = original.parent;
+        let kind = original.kind.clone();
         let item = self.build(parent, kind);
         self.head = Some(item.id);
         Some(item)
@@ -133,6 +144,28 @@ impl ReferenceTree {
         ids
     }
 
+    /// Adopts the id another implementation assigned to the item this call just created.
+    ///
+    /// Ids are each implementation's own business — both mint UUIDv7s and neither knows the
+    /// other's — while the *structure* is what the property test compares. Renaming one item keeps
+    /// the two comparable without making either side copy the other's logic.
+    pub fn rename(&mut self, from: ItemId, to: ItemId) {
+        let mut item = self
+            .items
+            .remove(&from)
+            .unwrap_or_else(|| panic!("{from} is not in the reference tree"));
+        item.id = to;
+        for candidate in self.items.values_mut() {
+            if candidate.parent == Some(from) {
+                candidate.parent = Some(to);
+            }
+        }
+        if self.head == Some(from) {
+            self.head = Some(to);
+        }
+        self.items.insert(to, item);
+    }
+
     fn build(&mut self, parent: Option<ItemId>, kind: ItemKind) -> Item {
         self.clock += 1;
         let item = Item::with_id(ItemId::new(), self.session, kind)
@@ -166,7 +199,7 @@ impl ReferenceTree {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hatchery_protocol::Content;
+    use hatchery_protocol::{BranchNote, Content};
 
     fn message(text: &str) -> ItemKind {
         ItemKind::UserMessage(Content::text(text))
@@ -198,13 +231,16 @@ mod tests {
         let first = tree.append(message("one"));
         let second = tree.append(message("two"));
 
-        let forked = tree
-            .edit_fork(second.id, message("two, said better"))
-            .expect("fork");
+        let forked = tree.edit_fork(second.id).expect("fork");
         assert_eq!(
             forked.parent,
             Some(first.id),
             "the fork hangs off the target's parent"
+        );
+        assert_eq!(
+            forked.kind_tag(),
+            second.kind_tag(),
+            "an edit keeps the item's kind"
         );
         assert_eq!(tree.head(), Some(forked.id));
         assert_eq!(tree.len(), 3, "the old branch is kept");
@@ -214,6 +250,22 @@ mod tests {
         assert!(tree.switch_branch(second.id));
         assert_eq!(tree.active_chain().len(), 2);
         assert_eq!(tree.active_chain()[1].0, second.id);
+    }
+
+    #[test]
+    fn forking_an_item_without_content_is_refused() {
+        let session = SessionId::new();
+        let mut tree = ReferenceTree::new(session);
+        let note = tree.append(ItemKind::BranchNote(BranchNote {
+            note: "why".to_owned(),
+        }));
+
+        assert!(tree.edit_fork(note.id).is_none(), "a note has no content");
+        assert!(
+            tree.edit_fork(ItemId::new()).is_none(),
+            "nor does a missing item"
+        );
+        assert_eq!(tree.len(), 1, "a refused fork adds nothing");
     }
 
     #[test]
@@ -232,7 +284,7 @@ mod tests {
         assert_eq!(tree.len(), 3, "a refused delete changes nothing");
 
         // Fork from `first`: the head moves outside the tip's subtree, and now it may go.
-        let forked = tree.edit_fork(first.id, message("forked")).expect("fork");
+        let forked = tree.edit_fork(first.id).expect("fork");
         assert_eq!(forked.parent, Some(root.id));
         assert_eq!(tree.head(), Some(forked.id));
 
@@ -250,7 +302,7 @@ mod tests {
         let mut tree = ReferenceTree::new(session);
         let root = tree.append(message("root"));
         let kept = tree.append(message("kept"));
-        let forked = tree.edit_fork(kept.id, message("forked")).expect("fork");
+        let forked = tree.edit_fork(kept.id).expect("fork");
 
         assert!(tree.switch_branch(forked.id));
         let deleted = tree
