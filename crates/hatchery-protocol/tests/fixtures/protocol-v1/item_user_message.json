@@ -1,0 +1,18 @@
+{
+  "created_at": 1780000000000,
+  "id": "01890f47-0000-7000-8000-000000000002",
+  "kind": "user_message",
+  "parent": "01890f47-0000-7000-8000-000000000003",
+  "payload": {
+    "parts": [
+      {
+        "mime_type": "text/markdown",
+        "type": "resource",
+        "uri": "/tmp/notes.md"
+      }
+    ],
+    "text": "why is the store slow?"
+  },
+  "session": "01890f47-0000-7000-8000-000000000001",
+  "turn": "01890f47-0000-7000-8000-000000000004"
+}

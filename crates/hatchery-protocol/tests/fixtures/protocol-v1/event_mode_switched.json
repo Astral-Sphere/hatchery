@@ -1,0 +1,7 @@
+{
+  "from": "chat",
+  "generation": 3,
+  "session": "01890f47-0000-7000-8000-000000000001",
+  "to": "code",
+  "type": "mode_switched"
+}

@@ -1,0 +1,35 @@
+{
+  "capabilities": {
+    "methods": [
+      "daemon/hello",
+      "session/new",
+      "session/load",
+      "session/list",
+      "session/prompt",
+      "session/cancel",
+      "session/set_mode",
+      "session/set_config",
+      "session/edit_item",
+      "session/branch/list",
+      "session/branch/switch",
+      "session/branch/delete",
+      "session/rewind",
+      "session/delete",
+      "session/rename",
+      "approval/respond",
+      "config/get",
+      "config/set",
+      "prompt/render",
+      "store/export_jsonl"
+    ],
+    "modes": [
+      "chat",
+      "code"
+    ]
+  },
+  "daemon_version": "0.1.0",
+  "protocol_version": "1.0.0",
+  "supported_versions": [
+    "1.0.0"
+  ]
+}

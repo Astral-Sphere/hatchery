@@ -801,6 +801,7 @@ version = "0.0.0"
 dependencies = [
  "async-trait",
  "futures",
+ "hatchery-protocol",
  "hatchery-testkit",
  "insta",
  "serde",
@@ -831,7 +832,6 @@ dependencies = [
 name = "hatchery-protocol"
 version = "0.0.0"
 dependencies = [
- "insta",
  "serde",
  "serde_json",
  "thiserror",

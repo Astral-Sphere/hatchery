@@ -1,0 +1,11 @@
+{
+  "patch": {
+    "overrides": {
+      "ui": {
+        "show_reasoning": true
+      }
+    },
+    "reasoning_effort": "high"
+  },
+  "session_id": "01890f47-0000-7000-8000-000000000001"
+}

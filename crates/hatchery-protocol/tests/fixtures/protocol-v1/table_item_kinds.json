@@ -1,0 +1,11 @@
+[
+  "user_message",
+  "assistant_message",
+  "reasoning",
+  "tool_call",
+  "tool_result",
+  "checkpoint",
+  "compaction",
+  "mode_switch",
+  "branch_note"
+]

@@ -1,0 +1,11 @@
+{
+  "error": {
+    "code": "llm_error",
+    "message": "429 from the gateway",
+    "retryable": true
+  },
+  "generation": 3,
+  "session": "01890f47-0000-7000-8000-000000000001",
+  "turn": "01890f47-0000-7000-8000-000000000004",
+  "type": "turn_failed"
+}

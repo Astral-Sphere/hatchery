@@ -1,0 +1,15 @@
+{
+  "created_at": 1780000000002,
+  "id": "01890f47-0000-7000-8000-000000000002",
+  "kind": "reasoning",
+  "parent": "01890f47-0000-7000-8000-000000000003",
+  "payload": {
+    "signature": {
+      "data": "b3BhcXVl",
+      "scheme": "openai-encrypted-content"
+    },
+    "text": " leading space and\ntrailing newline \n"
+  },
+  "session": "01890f47-0000-7000-8000-000000000001",
+  "turn": "01890f47-0000-7000-8000-000000000004"
+}
