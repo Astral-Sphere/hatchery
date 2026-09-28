@@ -56,7 +56,7 @@
 
 ## M5 — 生态与打磨
 
-**范围**：MCP client（rmcp，会话级配置透传兑现）、上下文压缩（compaction item + side-query 摘要）、沙箱（landlock/bwrap，接口已留）、自定义模式开放、JSONL 导入、otel（过 ADR 后）、文档英文化评估。
+**范围**：MCP client（rmcp，会话级配置透传兑现）、上下文压缩（compaction item + side-query 摘要）、沙箱（landlock/bwrap，接口已留）、自定义模式开放、JSONL 导入、otel（过 ADR 后）、**WASM 工具插件评估**（wasmtime + WASI，仅评估：能力边界/性能/生态调研，实施须过新 ADR——ADR-0009）、文档英文化评估。
 
 **DoD**：按范围逐项验收。
 

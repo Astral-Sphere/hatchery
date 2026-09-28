@@ -78,6 +78,9 @@ dev hatchery-testkit       测试基建：fake 后端 / ScriptedProvider / TestD
 - **kernel 零业务语义**：不知道 Chat/Code 模式、不知道工作区、不知道存储格式。它只驱动「LLM 请求 → 流事件 → 工具调用 → 结果回填」循环，通过 trait 与外界交互。
 - **capabilities 定义接缝，tools/acp 提供实现**：工具永远通过 `FsBackend`/`TerminalBackend`/`ApprovalGate` trait 操作外界，绝不直接 touch 文件系统或进程。这是 ACP 完整适配（ADR-0004）与将来远程执行后端（docker/ssh）的前提。
 - **daemon 是唯一的 runtime 所有者**：前端不重建任何生命周期状态，只投影事件流（view projection）。
+- **Disposer 纪律**（ADR-0009）：一切有副作用的注册（runtime 装配、hub 订阅、adapter 注册、检查点句柄）必须返回 disposer（Drop guard 或显式 dispose），teardown 严格逆序；有测试锁定。
+- **反预拆分刹车**（ADR-0009）：trait 在第二个实现出现前不做 provider 层抽象，crate 在第二个消费者出现前不拆。
+- **Fail-loud 装配**（ADR-0009）：daemon 按 profile 装配组件，启动期审计——必需组件缺失即拒绝服务并输出错误清单；「运行时静默 PENDING」是反模式。
 - 新增跨 crate 依赖必须在 ADR 或 worklog 里说明理由；禁止环。
 
 ## 4. 数据流

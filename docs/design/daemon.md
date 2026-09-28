@@ -46,9 +46,23 @@ struct SessionSlot {
 }
 ```
 
-- **runtime 生命周期**：`session/new|load` 时装配 Agent（builder 注入 provider/tools/history/sink）；turn 之间 runtime 常驻内存；空闲超时（默认 30min 无订阅者且无进行中 turn）落盘卸载。
+- **runtime 生命周期**：`session/new|load` 时装配 Agent（builder 注入 provider/tools/history/sink）；turn 之间 runtime 常驻内存；空闲超时（默认 30min 无订阅者且无进行中 turn）落盘卸载。**卸载/关闭走 disposer 逆序**（ADR-0009 纪律 1）：订阅者 → runtime → 检查点句柄 → store writer → 监听器，每步的 disposer 由装配时注册。
 - **代际号**：runtime 每次（重）建 generation+1 并落库；所有事件带 generation，hub 丢弃旧代事件；`GenerationBumped` 通知前端重置视图。
 - **崩溃恢复**：daemon 重启后 sessions 表 status=running 的会话标记为 interrupted（发 TurnFailed 存档），不自动续跑（v1）。
+
+### 3.1 Profile 化装配与启动审计（ADR-0009）
+
+daemon 启动按命名 **profile** 装配组件捆绑，装配表是显式数据（不是散落的 if/else）：
+
+| profile | 监听器 | 能力后端 | 工具集 | 场景 |
+|---|---|---|---|---|
+| `local` | UDS | Local 三件套 | 按模式 | 常驻 daemon（CLI/GTK attach） |
+| `headless` | stdio | Local 三件套 | 按模式 | `hatchery exec` embedded |
+| `acp-stdio` | stdio(ACP) | 按宿主能力协商（ADR-0004 矩阵） | Code 全量 | `hatchery acp` attach 常驻 daemon |
+| `acp-standalone` | stdio(ACP) | 同上 | 同上 | 宿主 spawn 的自包含进程 |
+
+- **启动审计（fail-loud）**：装配完成后核对 profile 声明的必需组件（provider 可用、密钥环境变量存在、监听器绑定成功、store 迁移完成）；任一未 resolve → 拒绝服务，输出缺失清单后退出（非零码）。dsh `auditStartupEntries` 语义，杜绝「运行时永久 PENDING」。
+- 注册句柄：profile 内的组件注册（provider adapter、MCP 连接等）返回 `Handle`（disposer + 原子 `replace()`），运行中换 provider 走整表原子替换（见 capabilities.md §1）。
 
 ## 4. Live Hub（事件扇出）
 

@@ -21,6 +21,8 @@ pub struct ApprovalRequest {
 pub struct ToolRegistry { /* name → Arc<dyn Tool>；turn 开始冻结快照（kernel.md §5） */ }
 ```
 
+**注册句柄模式**（ADR-0009 纪律 3，借鉴 dsh `registerAdapter()` → handle）：`register()` 返回 `RegistrationHandle { dispose(), replace() }`——`replace()` 用新实现整表原子替换旧实现（进行中的 turn 不受影响，因为 kernel 持有的是冻结快照），`dispose()` 摘除注册。MCP 工具、用户自定义工具、运行中换 provider adapter 全部走这一模式；禁止对注册表的原地突变。
+
 ### 本地实现（本 crate 提供）
 
 - `LocalFs`：tokio::fs + 路径校验（工作区逃逸检查、危险路径硬门）+ **写前打影子 Git 检查点**。
@@ -65,6 +67,7 @@ impl CheckpointStore {
 | `checkpoint_diff` / `rewind` | Code | CheckpointStore | 无需（只读）/ 需确认（restore） |
 | `subagent`（M3） | Code | ACP client | 继承父会话策略 |
 | MCP 工具（M5） | 按配置 | rmcp client | 默认 Executes 级审批 |
+| WASM 插件工具（M5 评估占位，ADR-0009） | 按配置 | wasmtime + WASI（沙箱化） | 默认 Executes 级审批；实施前须过新 ADR |
 
 工具输出统一 `ToolOutput { text, artifacts?, spilled? }`；超阈值 spill 到 `~/.local/state/hatchery/tool-results/`，库存引用。
 

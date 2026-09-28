@@ -41,6 +41,7 @@ Rust workspace，约 14 个 crate，自称 100% AI 生成。
 DeepSeek 官方开源（MIT），TS monorepo，60+ 插件包。
 
 - **everything is a plugin**：基于 Cordis（vendored），agent loop、模型适配器、会话日志皆可替换；运行形态即 profile（web/headless/sdk/acp/desktop）。
+- **Cordis 机制深挖（2026-09-28 二次深读，ADR-0009 的证据基础）**：核心 2696 行（`vendor/cordis/src/` 9 文件）+ 外围设施 ~3100 行（loader/schemastery/hmr/include）。ctx 是 `Proxy`（`reflect.ts` get/set trap 沿 fiber 祖先链查字符串键字典）；类型安全只有 declaration merging（163 个文件增强 `Context`），`inject: ['fs']` 与之无编译期连接，拼错 = 永久 PENDING fiber。事故记录 `docs/postmortem/0001`：多写一行 `export default apply` 静默丢 inject，**178 单测全绿、行覆盖 100%，生产完全不可用**；`0002`：`disabled: !!js`（`new Function + eval`）从不被求值，fs 工具永久关闭。HMR（`packages/boot/hmr/`）依赖 Node `--expose-internals`，且**无状态迁移**（dispose-and-recreate，状态本就外置在持久会话日志 + projection）。dsh 自己的刹车：`.agents/notes/rejected/simplification/2026-07-19-fold-compaction-package-split.md` 明文「**Don't split preemptively**」；事件词汇拒绝上运行时 schema。capability seam 三角色（Definition 抽象 Service / Provider 子类或注册式 / Consumer 只 inject）权威定义在 `.agents/notes/implemented/architecture/2026-06-13-capability-seams.md`；`docs/capability-seams.md` 是生成物，~180 个 ctx 服务的 owner/impl/consumer 图。
 - **Capability seam 三角色模型**（Definition/Provider/Consumer，`docs/capability-seams.md`）：换一个 fs/subprocess provider，Bash、PTY、LSP 全部跟着迁移到远程沙箱。**hatchery capabilities 层的直接 inspiration。**
 - **reasoning**：`packages/llm/llm-deepseek/src/config.ts:85` 暴露 `reasoningEffort: 'off'|'low'|'high'|'max'`（volatile 即时生效）；回放**逐字节精确**以命中 KV cache（决策记录 `.agents/notes/archived/bug-fix/2026-08-19-deepseek-reasoning-passback-every-turn.md`）；`assembler.ts` 把 `reasoning-delta` 累积为 `reasoning` 块。独有 wire 扩展 `dsh_session_log`（会话日志随请求增量上传，watermark at-least-once）。
 - **存储**：append-only JSONL（`session.vN.jsonl[.zstd]`，代际迁移链、独占发布、从不改写，`docs/persistence-catalog.md`）；历史不可编辑但支持 fork（`inheritedEventCount` 记录分叉点）；非会话数据走 `packages/storage`（JSON/SQLite 双后端 + 类型化 KV）。
@@ -70,9 +71,10 @@ TS monorepo（0.24.6），远超「Gemini CLI fork」；a2a-server 已移除，A
 4. atomcode 影子 Git rewind + qwen-code branch points → 历史分叉 + 代码回滚（ADR-0003/0006）。
 5. dsh "model-visible means logged" 不变量 → 存储设计（ADR-0002）。
 6. codex 配置分层 + per-key origins；atomcode PRECEDENCE 安全门不可覆盖。
+7. dsh/Cordis 的五条语言无关纪律（disposer 逆序、反预拆分刹车、注册句柄原子替换、profile 化装配 + 启动 fail-loud 审计、状态外置 + projection）→ 模块化策略（ADR-0009）。
 
 **规避**：
 1. atomcode 单 runtime 强绑定本地工具导致 ACP 适配残缺。
-2. dsh 的 everything-is-plugin 对 Rust 过重：hatchery 用 trait + 编译期装配，不做动态插件树（M5+ 再评估扩展机制）。
+2. dsh 的 Cordis 运行时机制不移植：Proxy ctx/字符串键服务字典/declaration-merging 假类型安全/`!!js` eval/HMR/epoch 重载依赖 JS 动态性且有事故实证（见上 Cordis 深挖）；hatchery 用 trait + 编译期装配，只吸收其纪律层（ADR-0009）；第三方扩展面走 MCP/ACP，WASM 插件 M5 评估。
 3. qwen-code 的「CLI 进程内直连 + 远程前端走 daemon」双接线：维护两套路径，hatchery 统一走协议（保留 `--embedded` 进程内 daemon 作为优化，但协议不变）。
 4. codex 移除 Chat Completions 押注 Responses-only：hatchery 面向第三方 OpenAI 兼容生态，必须双 wire 并存。

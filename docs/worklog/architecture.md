@@ -30,3 +30,4 @@
 - 用户明确的核心差异化诉求：完整 ACP（含 fs/terminal 委派，atomcode 的反面教材）、reasoning_content 可配置回传、历史可编辑（分叉+删除）、提示词透明、CLI+GTK 双前端。
 - 下一步：单独对 M0 做细化规划（用户明确要求先停下来对齐）。
 - 补充测试体系设计（用户要求「详尽的测试，确保所有代码都能如期运行」）：新增 design/testing.md + worklog/testing.md；crate 清单加入 dev-only 的 `hatchery-testkit`（12 个）；architecture.md 不变量节与 roadmap DoD 挂接测试文档。
+- dsh/Cordis 模块化二次深读（用户问「能否采纳其激进模块化」，探索代理做了 vendor/cordis 代码级分析）：结论 = 运行时机制不移植（Proxy ctx/字符串键字典/`!!js` eval/HMR，postmortem 0001/0002 事故实证），吸收五条语言无关纪律 → **ADR-0009**；architecture.md §3 分层纪律 +3 条（disposer 逆序/反预拆分/fail-loud 装配）；第三方扩展面定为 MCP + ACP，WASM 工具插件列 M5 评估占位；证据细节补进 references.md dsh 节。

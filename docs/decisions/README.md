@@ -19,3 +19,4 @@
 | [0006](0006-shadow-git-rewind.md) | 代码回滚用影子 Git 检查点 | accepted |
 | [0007](0007-llm-openai-interface.md) | LLM 层基于 openai-interface，reasoning 逐字节回放 | accepted |
 | [0008](0008-gui-gtk4-libadwaita.md) | GUI 用 gtk4-rs + libadwaita，i18n 用 gettext | accepted |
+| [0009](0009-modularity-strategy.md) | 模块化：编译期装配 + Cordis 纪律借鉴，不做动态插件树 | accepted |

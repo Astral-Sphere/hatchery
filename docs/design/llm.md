@@ -42,6 +42,8 @@ pub struct ProviderConfig {
 }
 ```
 
+adapter 注册表采用与 ToolRegistry 相同的注册句柄模式（`register() → Handle{dispose, replace}`，见 capabilities.md §1 与 ADR-0009 纪律 3）：运行中更换/升级 provider adapter 走整表原子替换，进行中的 turn 使用其开始时的冻结快照。
+
 ## 3. effort 映射（能力表）
 
 canonical：`Off | Low | Medium | High | Max`。内置默认表（借鉴 qwen-code 的 per-model `disableField` 思路），config 可整条覆盖：

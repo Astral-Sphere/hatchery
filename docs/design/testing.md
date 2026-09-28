@@ -121,6 +121,8 @@ pub fn assert_golden(value: impl Debug);      // insta 封装，统一快照命�
 - 租约与代际（不变量 1 专属）：`stale_runtime_events_are_dropped`——旧 generation 事件注入 hub，断言订阅者收不到；`session_lease_blocks_second_runtime`。
 - hub：两订阅者收到同序事件；迟加入者 replay 完整；慢消费者被踢且不阻塞他人；coalescing 合并 delta 但控制事件不合并、不乱序。
 - 崩溃恢复：status=running 的会话重启后标记 interrupted 且发过 TurnFailed 存档事件。
+- **fail-loud 装配审计**（ADR-0009）：`startup_audit_missing_provider_refuses_service`——profile 必需组件缺失（如密钥环境变量不存在）时 daemon 拒绝服务、输出缺失清单、非零退出；逐个必需组件各一条。
+- **teardown 逆序**（ADR-0009）：装配时注册带序号的 disposer，关闭后断言执行序严格为注册逆序（订阅者→runtime→检查点→store→监听器）。
 - e2e 主干（§4）大部分在此层驱动。
 
 ### 3.7 acp

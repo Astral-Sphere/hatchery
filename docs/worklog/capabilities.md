@@ -2,7 +2,7 @@
 
 - 范围：Fs/Terminal/Approval trait 与本地实现、影子 Git、内置工具、安全硬门、模式装配
 - 设计文档：[../design/capabilities.md](../design/capabilities.md)
-- 相关 ADR：0004、0005、0006
+- 相关 ADR：0004、0005、0006、0009
 
 ## 当前状态
 
@@ -19,6 +19,7 @@
 - [ ] (M2) web_fetch + spill + 凭据脱敏
 - [ ] (M2) disallowed_methods lint 配置（工具代码禁 std::fs/std::process）
 - [ ] (M3) 与 AcpClientFs/AcpClientTerminal 的绑定矩阵联测
+- [ ] (M5) WASM 工具插件评估（wasmtime + WASI；仅评估，实施须过新 ADR——ADR-0009 占位）
 
 ## 开放问题
 
@@ -30,3 +31,4 @@
 
 ### 2026-09-28
 - 初稿。核心设计输入：dsh capability seam 三角色模型 + atomcode 影子 Git 实现细节（预算熔断、RAII 补偿）+ atomcode ACP 缺 fs/terminal 的反面教材（ADR-0004）。
+- ADR-0009 落地：ToolRegistry 正式采用注册句柄模式（`register() → Handle{dispose, replace}`，整表原子替换，与 kernel Turn Tool Snapshot 衔接）；工具表加 WASM 插件 M5 评估占位行；反预拆分刹车对 trait/包演进生效（第二个实现出现前不拆）。
