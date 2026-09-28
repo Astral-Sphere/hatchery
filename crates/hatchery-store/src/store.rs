@@ -115,14 +115,19 @@ pub trait SessionStore: Send + Sync {
         all_branches: bool,
     ) -> Result<u64, StoreError>;
 
-    /// Flushes and stops the writer.
+    /// Stops the writer and waits for it to finish.
+    ///
+    /// Graceful shutdown is about waiting, not about durability: committed items survive even an
+    /// abrupt kill (`tests/crash_recovery.rs`).
     async fn shutdown(&self) -> Result<(), StoreError>;
 }
 
 /// The embedded engine (turso, ADR-0010).
 ///
 /// Owns a writer task; dropping the store closes the channel and lets the task finish. Call
-/// [`SessionStore::shutdown`] to wait for it and flush the WAL.
+/// [`SessionStore::shutdown`] to *wait* for it — durability does not depend on being graceful:
+/// committed items survive a `kill -9` (`tests/crash_recovery.rs`), and the M0 spike measured that
+/// `PRAGMA synchronous` changes nothing measurable, so no explicit WAL checkpoint is issued here.
 pub struct TursoStore {
     commands: mpsc::Sender<StoreCmd>,
     writer: Mutex<Option<JoinHandle<()>>>,
