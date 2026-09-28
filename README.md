@@ -62,10 +62,12 @@ Linux / macOS / Windows 三平台都进 PR CI。Windows 走 **MSYS2 UCRT64 + `x8
 pacman -S --needed mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-pkg-config \
                    mingw-w64-ucrt-x86_64-make git curl
 curl -sSfL https://sh.rustup.rs | sh -s -- \
-     --default-host x86_64-pc-windows-gnu --default-toolchain stable \
-     --component rustfmt clippy
+     --default-host x86_64-pc-windows-gnu --default-toolchain stable
 cargo install cargo-nextest --locked
 ```
+
+（rustup 的 default profile 自带 rustfmt + clippy；`rust-toolchain.toml` 也声明了这两个组件。注意
+`rustup-init --component` 只接受**一个逗号分隔值**，`--component rustfmt clippy` 会直接报参数错误。）
 
 存储引擎（turso）与 i18n（fluent）是纯 Rust；影子 Git 用 **vendored libgit2**（`git2` crate），所以
 **运行时不需要用户机器上有 git**，代价是构建期需要一个 C 编译器（gcc/clang；三平台 CI 已覆盖，

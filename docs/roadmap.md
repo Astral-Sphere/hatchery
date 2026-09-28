@@ -1,12 +1,12 @@
 # 路线图（M0–M5）
 
-> 每个里程碑的完成定义（DoD）都包含：`cargo test`/`clippy` 全绿 + 列出的端到端验证 + worklog 更新。测试分层、CI 门禁与「不变量 → 测试」映射见 [design/testing.md](design/testing.md)；各里程碑的测试交付物已列入其范围与 [worklog/testing.md](worklog/testing.md)。当前处于 **M0 之前**：文档定稿，等待 M0 细化规划。
+> 每个里程碑的完成定义（DoD）都包含：`cargo test`/`clippy` 全绿 + 列出的端到端验证 + worklog 更新。测试分层、CI 门禁与「不变量 → 测试」映射见 [design/testing.md](design/testing.md)；各里程碑的测试交付物已列入其范围与 [worklog/testing.md](worklog/testing.md)。当前进度：**M0a 已落地**（脚手架 + 门禁 + CI + 三个 spike），M0b（protocol/kernel/store 实现）未开工；M0a 的「三平台 CI 全绿」还在修首轮跑出的问题，尚未闭环。
 
 ## M0 — 地基（scaffold + 核心类型）
 
 **范围**
 - Cargo workspace 脚手架：12 个 workspace member（11 个 crate = 10 个产品 crate + dev-only 的 `hatchery-testkit`，外加 `xtask`；见 architecture.md §3）+ CI PR 门禁全套（testing.md §8）+ nextest 分组。
-- `hatchery-protocol`：Thread/Turn/Item/事件/方法的完整类型定义 + JSON fixture 测试。
+- `hatchery-protocol`：Session/Turn/Item/事件/方法的完整类型定义 + JSON fixture 测试。
 - `hatchery-kernel`：Turn 状态机 + trait 定义 + fake provider 单测。
 - `hatchery-store`：schema v1 + writer actor + rebuild_history + 分支操作（分叉/切换/级联删）+ 属性测试。
 - spike（各半天，结论写进对应 worklog）：**三个全部完成**——存储引擎 → turso 0.7.2（ADR-0010，12 项门槛测试常驻）；影子 Git 后端 → git2 vendored（ADR-0012，11 项门槛测试常驻）；i18n → fluent（ADR-0011）。

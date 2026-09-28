@@ -114,17 +114,38 @@ jobs:
       - name: Install rustup with the windows-gnu host
         run: |
           set -euo pipefail
+          # Project decision: windows-gnu inside MSYS2 UCRT64, never MSVC. The guard below may
+          # find the rustup that ships in the runner image, whose default host is msvc — so the
+          # host tuple is pinned instead of inherited.
+          host=x86_64-pc-windows-gnu
           mkdir -p "$CARGO_BIN_POSIX"
           export PATH="$CARGO_BIN_POSIX:$PATH"
           if ! command -v rustup >/dev/null 2>&1; then
-            curl -sSfL https://sh.rustup.rs | sh -s -- -y \
-              --default-host x86_64-pc-windows-gnu \
-              --default-toolchain stable \
-              --profile minimal \
-              --component rustfmt clippy
+            curl -sSfL https://sh.rustup.rs | sh -s -- -y --no-modify-path \
+              --default-host "$host" --default-toolchain none --profile minimal
           fi
+          rustup set default-host "$host"
+          # The toolchain goes on in its own command, not as rustup-init arguments, for two
+          # measured reasons (rustup-init 1.29.1): `--component` takes a *single* comma-separated
+          # value, so `--component rustfmt clippy` aborts with "unexpected argument 'clippy'";
+          # and requested components are dropped with "ignoring requested components" when
+          # --default-toolchain is none. This command is idempotent and covers a warm cache,
+          # which restores the rustup binary under CARGO_HOME/bin but not RUSTUP_HOME — that one
+          # stays out of the cache so `stable` can never go stale against the unix jobs.
+          channel=$(sed -n 's/^channel[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' rust-toolchain.toml)
+          if [ -z "$channel" ]; then
+            printf 'cannot read the toolchain channel from rust-toolchain.toml\n' >&2
+            exit 1
+          fi
+          rustup toolchain install "$channel-$host" --profile minimal --component rustfmt,clippy
           uname -a
-          rustup show active-toolchain
+          # Fail loud rather than quietly compiling with the other ABI.
+          active=$(rustup show active-toolchain)
+          printf 'active toolchain: %s\n' "$active"
+          case "$active" in
+            *"$host"*) ;;
+            *) printf 'expected the active toolchain to target %s\n' "$host" >&2; exit 1 ;;
+          esac
           rustc -vV
           cargo --version
           cargo fmt --version
