@@ -1,9 +1,22 @@
 //! The workspace layering contract: `docs/architecture.md` §3 made machine-checkable.
 //!
 //! Dependencies must point strictly downwards (`L0` → `L1` → `L2` → `L3` → `L4` → frontends),
-//! never sideways between crates of the same layer and never upwards, and the graph must be
-//! acyclic. Dev-only crates sit above everything and may depend on any product crate, but no
-//! product crate may take a dev crate as a normal dependency — that would ship test code.
+//! never sideways between crates of the same layer and never upwards. All three dependency kinds
+//! `cargo metadata` reports are checked, because a rule that only sees one kind certifies less
+//! than it claims:
+//!
+//! - **normal** and **build** edges form the build graph: strictly downward, acyclic, and no
+//!   product crate may take a dev-only crate (`hatchery-testkit`, `xtask`) — that would ship
+//!   test code.
+//! - **dev** edges may point at the dev-only crates (the sanctioned way to use the testkit), but
+//!   every other dev edge must be strictly downward too. Cargo permits dev-dependency cycles and
+//!   upward dev edges, so the direction rule is the only thing standing between the contract and
+//!   a test-only coupling that inverts it: `[dev-dependencies] hatchery-kernel` in
+//!   `hatchery-protocol` would be an `L0` → `L1` edge wearing a test costume.
+//! - Edges whose *target* is a dev-only crate are exempt from the direction rule, and dev edges
+//!   do not join the cycle walk: `hatchery-kernel` dev-depends on `hatchery-testkit` while the
+//!   testkit normal-depends on the kernel — a cycle in the union graph, but not in the build
+//!   graph cargo actually compiles.
 //!
 //! `hatchery-protocol` sits at the bottom because its vocabulary (ids, `Content`, `ToolOutput`,
 //! `ApprovalRequest`, `Usage`) is shared: the kernel needs those types too, and a sideways `L0`
@@ -52,7 +65,8 @@ pub enum Layer {
     L4,
     /// CLI and GTK frontends.
     Frontend,
-    /// Dev-only crates (`hatchery-testkit`, `xtask`): exempt from the downward rule.
+    /// Dev-only crates (`hatchery-testkit`, `xtask`): any crate may depend on them from
+    /// `[dev-dependencies]`, and they may depend on anything.
     Dev,
 }
 
@@ -85,39 +99,92 @@ impl fmt::Display for Layer {
     }
 }
 
+/// How a dependency is declared, as `cargo metadata` reports it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum DepKind {
+    /// `[dependencies]` — part of the build graph.
+    Normal,
+    /// `[build-dependencies]` — part of the build graph, and just as shippable: a build script
+    /// runs on every user's machine.
+    Build,
+    /// `[dev-dependencies]` — built only for this crate's own tests and examples.
+    Dev,
+}
+
+impl DepKind {
+    fn from_metadata(kind: Option<&str>) -> Self {
+        match kind {
+            None => Self::Normal,
+            Some("dev") => Self::Dev,
+            // Cargo reports no other kinds; an unknown spelling is treated as part of the build
+            // graph, which is the strictest reading.
+            Some(_) => Self::Build,
+        }
+    }
+
+    /// True when the edge is part of the graph cargo compiles in dependency order.
+    fn in_build_graph(self) -> bool {
+        self != Self::Dev
+    }
+}
+
+impl fmt::Display for DepKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = match self {
+            Self::Normal => "normal",
+            Self::Build => "build",
+            Self::Dev => "dev",
+        };
+        f.write_str(name)
+    }
+}
+
+/// One dependency edge between workspace members.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Edge {
+    /// The crate depended on.
+    pub to: String,
+    /// How the dependency is declared.
+    pub kind: DepKind,
+}
+
 /// Outcome of a successful check.
 #[derive(Clone, Copy, Debug)]
 pub struct Report {
     /// Number of workspace members.
     pub members: usize,
-    /// Number of normal (non-dev, non-build) dependency edges between members.
+    /// Build-graph edges (normal + build) between members.
     pub edges: usize,
+    /// Dev-only edges between members.
+    pub dev_edges: usize,
 }
 
 impl fmt::Display for Report {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "layering ok: {} members, {} dependency edges, strictly downward, no cycles",
-            self.members, self.edges
+            "layering ok: {} members, {} build edges + {} dev edges, strictly downward, no cycles",
+            self.members, self.edges, self.dev_edges
         )
     }
 }
 
-type Graph = BTreeMap<String, BTreeSet<String>>;
+type Graph = BTreeMap<String, BTreeSet<Edge>>;
 
 /// Verifies the whole workspace and reports what was checked.
 pub fn check() -> Result<Report> {
     let root = workspace_root()?;
     let packages = cargo_metadata(&root)?;
     let members = members(&packages)?;
-    let edges = normal_edges(&packages, &members);
+    let edges = member_edges(&packages, &members);
     reject_dev_crates_as_product_deps(&edges, &members)?;
     reject_layer_violations(&edges)?;
     reject_cycles(&edges)?;
+    let all: Vec<&Edge> = edges.values().flatten().collect();
     Ok(Report {
         members: members.len(),
-        edges: edges.values().map(BTreeSet::len).sum(),
+        edges: all.iter().filter(|edge| edge.kind.in_build_graph()).count(),
+        dev_edges: all.iter().filter(|edge| edge.kind == DepKind::Dev).count(),
     })
 }
 
@@ -161,25 +228,28 @@ fn members(packages: &[Package]) -> Result<BTreeSet<String>> {
     if !absent.is_empty() {
         return Err(anyhow!(
             "listed in the layer table but not a workspace member: {absent:?} — remove them from \
-             xtask::layering::LAYERS and from docs/architecture.md §3"
+             xtask::layering::LAYERS and docs/architecture.md §3"
         ));
     }
     Ok(found)
 }
 
-fn normal_edges(packages: &[Package], members: &BTreeSet<String>) -> Graph {
+/// Every member-to-member dependency edge, of every kind.
+fn member_edges(packages: &[Package], members: &BTreeSet<String>) -> Graph {
     let mut edges: Graph = members
         .iter()
         .map(|m| (m.clone(), BTreeSet::new()))
         .collect();
     for package in packages {
-        let Some(deps) = edges.get_mut(&package.name) else {
+        let Some(from) = edges.get_mut(&package.name) else {
             continue;
         };
         for dep in &package.dependencies {
-            let is_normal = dep.kind.is_none();
-            if is_normal && members.contains(&dep.name) {
-                deps.insert(dep.name.clone());
+            if members.contains(&dep.name) {
+                from.insert(Edge {
+                    to: dep.name.clone(),
+                    kind: DepKind::from_metadata(dep.kind.as_deref()),
+                });
             }
         }
     }
@@ -191,11 +261,18 @@ fn reject_dev_crates_as_product_deps(edges: &Graph, members: &BTreeSet<String>) 
         if Layer::of(product).is_some_and(Layer::is_dev) {
             continue;
         }
-        for dep in &edges[product] {
-            if Layer::of(dep).is_some_and(Layer::is_dev) {
+        for edge in &edges[product] {
+            // A dev-dependency on the testkit is the sanctioned pattern; anything else that pulls
+            // a dev crate into a product crate ships test code to users.
+            if edge.kind == DepKind::Dev {
+                continue;
+            }
+            if Layer::of(&edge.to).is_some_and(Layer::is_dev) {
                 return Err(anyhow!(
-                    "{product} takes dev-only crate {dep} as a normal dependency; use \
-                     [dev-dependencies] so test code is never shipped"
+                    "{product} takes dev-only crate {} as a {} dependency; only \
+                     [dev-dependencies] may point at dev crates, so test code is never shipped",
+                    edge.to,
+                    edge.kind
                 ));
             }
         }
@@ -206,12 +283,19 @@ fn reject_dev_crates_as_product_deps(edges: &Graph, members: &BTreeSet<String>) 
 fn reject_layer_violations(edges: &Graph) -> Result<()> {
     for (from, deps) in edges {
         let from_layer = layer_or_err(from)?;
-        for to in deps {
-            let to_layer = layer_or_err(to)?;
+        for edge in deps {
+            let to_layer = layer_or_err(&edge.to)?;
+            // Dev-only crates sit above everything: any crate may use them from its tests, and
+            // they may use each other.
+            if to_layer.is_dev() {
+                continue;
+            }
             if from_layer <= to_layer {
                 return Err(anyhow!(
-                    "{from} ({from_layer}) depends on {to} ({to_layer}): dependencies must point \
-                     strictly downwards (docs/architecture.md §3)"
+                    "{from} ({from_layer}) depends on {} ({to_layer}) via a {} dependency: \
+                     dependencies must point strictly downwards (docs/architecture.md §3)",
+                    edge.to,
+                    edge.kind
                 ));
             }
         }
@@ -226,11 +310,25 @@ fn layer_or_err(crate_name: &str) -> Result<Layer> {
 }
 
 fn reject_cycles(edges: &Graph) -> Result<()> {
+    // Dev edges stay out of the walk on purpose — see the module docs. The build graph is what
+    // cargo compiles in dependency order, so it is what must be acyclic.
+    let build: Graph = edges
+        .iter()
+        .map(|(from, deps)| {
+            (
+                from.clone(),
+                deps.iter()
+                    .filter(|edge| edge.kind.in_build_graph())
+                    .cloned()
+                    .collect(),
+            )
+        })
+        .collect();
     let mut settled: BTreeSet<String> = BTreeSet::new();
-    for node in edges.keys().cloned().collect::<Vec<_>>() {
+    for node in build.keys().cloned().collect::<Vec<_>>() {
         let mut seen = BTreeSet::new();
         let mut path = Vec::new();
-        visit(&node, edges, &mut settled, &mut seen, &mut path)?;
+        visit(&node, &build, &mut settled, &mut seen, &mut path)?;
     }
     Ok(())
 }
@@ -260,8 +358,8 @@ fn visit(
     }
 
     path.push(node.to_owned());
-    for dep in edges.get(node).into_iter().flatten() {
-        visit(dep, edges, settled, seen, path)?;
+    for edge in edges.get(node).into_iter().flatten() {
+        visit(&edge.to, edges, settled, seen, path)?;
     }
     path.pop();
 
@@ -285,4 +383,145 @@ struct Dependency {
     name: String,
     /// `null` for normal dependencies, `"dev"` or `"build"` otherwise.
     kind: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn members_all() -> BTreeSet<String> {
+        LAYERS.iter().map(|(name, _)| (*name).to_owned()).collect()
+    }
+
+    fn edge(to: &str, kind: DepKind) -> Edge {
+        Edge {
+            to: to.to_owned(),
+            kind,
+        }
+    }
+
+    fn graph(entries: &[(&str, &[Edge])]) -> Graph {
+        let mut graph: Graph = members_all()
+            .iter()
+            .map(|m| (m.clone(), BTreeSet::new()))
+            .collect();
+        for (from, edges) in entries {
+            graph
+                .get_mut(*from)
+                .expect("a real member")
+                .extend(edges.iter().cloned());
+        }
+        graph
+    }
+
+    #[test]
+    fn downward_edges_of_every_kind_pass() {
+        let edges = graph(&[
+            (
+                "hatchery-kernel",
+                &[edge("hatchery-protocol", DepKind::Normal)],
+            ),
+            (
+                "hatchery-daemon",
+                &[edge("hatchery-kernel", DepKind::Build)],
+            ),
+            ("hatchery-daemon", &[edge("hatchery-store", DepKind::Dev)]),
+        ]);
+        reject_dev_crates_as_product_deps(&edges, &members_all()).expect("no dev crate shipped");
+        reject_layer_violations(&edges).expect("strictly downward");
+        reject_cycles(&edges).expect("acyclic");
+    }
+
+    #[test]
+    fn an_upward_dev_edge_is_rejected() {
+        // The prospective hole this rewrite closes: cargo permits it, the contract must not.
+        let edges = graph(&[(
+            "hatchery-protocol",
+            &[edge("hatchery-kernel", DepKind::Dev)],
+        )]);
+        let error = reject_layer_violations(&edges)
+            .expect_err("L0 must not depend on L1, not even from [dev-dependencies]");
+        assert!(
+            error.to_string().contains("dev dependency"),
+            "the message must name the kind that violated: {error}"
+        );
+    }
+
+    #[test]
+    fn a_sideways_dev_edge_is_rejected() {
+        let edges = graph(&[("hatchery-store", &[edge("hatchery-llm", DepKind::Dev)])]);
+        reject_layer_violations(&edges).expect_err("two L2 crates must not depend on each other");
+    }
+
+    #[test]
+    fn a_product_crate_may_dev_depend_on_the_testkit() {
+        let edges = graph(&[("hatchery-kernel", &[edge("hatchery-testkit", DepKind::Dev)])]);
+        reject_dev_crates_as_product_deps(&edges, &members_all()).expect("the sanctioned pattern");
+        reject_layer_violations(&edges).expect("dev crates sit above everything");
+    }
+
+    #[test]
+    fn a_build_dependency_on_a_dev_crate_is_rejected() {
+        // A build script runs on every user's machine, so this ships test code just like a
+        // normal dependency would.
+        let edges = graph(&[(
+            "hatchery-daemon",
+            &[edge("hatchery-testkit", DepKind::Build)],
+        )]);
+        let error = reject_dev_crates_as_product_deps(&edges, &members_all())
+            .expect_err("test code must never be shipped");
+        assert!(error.to_string().contains("build dependency"), "{error}");
+    }
+
+    #[test]
+    fn dev_crates_may_depend_on_each_other_and_on_products() {
+        let edges = graph(&[
+            (
+                "hatchery-testkit",
+                &[edge("hatchery-kernel", DepKind::Normal)],
+            ),
+            ("hatchery-testkit", &[edge("xtask", DepKind::Normal)]),
+            ("xtask", &[edge("hatchery-testkit", DepKind::Normal)]),
+        ]);
+        reject_layer_violations(&edges).expect("dev sources are above every product layer");
+    }
+
+    #[test]
+    fn the_kernel_testkit_dev_cycle_is_not_a_build_cycle() {
+        // kernel dev-depends on testkit (its tests use the fakes) while testkit normal-depends
+        // on kernel (the fakes implement its seams). Cargo compiles this fine: the dev edge is
+        // not part of the build graph.
+        let edges = graph(&[
+            ("hatchery-kernel", &[edge("hatchery-testkit", DepKind::Dev)]),
+            (
+                "hatchery-testkit",
+                &[edge("hatchery-kernel", DepKind::Normal)],
+            ),
+        ]);
+        reject_cycles(&edges).expect("a dev edge does not close a build cycle");
+    }
+
+    #[test]
+    fn a_cycle_in_the_build_graph_is_rejected() {
+        // Both crates are Dev, so the direction rule is exempt and only the cycle walk can see
+        // this — which is why dev crates are not exempt from acyclicity either.
+        let edges = graph(&[
+            ("hatchery-testkit", &[edge("xtask", DepKind::Normal)]),
+            ("xtask", &[edge("hatchery-testkit", DepKind::Normal)]),
+        ]);
+        let error = reject_cycles(&edges).expect_err("the build graph must be acyclic");
+        assert!(error.to_string().contains("dependency cycle"), "{error}");
+    }
+
+    #[test]
+    fn metadata_kinds_map_onto_the_three_declared_tables() {
+        assert_eq!(DepKind::from_metadata(None), DepKind::Normal);
+        assert_eq!(DepKind::from_metadata(Some("dev")), DepKind::Dev);
+        assert_eq!(DepKind::from_metadata(Some("build")), DepKind::Build);
+        assert_eq!(
+            DepKind::from_metadata(Some("something-new")),
+            DepKind::Build,
+            "an unknown kind is read as part of the build graph: the strictest interpretation"
+        );
+    }
 }
