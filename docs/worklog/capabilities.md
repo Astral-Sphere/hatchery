@@ -11,7 +11,7 @@
 ## 待办
 
 - [x] (M0) **git spike（实测）**：两轮——CLI git 2.55 与 git2 0.21（vendored libgit2 1.9.7）；最终选 git2，结论落 ADR-0012 + design/capabilities.md §2
-- [ ] (M0b) trait 定型（FsBackend/TerminalBackend/ApprovalGate/TerminalHandle 取消与流语义）+ 实现 kernel 的 `ToolHost`（解 L0↔L1 环，见 worklog/kernel.md）
+- [ ] (M1) trait 定型（FsBackend/TerminalBackend/ApprovalGate/TerminalHandle 取消与流语义）+ 实现 kernel 的 `ToolHost`（`snapshot`/`summarize`/`approval_for`/`invoke`，见 worklog/kernel.md）——M0b 只定了**值类型的归属与审批往返的分工**（见下「M0b 记录」），trait 与实现推迟到 M1/M2
 - [ ] (M1) LocalFs 只读路径 + read_file/glob/grep 工具（Chat 模式用）
 - [ ] (M2) **CheckpointStore**：把测试里的 `Sandbox` 提炼成正式实现——open 配方（init_opts + 手写 `core.worktree`/`core.bare` + `set_workdir(.., false)`）、`harden()` 的配置钉扎、每次打开重放 ignore 规则、purge 走 `checkout_index(remove_untracked)`、restore 前自动 snapshot
 - [ ] (M2) LocalFs 写路径 + write/edit 工具（写前打检查点）
@@ -65,6 +65,15 @@
 - **更正一条错误记录**：第一轮我写下「git2 需要 cmake」。实测 libgit2-sys 0.18.8 的 `build.rs` 用 `cc::Build`（`add_c_files`/`add_pcre2_files`）自己编译 libgit2 与 pcre2，**不调用 cmake**（cmake 只出现在注释链接与 `#cmakedefine` 替换里）；当时探测机上 cmake 4.3.0 恰好在场，我把「在场」误当成「需要」。教训已写进 design/testing.md §0.2：自己写下的结论同样要复核。
 - 否决 CLI 的真正原因不是性能（它冷快照更快），而是**可用性**：把 git 二进制变成运行时硬依赖，等于让 Code 模式的安全网在没装 git 的机器上静默失效。
 
+## M0b 记录（2026-09-28）
+
+capabilities 的**代码**在 M0b 没有动（trait 与工具实现是 M1/M2 的活），但它的设计落定了两件必须现在决定的事——kernel 落地的同时撞上了这两处接缝：
+
+1. **值类型的归属**：初稿把 `ApprovalRequest`/`ApprovalOutcome`/`ToolOutput`/`ToolProgress` 写成 kernel 类型（M0a 修正）。M0b 发现它们既要进 wire 又要被 kernel 与 capabilities 共用，而同层横向依赖被 layering 禁止，于是统一搬到最底层的 **protocol**。`ApprovalOutcome` 并入 `ApprovalOption`（答复必然是被提供的选项之一）。kernel 只留 `ToolInvocation`（「跑失败」与「没跑成」的分野）。
+2. **审批往返的分工**：**kernel 发起、daemon 应答**。kernel 发 `ApprovalNeeded { request_id, request }` 并等 `ApprovalDecision { request_id, option }`；daemon 收到事件后调用会话绑定的 `ApprovalGate`（`DaemonApproval` 弹前端 / `AcpPermission` 转发 `session/request_permission`），把结果作为命令回灌。`request_id` 与协议 `approval/respond` 一一对应；`ToolCtx` 里**没有** approval 字段（工具不请求审批，审批发生在工具被调用之前）；**超时 fail-closed = deny 住在 gate 实现里**，不在 kernel。
+
+两条都写进了 design/capabilities.md §1 与 design/kernel.md §7。M2 实现 `DaemonApproval` 时按这份分工接。
+
 ## 开放问题
 
 见设计文档末尾 4 条（glob/grep 在 ACP 会话的降级、unified exec、HTML→MD 选型、edit 格式）。解决过程记录于此：
@@ -73,6 +82,10 @@
 - 2026-09-28 影子 Git 后端：git2 vendored（用户裁决 + 第二轮实测），ADR-0012。若将来要摆脱 C 依赖，替代候选是 `gix`（纯 Rust，**未实测**），前提是把这 11 项门槛在 gix 上重跑全绿。
 
 ## 变更日志
+
+### 2026-09-28 · M0b
+
+- 代码未动，设计落定两处（详见上面「M0b 记录」）：值类型归 protocol（`ApprovalOutcome` 并入 `ApprovalOption`）、审批往返由 kernel 发起 / daemon 应答。design/capabilities.md §1 相应重写（新增两张表：值类型归属、审批分工）。
 
 ### 2026-09-28
 - 初稿。核心设计输入：dsh capability seam 三角色模型 + atomcode 影子 Git 实现细节（预算熔断、RAII 补偿）+ atomcode ACP 缺 fs/terminal 的反面教材（ADR-0004）。

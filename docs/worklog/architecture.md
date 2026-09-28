@@ -6,9 +6,9 @@
 
 ## 当前状态
 
-**M0a 完成（2026-09-28）**：workspace 脚手架（12 member）、门禁脚本、三平台 CI、xtask layering 契约、三个 spike 全部落地并实测通过。M0b（protocol/kernel/store 的实现）未开工。
+**M0b 完成（2026-09-28）**：`hatchery-protocol`/`hatchery-kernel`/`hatchery-store` 三个 crate 实现落地并全绿（93 + 40 + 64 项测试，7 个可运行 doctest，219 项默认组），`hatchery-testkit` 交付 M0b 子集。本地 `./scripts/ci.sh` 全绿；三平台 CI 上一轮已跑通（M0a 收尾），M0b 的代码尚未 push。**M0 里程碑达成**（roadmap.md 的 M0 DoD：门禁三平台绿 + store 的 kill -9 崩溃恢复测试通过 + 三个 spike 结论落档）。
 
-仓库现状：`crates/`（11 crate）+ `xtask/` + `scripts/ci.sh` + `.github/workflows/{pr,nightly}.yml` + `docs/`。本地 `./scripts/ci.sh` 全绿；**三平台 CI 已跑通**（2026-09-28，第 2 次尝试）——M0a 的门禁 DoD 闭环。
+仓库现状：`crates/`（11 crate，其中 3 个已实现）+ `xtask/` + `scripts/ci.sh` + `.github/workflows/{pr,nightly}.yml` + `docs/`。
 
 ## 待办
 
@@ -21,6 +21,8 @@
 - [x] (M0) 编译 flags：`.cargo/config.toml` 加 `[build] rustflags = ["-C", "target-cpu=native"]`（用户偏好；已实测进入 rustc 调用）。**纪律**：发布产物与交叉编译必须覆盖（`RUSTFLAGS=""`），否则二进制不可跨 CPU 移植
 - [x] (M0) 三平台 CI 跑通（第 1 次失败于 windows 的 `rustup-init --component` 参数 arity，已在 5b953fb 修复并补 windows-gnu 的 ABI 断言；细节见 worklog/testing.md「实测记录 · CI 首跑」）
 - [x] (M0) 顶层 README 扩写：项目定位、快速开始、文档链接、MSYS2 ucrt64 环境清单、仓库布局；docs/README.md 加「代码布局」节
+- [x] (M0b) 分层修正：protocol 沉为唯一最底层，kernel 升 L1（见下「M0b 修正」）
+- [x] (M0b) protocol/kernel/store 三个 crate 实现 + testkit M0b 子集 + 219 项测试
 - [ ] (M1) 建立 docs/glossary.md 术语表
 - [ ] (M1) MSRV CI job（`cargo +1.90.0 check`）加进 nightly，防止依赖升级悄悄抬高 MSRV
 - [ ] (M1) `hatchery-tests` 成员 crate（跨 crate e2e 与不变量套件的家；虚拟 manifest 不能有顶层 `tests/`，见 design/testing.md §1）
@@ -33,7 +35,19 @@
 
 ## 变更日志
 
-### 2026-09-28
+### 2026-09-28 · M0b（分层修正 + 三个 crate 落地）
+
+**M0b 修正：把 protocol 沉为唯一最底层。** M0a 把 `hatchery-protocol` 与 `hatchery-kernel` 并列在 L0，layering 契约禁止同层横向依赖（`from_layer <= to_layer` 即违规）。但 protocol 的数据模型必须引用 `ToolOutput`/`ApprovalRequest`/`Content`/`Usage`——这些值既要进 wire、又被 kernel 与 capabilities 共用。两个选择：镜像约 10 个类型 + 在 daemon 里加一层翻译，或者让 protocol 成为共享词汇表。选后者：
+
+- protocol = L0（共享词汇表 + wire 契约）；kernel = L1；llm/store/capabilities = L2；tools/acp = L3；daemon = L4；cli/gui = frontend。
+- 连带改动：`xtask::layering::LAYERS`、`Layer` 枚举 + `L4`、8 个 crate 的 lib.rs 层号注释、architecture.md §3 的分层图与纪律条目。
+- **ADR-0004 的「kernel 不得依赖 capabilities」不受影响**：那条边向上，仍然禁止。这条纪律的措辞也从「L0 反过来依赖 L1」改为「kernel 反过来依赖上层」。
+- 没有新增 ADR：层号是 architecture.md 内部的表述，推翻记录留在本文件（依约定，ADR 才需要 supersede 链）。
+- 用户四项裁决同时落定：① protocol 沉底（本条）；② store 只出有序 `Vec<Item>`（storage.md §4）；③ 审批由 kernel 发起、daemon 应答（kernel.md §7 / capabilities.md §1）；④ 崩溃测试用测试二进制自重入（testing.md 开放问题 1）。
+
+**三个 crate 的实现**（各自的 worklog 有细节）：protocol 93 测试 + 62 golden fixture；kernel 40 测试；store 64 测试（含属性测试与 kill -9）。`cargo xtask layering` 报 12 members / 22 edges，严格向下。
+
+### 2026-09-28 · M0a
 - 项目启动设计：深读四款参考项目（分析结论存 ../references.md），与用户对齐 8 项关键决策（ADR-0001~0008），产出 architecture/roadmap + 9 份方向设计文档 + 本 worklog 体系。
 - 用户明确的核心差异化诉求：完整 ACP（含 fs/terminal 委派，atomcode 的反面教材）、reasoning_content 可配置回传、历史可编辑（分叉+删除）、提示词透明、CLI+GTK 双前端。
 - 补充测试体系设计（用户要求「详尽的测试，确保所有代码都能如期运行」）：新增 design/testing.md + worklog/testing.md；crate 清单加入 dev-only 的 `hatchery-testkit`；architecture.md 不变量节与 roadmap DoD 挂接测试文档。

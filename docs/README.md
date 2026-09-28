@@ -31,7 +31,7 @@ Hatchery 是一个用 Rust 编写的开源 AI Agent Harness，支持 CLI 与原�
 
 | 路径 | 内容 |
 |---|---|
-| `crates/` | 11 个 crate（10 个产品 crate + dev-only 的 `hatchery-testkit`），分层见 [architecture.md](architecture.md) §3 |
+| `crates/` | 11 个 crate（10 个产品 crate + dev-only 的 `hatchery-testkit`），分层见 [architecture.md](architecture.md) §3。M0 已实现的三个：`hatchery-protocol`（wire 类型与帧）、`hatchery-kernel`（turn 循环）、`hatchery-store`（schema + writer actor，`migrations/v1.sql` 是它的 DDL） |
 | `xtask/` | 开发者任务：`cargo xtask layering`（分层契约检查）、`cargo xtask coverage`；`i18n-extract`/`record-fixtures` 是 fail-loud 占位 |
 | `scripts/ci.sh` | 门禁序列的**唯一真相**，本地与 GitHub Actions 跑同一条命令 |
 | `.github/workflows/` | `pr.yml`（三平台：ubuntu / macos / windows MSYS2 ucrt64 + windows-gnu）、`nightly.yml` |

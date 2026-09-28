@@ -6,19 +6,19 @@
 
 ## 当前状态
 
-引擎已实测定型：**turso 0.7.2**（纯 Rust，ADR-0010）。门槛测试 12 项常驻 `crates/hatchery-store/tests/spike_engine.rs`，本地全绿（2026-09-28，Linux x86_64）。schema 落地、writer actor、rebuild_history 尚未实现（M0b）。
+**M0b 完成（2026-09-28）**：schema v1 迁移、writer actor、`SessionStore` 全量实现（含分支操作与 JSONL 导出）、属性测试与 kill -9 崩溃恢复测试全部落地；64 个测试全绿（12 项引擎门槛 + 22 项 store 集成 + 1 项属性测试 + 6 项崩溃恢复 + 单元测试）。设计文档 `docs/design/storage.md` 已按实现重写。
 
 ## 待办
 
 - [x] (M0) **引擎 spike（实测，勿靠文档推断）**：turso 0.7.2 全门槛实测 → 选中；结论落 ADR-0010，测试沉淀为常驻回归（见下「实测记录」）
-- [ ] (M0b) schema v1 落成 `include_str!` 迁移脚本 + 迁移框架（`user_version` + `schema_meta` 双记录）
-- [ ] (M0b) writer actor + StoreCmd 全量实现 + 有界背压（1024）
-- [ ] (M0b) rebuild_history（**内存走树**，引擎无递归 CTE）+ 属性测试（随机编辑序列 vs testkit 里独立写的纯 Vec 参考模型）
-- [ ] (M0b) EditFork / SwitchBranch / DeleteBranch（内存 BFS 收子树 + active_head 校验 + 级联删）
-- [ ] (M0b) kill -9 崩溃测试（需专用 writer 子进程；每种 StoreCmd 各一次）
-- [ ] (M0b) ExportJsonl（从 M2 提前：逃生通道成本低、测试便宜）
+- [x] (M0b) schema v1 落成 `include_str!` 迁移脚本 + 迁移框架（`user_version` + `schema_meta` 双记录，每迁移一个事务，拒绝新版本库）
+- [x] (M0b) writer actor + StoreCmd 全量实现 + 有界背压（1024）
+- [x] (M0b) rebuild_chain（**内存走树**，引擎无递归 CTE）+ 属性测试（随机编辑序列 vs testkit 里独立写的 `ReferenceTree`）
+- [x] (M0b) EditFork / SwitchBranch / DeleteBranch（内存 BFS 收子树 + active_head 校验 + 级联删 + **数量交叉校验**）
+- [x] (M0b) kill -9 崩溃测试（**测试二进制自重入**，不新增 target；五种 StoreCmd 各一次 + 恢复后仍可用）
+- [x] (M0b) ExportJsonl（从 M2 提前：逃生通道成本低、测试便宜）
 - [ ] (M1) 只读连接池与 spawn_blocking 读路径接线
-- [ ] (M2) checkpoints 表与 CheckpointStore 联动（级联删除时 GC）
+- [ ] (M2) checkpoints 表与 CheckpointStore 联动（级联删除时 GC；checkpoint 的级联已由引擎门槛测试锁定）
 - [ ] (M5) 导入
 
 ## 实测记录（2026-09-28，turso 0.7.2，Linux x86_64）
@@ -57,6 +57,20 @@ API 怪癖（写 store 实现时一定会踩）：
 - `Builder::experimental_triggers(bool)` 是 no-op，源码注释写着 "Triggers are now always enabled"（`experimental_strict` 同理）
 - `default-features = false` 去掉 mimalloc 与 fts（tantivy）后，整棵依赖树增量编译约 25 s
 
+## 实测记录 · M0b（2026-09-28，turso 0.7.2）
+
+写 store 时必然要碰的 API 事实。前两条是**读上游源码**得到的（`~/.cargo/registry/.../turso-0.7.2/src/params.rs` 与 `connection.rs`），其余由本 crate 的测试覆盖：
+
+- **绑定参数的类型与方法**：`Connection::{execute,query}(sql, impl IntoParams)`；`IntoParams` 是 sealed trait，可用形态为 ≤16 项的**元组**（异构）、同类型数组、`Vec<T>`，以及动态个数的 `params_from_iter`。`IntoValue` 由 `TryInto<Value>` 统一实现，`Value` 本身也可直接绑。
+- **`Option<T>` 绑成 NULL**：`impl<T: Into<Value>> From<Option<T>> for Value`，所以可空列直接绑 `Option<&str>`/`Option<i64>`，不必拼 SQL。
+- **`Connection::unchecked_transaction()` 是 `async`**，要 `.await`；`Transaction` Deref 到 `Connection`，drop 默认回滚。
+- **DDL 可以放在事务里**：`migrate()` 把 `execute_batch(DDL)` + 写 `user_version` + 写 `schema_meta` 放进同一个 `unchecked_transaction` 并提交，全部测试通过（`migrations_run_once_and_both_records_agree`）——半套 schema 的隐患因此不存在。
+- **必须把 `Rows` 读到结束**：上游源码注释写着「Discard remaining rows ... Otherwise Drop of the statement will cause transaction rollback」。所有行读取辅助函数末尾都 `drain` 到空，否则一条半读的查询会让**后续**写入失败，错误现场与病因毫无关系。
+- **`execute` 的返回值只算直接删除的行**（M0a 已测）：所以 `delete_branch` 的计数必须来自我们自己的走树，并与删除前后的行数差交叉校验。
+- **`Builder::new_local(path: &str)` 收 `&str`**（不是 `AsRef<Path>`），`Database` 要与连接一起保活：`Writer` 持有 `_database` 字段。
+- **payload 分块取 200 个 id 一批**：引擎的参数上限没有文档，300 条链的测试（两次分块）证明可行；上限不是实测出来的，因此选了保守值。
+- **`cargo-llvm-cov` 不在本机**，`cargo xtask coverage` 按设计 fail-loud 报安装命令。覆盖率数字因此**未测**（阈值 enforcement 本来就排在 M1）。
+
 ## 开放问题
 
 见设计文档末尾 5 条（payload 二级索引、孤儿仓库 GC、断电级 durability 无证据、10k items 加载策略）。选型问题已关闭。解决过程记录于此：
@@ -66,6 +80,19 @@ API 怪癖（写 store 实现时一定会踩）：
 ## 变更日志
 
 ### 2026-09-28
+
+**M0b 落地**（64 测试全绿）。要点：
+
+- `migrations/v1.sql` = spike 的 DDL 原样搬入（三处修正已内建），此后只能新增文件；迁移**双记录**版本并拒绝更新版本的库。
+- writer actor：有界通道 1024 + reply slot；单条 append 也走事务（插 item + 推进 head + 更新 updated_at 同事务，正确性而非速度）；批量 append 一个事务——测试 `a_batch_commits_atomically` 用「父节点属于别的会话」让整批失败，断言**一条都没落**且 head 未动。
+- **`rebuild_history` 改名 `rebuild_chain` 并改语义**：返回有序 `Vec<Item>`，不做 reasoning 过滤/compaction/裁剪——那些需要 provider 能力表，属 daemon 的装配器（M0b 裁决，见 design/storage.md §4）。
+- **交叉校验**：`delete_branch` 用 BFS 收子树计数（引擎只回报直接删除的行），删完后比对行数差，不一致即报错。
+- **跨会话父节点**：schema 的外键证明不了父节点属于同一会话，`insert_item` 自己校验（`SessionMismatch`）。
+- **崩溃测试形态**：测试二进制自重入（`current_exe()` + `HATCHERY_CRASH_PROBE` + `#[ignore]` 入口），不新增 target、不发布二进制、三平台同一份代码；父进程 `Child::kill()`（unix SIGKILL / Windows TerminateProcess）后重开断言，并额外断言 `-wal` 存在、恢复后数据库**可用**。
+- **属性测试**：随机脚本对拍 testkit 的 `ReferenceTree`，每步比对链形态、head、active 集合、行数。它先抓出的是**参考模型**的错（哪些 kind 可编辑），而不是 store 的。
+- `SessionStore` trait 17 个方法全部实现；`StoreError` 12 个变体并映射到 wire 错误码（「必须先切分支」是 `InvalidRequest`，「磁盘坏了」才是 `StoreError`）。
+
+### 2026-09-28（M0a）
 - 初稿。关键取舍：数据库做主存储（四家参考都用 JSONL，hatchery 因「历史可编辑」需求反向选择）；单写者 actor 规避多写者限制（ADR-0002）。
 - **M0a 引擎 spike 完成**：12 项门槛测试落地全绿；选 turso 0.7.2 → 新增 **ADR-0010**（supersedes ADR-0002 的引擎部分），design/storage.md 同步（引擎与 async API 形态、内存走树、`active_head` 可空、`commit_id`、journal_mode 走 query、性能/durability 实测结论、开放问题 4/5）。
 - spike 抓出三处 schema 缺陷，都是读设计文档看不出来、只有真跑引擎才会暴露的：`commit` 保留字、`active_head NOT NULL` 与 `items.session_id` 互锁、`journal_mode` 需要 `query()`。

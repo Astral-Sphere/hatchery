@@ -7,7 +7,7 @@
 三个核心 trait（完整签名见 ADR-0004）+ 检查点与工具注册表框架：
 
 ```rust
-// 工具契约住在这一层：kernel 只见 ToolHost 窄接口（kernel.md §5），否则 L0 会反过来依赖 L1 成环
+// 工具契约住在这一层：kernel 只见 ToolHost 窄接口（kernel.md §5），否则 kernel 会反过来依赖上层成环
 pub trait Tool: Send + Sync {
     fn def(&self) -> ToolDef;                       // ToolDef 是 kernel 类型（要进 LLM 请求）
     fn needs_approval(&self, args: &Value) -> Option<ApprovalRequest>;
@@ -23,19 +23,31 @@ pub struct ToolCtx<'a> {          // 工具能拿到的全部外界能力 = 接�
 
 pub trait FsBackend      // read_text_file / write_text_file / metadata（+M2: list/glob 支持）
 pub trait TerminalBackend // create → TerminalHandle { output stream, wait_for_exit, kill, release }
-pub trait ApprovalGate   // request(ApprovalRequest) → ApprovalOutcome
+pub trait ApprovalGate   // request(ApprovalRequest) → ApprovalOption（批准后由 daemon 回灌 kernel）
 
-// ApprovalRequest / ApprovalOutcome / ToolOutput / ToolProgress 定义在 kernel（M0a 修正）：
-// kernel 的 ToolHost::approval_for 与事件投影都要用它们，capabilities 只消费与构造。
-pub struct ApprovalRequest {
-    pub tool: String,
-    pub args_digest: String,          // 人类可读摘要（如 "edit src/main.rs (+12 -3)"）
-    pub risk: RiskLevel,              // ReadOnly | WritesWorkspace | WritesOutside | Executes | Network
-    pub options: Vec<ApprovalOption>, // AllowOnce | AllowAlways | Deny | DenyAlways（→ 持久化规则）
-}
-
+// ToolDef / ToolInvocation / ToolProgress* 见下；值类型住在 protocol（M0b 分层修正）
 pub struct ToolRegistry { /* name → Arc<dyn Tool>；实现 kernel::ToolHost，turn 开始冻结快照 */ }
 ```
+
+### 值类型的归属（M0b 定案）
+
+初稿把 `ApprovalRequest`/`ApprovalOutcome`/`ToolOutput`/`ToolProgress` 都写成 kernel 类型（M0a 修正）。落地时发现：它们既要进 wire（`ItemKind::ToolResult`、`ServerEvent::ApprovalRequested`/`ToolCallProgress`），又被 kernel 与 capabilities 共用，而 layering 禁止同层横向依赖——于是它们统一搬到最底层的 **protocol**（见 architecture.md §3 的 M0b 分层裁决）：
+
+| 类型 | 归属 | 理由 |
+|---|---|---|
+| `ToolOutput`、`ToolProgress`、`ToolArtifact`、`SpilledOutput` | protocol | 落库 + 进事件 |
+| `ApprovalRequest`、`ApprovalOption`、`RiskLevel` | protocol | 进事件 + 落 `approval_rules` |
+| `ToolInvocation { output, is_error }` | kernel | 「跑失败」与「没跑成」的分野，只对 kernel 的循环有意义 |
+| `ToolDef`、`ToolCallSummary` 的**产生** | kernel / ToolHost | `ToolDef` 进 LLM 请求；`ToolCallSummary` 由 `ToolHost::summarize` 构造 |
+| `Tool`、`ToolCtx`、`FsBackend`、`TerminalBackend`、`ApprovalGate` | capabilities | 实现细节，kernel 不得看见 |
+
+`ApprovalOutcome` 不再单独存在：答复必然是被提供的选项之一，`ApprovalOption { AllowOnce, AllowAlways, Deny, DenyAlways }` 兼作请求选项与答复，`ApprovalGate::request(&self, req) -> ApprovalOption`。
+
+### 审批往返由谁发起（M0b 定案）
+
+**kernel 发起、daemon 应答**：kernel 调 `ToolHost::approval_for` 判断是否需要审批；需要则进入 `AwaitingApproval`，发 `KernelEvent::ApprovalNeeded { request_id, request }`，等 `AgentCommand::ApprovalDecision { request_id, option }`（kernel.md §7）。daemon 收到事件后调用该会话绑定的 `ApprovalGate`（本地 `DaemonApproval` 弹给前端；`AcpPermission` 转发 `session/request_permission`），把结果作为命令回灌。
+
+这样切的两个好处：`request_id` 与协议的 `approval/respond` 一一对应，daemon 只是翻译层；kernel 不认识任何审批后端，`ToolCtx` 里也**没有** approval 字段——工具不请求审批，审批发生在工具被调用之前。超时策略（fail-closed = deny）住在 `ApprovalGate` 实现里，不在 kernel：kernel 无从知道一个人需要多久。
 
 **注册句柄模式**（ADR-0009 纪律 3，借鉴 dsh `registerAdapter()` → handle）：`register()` 返回 `RegistrationHandle { dispose(), replace() }`——`replace()` 用新实现整表原子替换旧实现（进行中的 turn 不受影响，因为 kernel 持有的是冻结快照），`dispose()` 摘除注册。MCP 工具、用户自定义工具、运行中换 provider adapter 全部走这一模式；禁止对注册表的原地突变。
 
