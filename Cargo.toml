@@ -5,6 +5,10 @@ members = ["crates/*", "xtask"]
 [workspace.package]
 version = "0.0.0"
 edition = "2024"
+# Measured, not copied from dependency metadata: `cargo +1.90.0 check --workspace --all-targets`
+# passes, 1.88 fails (roaring 0.11.5 needs 1.90) and 1.85 fails (turso's icu_*/aristo need 1.88).
+# Declaring it also makes resolver 3 pick MSRV-compatible dependency versions.
+rust-version = "1.90"
 license = "GPL-3.0-only"
 repository = "https://github.com/Astral-Sphere/hatchery"
 homepage = "https://github.com/Astral-Sphere/hatchery#readme"
