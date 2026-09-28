@@ -21,6 +21,9 @@ env:
   INSTA_UPDATE: "no"
   # Pinned to the version developers install locally (docs/design/testing.md §1).
   NEXTEST_VERSION: 0.9.146
+  # Compiler flags come from .cargo/config.toml (`-C target-cpu=native`) so that CI and a
+  # developer's machine build the same way. Do not duplicate them here: RUSTFLAGS in the
+  # environment would override the config file instead of adding to it.
 
 jobs:
   unix:
@@ -39,15 +42,20 @@ jobs:
 
       # No toolchain action on purpose: rust-toolchain.toml names the channel and components, and
       # the runner's preinstalled rustup installs them on the first cargo invocation.
-      - name: Install cargo-nextest
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-nextest@${{ env.NEXTEST_VERSION }}
-
       - name: Cache cargo and target
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: gate-${{ matrix.platform }}
+
+      # Built from source rather than downloaded as a prebuilt binary: one fewer supply-chain and
+      # one fewer platform-compatibility surface, and the same on all three runners. The cache
+      # above keeps ~/.cargo/bin, so this is a no-op on a warm run.
+      - name: Install cargo-nextest
+        run: |
+          if ! cargo nextest --version >/dev/null 2>&1; then
+            cargo install cargo-nextest --version "${NEXTEST_VERSION}" --locked
+          fi
+          cargo nextest --version
 
       - name: Gate
         run: bash scripts/ci.sh
@@ -80,22 +88,23 @@ jobs:
         with:
           msystem: UCRT64
           update: true
-          # gcc and pkg-config are only needed if the storage spike lands on a C-based engine
-          # (libsql-sys or rusqlite bundled); turso is pure Rust. pkg-config is also needed by
-          # GTK4 in M4.
+          # gcc is required: libgit2-sys compiles a vendored libgit2 with cc (no cmake involved,
+          # measured on Linux) and libz-sys does the same for zlib. pkg-config is needed by GTK4
+          # in M4. The storage engine (turso) and i18n (fluent) are pure Rust and need nothing.
           pacboy: >-
             gcc:p
             pkg-config:p
             make:p
+          # git for the determinism step in scripts/ci.sh, curl for the rustup installer.
           install: >-
             git
             curl
-            unzip
 
       - name: Cache cargo and target
         uses: actions/cache@v6
         with:
           path: |
+            C:/msys64/cargo/bin
             C:/msys64/cargo/registry
             C:/msys64/cargo/git
             target
@@ -121,15 +130,16 @@ jobs:
           cargo fmt --version
           cargo clippy --version
 
-      - name: Install cargo-nextest (prebuilt)
+      # Built from source with the same windows-gnu toolchain that builds the workspace: no
+      # MSVC-built binary has to run under MSYS2, and no release asset has to be trusted. The cache
+      # step above keeps C:/msys64/cargo/bin, so a warm run skips the build.
+      - name: Install cargo-nextest
         run: |
           set -euo pipefail
           export PATH="$CARGO_BIN_POSIX:$PATH"
-          # Upstream publishes no windows-gnu build; the MSVC-built exe is a native Windows
-          # binary and runs fine from MSYS2 bash while driving our gnu-toolchain cargo.
-          curl -sSL -o /tmp/cargo-nextest.zip \
-            "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-${NEXTEST_VERSION}/cargo-nextest-${NEXTEST_VERSION}-x86_64-pc-windows-msvc.zip"
-          unzip -o /tmp/cargo-nextest.zip -d "$CARGO_BIN_POSIX"
+          if ! cargo nextest --version >/dev/null 2>&1; then
+            cargo install cargo-nextest --version "${NEXTEST_VERSION}" --locked
+          fi
           cargo nextest --version
 
       - name: Gate

@@ -14,6 +14,7 @@ authors.workspace = true
 
 [dependencies]
 async-trait.workspace = true
+git2.workspace = true
 hatchery-kernel.workspace = true
 hatchery-protocol.workspace = true
 serde.workspace = true

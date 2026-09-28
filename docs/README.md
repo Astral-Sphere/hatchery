@@ -37,6 +37,7 @@ Hatchery 是一个用 Rust 编写的开源 AI Agent Harness，支持 CLI 与原�
 | `.github/workflows/` | `pr.yml`（三平台：ubuntu / macos / windows MSYS2 ucrt64 + windows-gnu）、`nightly.yml` |
 | `.config/nextest.toml` | 测试分组：default / ci / invariants / slow / gui / live（命名前缀约定见 [design/testing.md](design/testing.md) §1） |
 | `clippy.toml` | 不变量 4 的编译期强制清单（作用域：只在 `hatchery-tools` deny） |
+| `.cargo/config.toml` | `cargo xtask` 别名 + 全 workspace 的 `-C target-cpu=native`（ADR-0012；发布产物必须覆盖此 flag） |
 | `rust-toolchain.toml` | `channel = "stable"` + rustfmt/clippy；MSRV 见根 `Cargo.toml` 的 `rust-version`（实测 1.90） |
 
 ## 约定

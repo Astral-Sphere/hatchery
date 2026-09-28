@@ -30,6 +30,9 @@ hatchery-testkit = { path = "crates/hatchery-testkit", version = "0.0.0" }
 anyhow = "1.0.104"
 async-trait = "0.1.92"
 futures = "0.3.34"
+# Vendored libgit2 on purpose: shadow-git checkpoints must work on machines with no git binary
+# installed (ADR-0012). git2's default features are empty, so no https/ssh and no openssl.
+git2 = { version = "0.21.0", features = ["vendored-libgit2"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 thiserror = "2.0.21"
@@ -37,9 +40,9 @@ tokio = { version = "1.53.1", features = ["macros", "rt", "rt-multi-thread", "sy
 tokio-util = "0.7.19"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
-# default-features off: drops mimalloc (system allocator is fine) and fts (tantivy is a heavy
-# dependency we do not use). Turso is the spike's leading candidate — see the engine gate tests in
-# crates/hatchery-store/tests/spike_engine.rs before relying on it.
+# Chosen by the M0 storage spike (ADR-0010). default-features off drops mimalloc (system
+# allocator is fine) and fts (tantivy is a heavy dependency we do not use). The engine's measured
+# behaviour is pinned by crates/hatchery-store/tests/spike_engine.rs — rerun it on any upgrade.
 turso = { version = "0.7.2", default-features = false }
 uuid = { version = "1.26.1", features = ["v7", "serde"] }
 

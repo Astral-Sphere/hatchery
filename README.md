@@ -34,8 +34,14 @@ An open source AI harness -- hatchery for your code!
 
 ## 构建与测试
 
-前置：`rustup`（`rust-toolchain.toml` 会自动装 stable + rustfmt + clippy）、`git`、`cargo-nextest`
-（`cargo install cargo-nextest --locked`）。**MSRV 1.90**（实测，非抄依赖声明）。
+前置：
+
+- `rustup`（`rust-toolchain.toml` 会自动装 stable + rustfmt + clippy）；**MSRV 1.90**（实测，非抄依赖声明）。
+- 一个 **C 编译器**（cc/gcc/clang）：影子 Git 用 vendored libgit2，构建期由 `cc` 编译（**不需要 cmake**，ADR-0012）。
+- `cargo-nextest`：`cargo install cargo-nextest --locked`（CI 也是源码编译，不用预构建二进制）。
+- `git`：开发这个仓库需要；但 hatchery **运行时不需要**用户装 git。
+
+编译默认带 `-C target-cpu=native`（`.cargo/config.toml`）：本机跑得快，但产物不可跨 CPU 移植，交叉编译或打包发布时用 `RUSTFLAGS=""` 覆盖。
 
 ```bash
 cargo build --workspace
@@ -54,15 +60,16 @@ Linux / macOS / Windows 三平台都进 PR CI。Windows 走 **MSYS2 UCRT64 + `x8
 
 ```bash
 pacman -S --needed mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-pkg-config \
-                   mingw-w64-ucrt-x86_64-make git unzip curl
+                   mingw-w64-ucrt-x86_64-make git curl
 curl -sSfL https://sh.rustup.rs | sh -s -- \
      --default-host x86_64-pc-windows-gnu --default-toolchain stable \
      --component rustfmt clippy
-# cargo-nextest 上游只发 windows-msvc 预构建包；那是原生 exe，在 MSYS2 bash 下可直接调用
+cargo install cargo-nextest --locked
 ```
 
-存储引擎（turso）与 i18n（fluent）都是纯 Rust 实现，三平台都不需要 C 工具链——这是 ADR-0010/0011
-的共同理由。唯一的运行时外部依赖是 `git` 二进制（影子 Git 检查点，ADR-0006）。
+存储引擎（turso）与 i18n（fluent）是纯 Rust；影子 Git 用 **vendored libgit2**（`git2` crate），所以
+**运行时不需要用户机器上有 git**，代价是构建期需要一个 C 编译器（gcc/clang；三平台 CI 已覆盖，
+MSYS2 UCRT64 装 `mingw-w64-ucrt-x86_64-gcc`）。取舍与实测数据见 ADR-0010 / 0011 / 0012。
 
 ## 仓库布局
 

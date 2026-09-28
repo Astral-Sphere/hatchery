@@ -40,7 +40,7 @@
 |---|---|---|
 | 仅 fluent-bundle + unic-langid | **3.45 s** | 纯 Rust |
 | 仅 gettext-rs | **37.64 s** | 含 vendored libintl 的 C 编译 |
-| git2（对照，见 worklog/capabilities.md） | 4.58 s | 需 cmake + C |
+| git2（对照，见 worklog/capabilities.md 与 ADR-0012） | 4.58 s（`default-features=false`）/ 10.5 s（`vendored-libgit2`，含本项目 crate） | 需 C 编译器；**不需要 cmake**——M0a 曾误记为需要，已在 ADR-0012 更正 |
 
 功能实测：
 

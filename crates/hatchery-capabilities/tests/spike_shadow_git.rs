@@ -1,46 +1,55 @@
-//! Shadow-git spike: measured behaviour of `git --git-dir <shadow> --work-tree <user workspace>`,
-//! kept as permanent regression tests (ADR-0006, docs/design/testing.md §3.5).
+//! Shadow-git spike: measured behaviour of the **git2 / vendored libgit2** backend for checkpoints,
+//! kept as permanent regression tests (ADR-0006, ADR-0012, docs/design/testing.md §3.5).
 //!
-//! The point of this file is invariant 6 — checkpoints must never touch the user's own repository:
-//! not its HEAD, not its index, not its refs, not its untracked files. Everything here runs
-//! against a real `git` binary in a tempdir with a hermetic environment (fake `HOME`, no system
-//! or global config), so the tests neither read nor write the developer's git setup.
+//! The shape is "a repository whose git dir lives under our own data directory while its work tree
+//! is the user's workspace". The point of this file is invariant 6: checkpoints must never touch the
+//! user's own repository — not its HEAD, not its index, not its refs, and not even by planting a
+//! `.git` gitlink file in their workspace.
 //!
-//! The M0 verdict derived from these measurements is recorded in docs/worklog/capabilities.md.
+//! Everything runs in a tempdir. libgit2 reads the developer's global/system git configuration and
+//! template directory, which would make these tests depend on the machine running them, so the
+//! helper below disables external templates and pins the config keys that change snapshot or
+//! checkout behaviour (`core.autocrlf`, `core.excludesFile`, identity, fsmonitor).
 
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
-use std::time::Instant;
+use std::time::{Instant, SystemTime};
 
+use git2::build::CheckoutBuilder;
+use git2::{
+    IndexAddOption, ObjectType, Oid, Repository, RepositoryInitOptions, ResetType, Signature,
+    StatusOptions,
+};
 use tempfile::TempDir;
 
-/// A shadow repository living outside the user's workspace, plus the user workspace itself.
+/// `.git/` keeps a user's own repository out of our snapshots. `CheckpointStore` adds the
+/// large-file and build-artifact exclusions from configuration on top of this
+/// (docs/design/capabilities.md §2).
+const SHADOW_IGNORE_RULES: &str = ".git/\n";
+
+/// A workspace, optionally a user git repository inside it, plus the shadow repository's git dir.
 struct Sandbox {
-    // Held to keep the tree alive; the underscore keeps dead_code quiet.
+    // Held only to keep the directory alive; the underscore keeps dead_code quiet.
     _dir: TempDir,
-    root: PathBuf,
     workspace: PathBuf,
     git_dir: PathBuf,
+    // libgit2's ignore rules added with `add_ignore_rule` live on the repository handle, so they
+    // have to be re-applied every time the shadow repo is opened. That is exactly what this field
+    // models: CheckpointStore will derive its rules from configuration on each open.
+    extra_ignore_rules: RefCell<String>,
 }
 
 impl Sandbox {
-    /// Creates `<tmp>/{home,workspace,shadow}`; the workspace is a git repository with dirty
-    /// state when `user_repo` is set.
     fn new(user_repo: bool) -> Self {
         let dir = tempfile::tempdir().expect("create tempdir");
         let root = dir.path().to_path_buf();
         let workspace = root.join("workspace");
-        let home = root.join("home");
         std::fs::create_dir_all(&workspace).expect("create workspace");
-        std::fs::create_dir_all(&home).expect("create fake home");
-        // An empty global config file: GIT_CONFIG_GLOBAL must point somewhere that exists, and
-        // /dev/null is not portable to Windows.
-        std::fs::write(home.join("empty-gitconfig"), b"").expect("write empty gitconfig");
 
         let sandbox = Self {
             _dir: dir,
+            extra_ignore_rules: RefCell::new(String::new()),
             git_dir: root.join("shadow").join("repo.git"),
-            root,
             workspace,
         };
         if user_repo {
@@ -49,76 +58,179 @@ impl Sandbox {
         sandbox
     }
 
-    fn home(&self) -> PathBuf {
-        self.root.join("home")
+    fn signature() -> Signature<'static> {
+        Signature::now("hatchery-spike", "spike@localhost").expect("signature")
     }
 
-    /// Environment shared by every git invocation: no system config, no global config, no
-    /// developer identity, nothing inherited from the machine running the tests.
-    fn apply_env(&self, cmd: &mut Command) {
-        cmd.current_dir(&self.workspace)
-            .env("HOME", self.home())
-            .env("XDG_CONFIG_HOME", self.home())
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_CONFIG_GLOBAL", self.home().join("empty-gitconfig"))
-            .env("GIT_AUTHOR_NAME", "hatchery-spike")
-            .env("GIT_AUTHOR_EMAIL", "spike@localhost")
-            .env("GIT_COMMITTER_NAME", "hatchery-spike")
-            .env("GIT_COMMITTER_EMAIL", "spike@localhost")
-            // Never let an interactive prompt hang the test run.
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .env("GCM_INTERACTIVE", "never");
+    /// Adds ignore rules that every subsequent `open_shadow` re-applies.
+    fn add_extra_ignore(&self, rules: &str) {
+        self.extra_ignore_rules.borrow_mut().push_str(rules);
     }
 
-    /// Runs git as the *user* would: inside the workspace, against the workspace's own `.git`.
-    fn user_git(&self, args: &[&str]) -> String {
-        let mut cmd = Command::new("git");
-        self.apply_env(&mut cmd);
-        cmd.args(args);
-        let output = cmd.output().expect("spawn git");
-        assert!(
-            output.status.success(),
-            "git {args:?} failed: {}",
-            String::from_utf8_lossy(&output.stderr)
+    /// Pins the config keys that would otherwise leak in from the developer's machine and change
+    /// what we snapshot or how we check it out.
+    fn harden(repo: &Repository) {
+        let mut config = repo.config().expect("repo config");
+        config
+            .set_str("user.name", "hatchery-spike")
+            .expect("set user.name");
+        config
+            .set_str("user.email", "spike@localhost")
+            .expect("set user.email");
+        config
+            .set_str("core.autocrlf", "false")
+            .expect("set core.autocrlf");
+        // A developer's global excludesfile would silently shrink our snapshots.
+        config
+            .set_str("core.excludesFile", "/nonexistent/hatchery-excludes")
+            .expect("set core.excludesFile");
+        config
+            .set_bool("core.fsmonitor", false)
+            .expect("set core.fsmonitor");
+    }
+
+    /// Opens the shadow repository, creating it on first use, with the user's workspace as its work
+    /// tree and **no** gitlink written into that workspace.
+    fn open_shadow(&self) -> Repository {
+        let repo = if self.git_dir.join("HEAD").exists() {
+            Repository::open(&self.git_dir).expect("open shadow repo")
+        } else {
+            let mut options = RepositoryInitOptions::new();
+            // The git dir is exactly `git_dir` (no appended /.git), and no templates from the
+            // developer's machine.
+            options
+                .no_dotgit_dir(true)
+                .bare(true)
+                .external_template(false);
+            let repo = Repository::init_opts(&self.git_dir, &options).expect("init shadow repo");
+            // libgit2's `git_repository_set_workdir` only persists `core.worktree` and
+            // `core.bare=false` when `update_gitlink` is true — and that same flag is what writes a
+            // `.git` gitlink into the work tree (repository.c, git_repository_set_workdir). So the
+            // config is written by hand here and the in-memory handle is pointed at the workspace
+            // with `update_gitlink: false`, which leaves the user's directory alone.
+            let mut config = repo.config().expect("shadow config");
+            config
+                .set_str(
+                    "core.worktree",
+                    self.workspace.to_str().expect("workspace path is utf-8"),
+                )
+                .expect("set core.worktree");
+            config
+                .set_bool("core.bare", false)
+                .expect("clear core.bare");
+            drop(config);
+            repo.set_workdir(&self.workspace, false)
+                .expect("attach the user workspace as the work tree");
+            repo
+        };
+        Self::harden(&repo);
+        repo.add_ignore_rule(SHADOW_IGNORE_RULES)
+            .expect("add ignore rules");
+        let extra = self.extra_ignore_rules.borrow();
+        if !extra.is_empty() {
+            repo.add_ignore_rule(&extra)
+                .expect("add extra ignore rules");
+        }
+        drop(extra);
+
+        let workdir =
+            std::fs::canonicalize(repo.workdir().expect("the shadow repo has a work tree"))
+                .expect("canonicalise the work tree");
+        let expected = std::fs::canonicalize(&self.workspace).expect("canonicalise the workspace");
+        assert_eq!(
+            workdir, expected,
+            "the shadow repository must use the user's workspace as its work tree"
         );
-        String::from_utf8(output.stdout).expect("utf-8 stdout")
+        repo
     }
 
-    /// Runs git against the shadow repository with the user's workspace as its work tree.
-    fn shadow_git(&self, args: &[&str]) -> Output {
-        let mut cmd = Command::new("git");
-        self.apply_env(&mut cmd);
-        cmd.arg("--git-dir")
-            .arg(&self.git_dir)
-            .arg("--work-tree")
-            .arg(&self.workspace)
-            .args(args);
-        cmd.output().expect("spawn git")
+    /// Opens the user's own repository.
+    fn open_user_repo(&self) -> Repository {
+        Repository::open(&self.workspace).expect("open the user's repository")
     }
 
-    fn shadow_ok(&self, args: &[&str]) -> String {
-        let output = self.shadow_git(args);
-        assert!(
-            output.status.success(),
-            "shadow git {args:?} failed: {}\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        String::from_utf8(output.stdout).expect("utf-8 stdout")
+    fn user_index_mtime(&self) -> Option<SystemTime> {
+        mtime(&self.workspace.join(".git").join("index"))
     }
 
-    /// A user repository with staged, unstaged and untracked changes plus one commit.
+    /// Everything about the user's repository that shadow operations must not change.
+    fn user_repo_state(&self) -> UserRepoState {
+        let repo = self.open_user_repo();
+        let mut options = StatusOptions::new();
+        options.include_untracked(true).recurse_untracked_dirs(true);
+        let status_list = repo.statuses(Some(&mut options)).expect("statuses");
+        let mut status: Vec<String> = status_list
+            .iter()
+            .map(|entry| {
+                format!(
+                    "{:?} {}",
+                    entry.status(),
+                    entry.path().unwrap_or("<unparsable>")
+                )
+            })
+            .collect();
+        status.sort();
+
+        let mut refs: Vec<String> = repo
+            .references()
+            .expect("references")
+            .map(|reference| {
+                let reference = reference.expect("reference");
+                format!(
+                    "{} {:?}",
+                    reference.name().unwrap_or("<unparsable>"),
+                    reference.target()
+                )
+            })
+            .collect();
+        refs.sort();
+
+        UserRepoState {
+            status,
+            head: repo
+                .head()
+                .ok()
+                .and_then(|head| head.target())
+                .map(|oid| oid.to_string())
+                .unwrap_or_else(|| "unborn".to_owned()),
+            branch: repo
+                .head()
+                .ok()
+                .and_then(|head| head.shorthand().ok().map(str::to_owned))
+                .unwrap_or_else(|| "none".to_owned()),
+            refs,
+            index_mtime: self.user_index_mtime(),
+            git_dir_entries: sorted_entries(&self.workspace.join(".git")),
+        }
+    }
+
+    /// Creates a user repository with one commit, plus staged, unstaged and untracked changes.
     fn make_user_repo(&self) {
-        self.user_git(&["init", "--initial-branch=main"]);
+        let repo = Repository::init(&self.workspace).expect("init the user's repository");
+        Self::harden(&repo);
+
         self.write("committed.txt", "committed\n");
-        self.user_git(&["add", "committed.txt"]);
-        self.user_git(&["commit", "-m", "initial"]);
+        let mut index = repo.index().expect("user index");
+        index
+            .add_all(["*"].iter(), IndexAddOption::DEFAULT, None)
+            .expect("add all");
+        index.write().expect("write index");
+        let tree = repo
+            .find_tree(index.write_tree().expect("write tree"))
+            .expect("find tree");
+        let signature = Self::signature();
+        repo.commit(Some("HEAD"), &signature, &signature, "initial", &tree, &[])
+            .expect("initial commit");
+
         self.write("staged.txt", "staged\n");
-        self.user_git(&["add", "staged.txt"]);
+        let mut index = repo.index().expect("user index");
+        index
+            .add_path(Path::new("staged.txt"))
+            .expect("stage staged.txt");
+        index.write().expect("write index");
+
         self.write("unstaged.txt", "unstaged\n");
         self.write("untracked.txt", "untracked\n");
-        // Materialise and refresh the index so its mtime is meaningful before we start.
-        self.user_git(&["status", "--porcelain"]);
     }
 
     fn write(&self, name: &str, contents: &str) {
@@ -137,64 +249,116 @@ impl Sandbox {
         self.workspace.join(name).exists()
     }
 
-    /// Everything about the user's repository that a shadow operation must not change.
-    ///
-    /// Note this itself runs git in the user's repository, and `git status` rewrites the index —
-    /// so index mtime is captured separately by [`Sandbox::user_index_mtime`], which touches no
-    /// git at all.
-    fn user_repo_state(&self) -> UserRepoState {
-        UserRepoState {
-            status: self.user_git(&["status", "--porcelain"]),
-            head: self.user_git(&["rev-parse", "HEAD"]),
-            branch: self.user_git(&["rev-parse", "--abbrev-ref", "HEAD"]),
-            refs: self.user_git(&["for-each-ref", "--format=%(refname) %(objectname)"]),
-            git_dir_entries: sorted_entries(&self.workspace.join(".git")),
+    /// Takes a checkpoint of the whole workspace and returns its commit id.
+    fn snapshot(&self, label: &str) -> Oid {
+        let repo = self.open_shadow();
+        let mut index = repo.index().expect("shadow index");
+        index
+            .add_all(["*"].iter(), IndexAddOption::DEFAULT, None)
+            .expect("stage the workspace");
+        index.write().expect("write shadow index");
+        let tree = repo
+            .find_tree(index.write_tree().expect("write tree"))
+            .expect("find tree");
+        let signature = Self::signature();
+        let parent = repo
+            .head()
+            .ok()
+            .and_then(|head| head.target())
+            .and_then(|oid| repo.find_commit(oid).ok());
+        let parents: Vec<&git2::Commit> = parent.iter().collect();
+        repo.commit(Some("HEAD"), &signature, &signature, label, &tree, &parents)
+            .expect("checkpoint commit")
+    }
+
+    fn tracked_files(&self, commit: Oid) -> Vec<String> {
+        let repo = self.open_shadow();
+        let tree = repo
+            .find_commit(commit)
+            .expect("find commit")
+            .tree()
+            .expect("commit tree");
+        let mut files = Vec::new();
+        tree.walk(git2::TreeWalkMode::PreOrder, |root, entry| {
+            if matches!(entry.kind(), Some(ObjectType::Blob)) {
+                files.push(format!("{root}{}", entry.name().unwrap_or("<unparsable>")));
+            }
+            git2::TreeWalkResult::Ok
+        })
+        .expect("walk tree");
+        files.sort();
+        files
+    }
+
+    /// Restores the workspace to a checkpoint. `purge` also removes files that no checkpoint ever
+    /// tracked — the `RestoreOptions.purge_untracked` of docs/design/capabilities.md §2.
+    fn restore(&self, to: Oid, purge: bool) {
+        let repo = self.open_shadow();
+        let target = repo
+            .find_object(to, Some(ObjectType::Commit))
+            .expect("find target commit");
+        let mut checkout = CheckoutBuilder::new();
+        checkout.force().recreate_missing(true);
+        repo.reset(&target, ResetType::Hard, Some(&mut checkout))
+            .expect("hard reset to the checkpoint");
+
+        if purge {
+            // A hard reset only checks out the paths that differ from the target, so it never
+            // deletes files that were untracked all along. That needs a second, explicit pass over
+            // the index. Ignored files are deliberately kept: purge removes untracked files, not
+            // build output or the user's `.env`.
+            let mut purge_checkout = CheckoutBuilder::new();
+            purge_checkout.force().remove_untracked(true);
+            repo.checkout_index(None, Some(&mut purge_checkout))
+                .expect("purge untracked files");
         }
     }
 
-    /// Modification time of the user's index, read without running git.
-    fn user_index_mtime(&self) -> Option<std::time::SystemTime> {
-        metadata_mtime(&self.workspace.join(".git").join("index"))
+    fn changed_paths(&self, from: Oid, to: Oid) -> Vec<String> {
+        let repo = self.open_shadow();
+        let (old, new) = (
+            repo.find_commit(from).expect("from").tree().expect("tree"),
+            repo.find_commit(to).expect("to").tree().expect("tree"),
+        );
+        let diff = repo
+            .diff_tree_to_tree(Some(&old), Some(&new), None)
+            .expect("diff trees");
+        let mut paths: Vec<String> = diff
+            .deltas()
+            .map(|delta| {
+                delta
+                    .new_file()
+                    .path()
+                    .or_else(|| delta.old_file().path())
+                    .map(|path| path.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "<unparsable>".to_owned())
+            })
+            .collect();
+        paths.sort();
+        paths.dedup();
+        paths
     }
 
-    /// Initialises the shadow repository against this workspace.
-    fn init_shadow(&self) {
-        std::fs::create_dir_all(self.git_dir.parent().expect("shadow parent")).expect("mkdir");
-        self.shadow_ok(&["init"]);
-        // Never track the user's own .git directory, whatever git's default behaviour is.
-        let info = self.git_dir.join("info");
-        std::fs::create_dir_all(&info).expect("create info dir");
-        std::fs::write(info.join("exclude"), b".git/\n").expect("write exclude");
-        self.shadow_ok(&["config", "user.name", "hatchery-spike"]);
-        self.shadow_ok(&["config", "user.email", "spike@localhost"]);
-    }
-
-    /// Takes a checkpoint and returns its commit id.
-    fn snapshot(&self, label: &str) -> String {
-        self.shadow_ok(&["add", "-A"]);
-        self.shadow_ok(&["commit", "-m", label, "--allow-empty"]);
-        self.shadow_ok(&["rev-parse", "HEAD"]).trim().to_owned()
-    }
-
-    fn tree_files(&self, commit: &str) -> Vec<String> {
-        self.shadow_ok(&["ls-tree", "-r", "--name-only", commit])
-            .lines()
-            .map(str::to_owned)
-            .collect()
+    /// Total size of the shadow git dir, which is what the checkpoint budget measures.
+    fn shadow_dir_bytes(&self) -> u64 {
+        dir_bytes(&self.git_dir)
     }
 }
 
 #[derive(Debug)]
 struct UserRepoState {
-    status: String,
+    status: Vec<String>,
     head: String,
     branch: String,
-    refs: String,
+    refs: Vec<String>,
+    index_mtime: Option<SystemTime>,
     git_dir_entries: Vec<String>,
 }
 
-fn metadata_mtime(path: &Path) -> Option<std::time::SystemTime> {
-    std::fs::metadata(path).and_then(|m| m.modified()).ok()
+fn mtime(path: &Path) -> Option<SystemTime> {
+    std::fs::metadata(path)
+        .and_then(|meta| meta.modified())
+        .ok()
 }
 
 fn sorted_entries(dir: &Path) -> Vec<String> {
@@ -210,6 +374,33 @@ fn sorted_entries(dir: &Path) -> Vec<String> {
     names
 }
 
+fn dir_bytes(dir: &Path) -> u64 {
+    let mut total = 0;
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(path) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&path) else {
+            continue;
+        };
+        for entry in entries.filter_map(Result::ok) {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_dir() {
+                stack.push(entry.path());
+            } else if let Ok(meta) = entry.metadata() {
+                total += meta.len();
+            }
+        }
+    }
+    total
+}
+
+fn write_files(sandbox: &Sandbox, prefix: &str, count: usize) {
+    for index in 0..count {
+        sandbox.write(&format!("{prefix}{index:04}.rs"), &format!("// {index}\n"));
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Invariant 6: the shadow repository must not touch the user's repository.
 // ---------------------------------------------------------------------------
@@ -223,77 +414,89 @@ fn invariant_shadow_git_never_touches_user_repo() {
         "the user repo should start out dirty, otherwise the test proves nothing"
     );
 
-    // Captured without running git, because `git status` itself rewrites the index (see
-    // `status_rewrites_the_user_index_but_plumbing_commands_do_not`): measuring the index with a
-    // git command would measure the measurement.
-    let index_before = sandbox.user_index_mtime();
-
-    sandbox.init_shadow();
-    sandbox.write("agent-writes.txt", "first\n");
     let first = sandbox.snapshot("checkpoint 1");
     sandbox.write("agent-writes.txt", "second\n");
     sandbox.write("agent-adds.txt", "new\n");
     let _second = sandbox.snapshot("checkpoint 2");
-    sandbox.shadow_ok(&["reset", "--hard", &first]);
-
-    let index_after = sandbox.user_index_mtime();
-    assert_eq!(
-        index_before, index_after,
-        "the shadow repository rewrote the user's index"
-    );
+    sandbox.restore(first, false);
 
     let after = sandbox.user_repo_state();
 
-    // The agent's own file writes legitimately show up in the user's status as untracked files;
-    // what invariant 6 forbids is the shadow repository changing anything else.
+    // The agent's own writes legitimately appear in the user's status as untracked files; what
+    // invariant 6 forbids is the shadow repository changing anything else.
     let agent_files = ["agent-writes.txt", "agent-adds.txt"];
-    let without_agent_files = |status: &str| {
+    let without_agent_files = |status: &[String]| -> Vec<String> {
         status
-            .lines()
+            .iter()
             .filter(|line| !agent_files.iter().any(|name| line.contains(name)))
-            .collect::<Vec<_>>()
-            .join("\n")
+            .cloned()
+            .collect()
     };
     assert_eq!(
         without_agent_files(&before.status),
         without_agent_files(&after.status),
-        "the user's `git status` changed beyond the agent's own file writes"
+        "the user's status changed beyond the agent's own file writes"
     );
     assert_eq!(before.head, after.head, "user HEAD moved");
     assert_eq!(before.branch, after.branch, "user branch changed");
     assert_eq!(before.refs, after.refs, "user refs changed");
     assert_eq!(
+        before.index_mtime, after.index_mtime,
+        "the user's index was rewritten"
+    );
+    assert_eq!(
         before.git_dir_entries, after.git_dir_entries,
         "the user's .git directory gained or lost entries"
     );
 
-    // The user's dirty files must still hold the user's content.
     assert_eq!(sandbox.read("staged.txt").as_deref(), Some("staged\n"));
     assert_eq!(sandbox.read("unstaged.txt").as_deref(), Some("unstaged\n"));
-    assert_eq!(
-        sandbox.read("untracked.txt").as_deref(),
-        Some("untracked\n")
-    );
     assert_eq!(
         sandbox.read("committed.txt").as_deref(),
         Some("committed\n")
     );
 }
 
+/// `RepositoryInitOptions::workdir_path` documents that it creates a `.git` gitlink in the work
+/// tree. Planting one in the user's workspace would corrupt a non-git workspace and collide with a
+/// real `.git` directory, so this pins the `set_workdir(.., false)` route instead.
+#[test]
+fn no_gitlink_is_planted_in_the_user_workspace() {
+    let plain = Sandbox::new(false);
+    assert!(!plain.workspace.join(".git").exists());
+    plain.snapshot("checkpoint");
+    assert!(
+        !plain.workspace.join(".git").exists(),
+        "the shadow repository planted a .git gitlink in a workspace that had none"
+    );
+
+    let with_repo = Sandbox::new(true);
+    let entries_before = sorted_entries(&with_repo.workspace.join(".git"));
+    with_repo.snapshot("checkpoint");
+    assert!(
+        with_repo.workspace.join(".git").is_dir(),
+        "the user's .git must stay a directory, not be replaced by a gitlink file"
+    );
+    assert_eq!(
+        entries_before,
+        sorted_entries(&with_repo.workspace.join(".git")),
+        "the shadow repository added or removed entries inside the user's .git"
+    );
+}
+
 #[test]
 fn shadow_repo_does_not_track_the_users_git_directory() {
     let sandbox = Sandbox::new(true);
-    sandbox.init_shadow();
     sandbox.write("agent-writes.txt", "x\n");
     let commit = sandbox.snapshot("checkpoint");
 
-    let tracked = sandbox.tree_files(&commit);
+    let tracked = sandbox.tracked_files(commit);
     assert!(
-        tracked.iter().any(|f| f == "agent-writes.txt"),
+        tracked.iter().any(|file| file == "agent-writes.txt"),
         "the agent's file should be tracked: {tracked:?}"
     );
     assert!(
-        !tracked.iter().any(|f| f.starts_with(".git/")),
+        !tracked.iter().any(|file| file.starts_with(".git/")),
         "the shadow repo must never track the user's .git directory: {tracked:?}"
     );
 }
@@ -303,10 +506,8 @@ fn shadow_repo_does_not_track_the_users_git_directory() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn restore_brings_back_modified_files_and_removes_later_tracked_ones() {
+fn restore_rolls_back_tracked_files_and_leaves_never_tracked_ones_alone() {
     let sandbox = Sandbox::new(false);
-    sandbox.init_shadow();
-
     sandbox.write("file.txt", "version 1\n");
     let first = sandbox.snapshot("checkpoint 1");
 
@@ -315,7 +516,7 @@ fn restore_brings_back_modified_files_and_removes_later_tracked_ones() {
     let _second = sandbox.snapshot("checkpoint 2");
     sandbox.write("never-tracked.txt", "created after the last checkpoint\n");
 
-    sandbox.shadow_ok(&["reset", "--hard", &first]);
+    sandbox.restore(first, false);
 
     assert_eq!(
         sandbox.read("file.txt").as_deref(),
@@ -325,22 +526,39 @@ fn restore_brings_back_modified_files_and_removes_later_tracked_ones() {
     assert_eq!(
         sandbox.read("later-tracked.txt"),
         None,
-        "a file that the later checkpoint tracked must be removed by the rollback"
+        "a file the later checkpoint tracked must be removed by the rollback"
     );
-    // Measured behaviour, and the reason `rewind` needs an explicit policy: `reset --hard` only
-    // touches files the shadow index knows about.
     assert_eq!(
         sandbox.read("never-tracked.txt").as_deref(),
         Some("created after the last checkpoint\n"),
-        "reset --hard unexpectedly deleted a file that was never checkpointed"
+        "a default restore must not delete files no checkpoint ever tracked"
+    );
+}
+
+/// The `--purge` half of `RestoreOptions`: explicit, approval-gated, and it does remove files that
+/// no checkpoint ever tracked.
+#[test]
+fn purge_restore_also_removes_never_tracked_files() {
+    let sandbox = Sandbox::new(false);
+    sandbox.write("file.txt", "version 1\n");
+    let first = sandbox.snapshot("checkpoint 1");
+
+    sandbox.write("file.txt", "version 2\n");
+    sandbox.write("never-tracked.txt", "created after the last checkpoint\n");
+
+    sandbox.restore(first, true);
+
+    assert_eq!(sandbox.read("file.txt").as_deref(), Some("version 1\n"));
+    assert_eq!(
+        sandbox.read("never-tracked.txt"),
+        None,
+        "purge must remove files that no checkpoint ever tracked"
     );
 }
 
 #[test]
 fn diff_between_checkpoints_lists_the_changed_files() {
     let sandbox = Sandbox::new(false);
-    sandbox.init_shadow();
-
     sandbox.write("a.txt", "1\n");
     sandbox.write("b.txt", "1\n");
     let first = sandbox.snapshot("checkpoint 1");
@@ -349,40 +567,35 @@ fn diff_between_checkpoints_lists_the_changed_files() {
     sandbox.write("c.txt", "new\n");
     let second = sandbox.snapshot("checkpoint 2");
 
-    let names = sandbox.shadow_ok(&["diff", "--name-only", &first, &second]);
-    let mut names: Vec<&str> = names
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .collect();
-    names.sort_unstable();
-    assert_eq!(names, vec!["a.txt", "c.txt"]);
+    assert_eq!(sandbox.changed_paths(first, second), vec!["a.txt", "c.txt"]);
 
-    let patch = sandbox.shadow_ok(&["diff", &first, &second]);
+    let repo = sandbox.open_shadow();
+    let old = repo.find_commit(first).expect("from").tree().expect("tree");
+    let new = repo.find_commit(second).expect("to").tree().expect("tree");
+    let diff = repo
+        .diff_tree_to_tree(Some(&old), Some(&new), None)
+        .expect("diff");
+    let stats = diff.stats().expect("diff stats");
+    assert_eq!(stats.files_changed(), 2);
     assert!(
-        patch.contains("-1\n") || patch.contains("-1"),
-        "patch lacks the old line"
+        stats.insertions() >= 2,
+        "insertions: {}",
+        stats.insertions()
     );
-    assert!(patch.contains("+2"), "patch lacks the new line");
 }
 
 #[test]
-fn exclude_rules_keep_large_files_out_of_the_shadow_repo() {
+fn ignore_rules_keep_excluded_paths_out_of_the_shadow_repo() {
     let sandbox = Sandbox::new(false);
-    sandbox.init_shadow();
-
-    // The checkpoint store will write per-workspace exclude rules into <git-dir>/info/exclude.
-    let info = sandbox.git_dir.join("info");
-    std::fs::create_dir_all(&info).expect("create info dir");
-    std::fs::write(info.join("exclude"), b".git/\nbig/\n*.blob\n").expect("write exclude");
+    // Stands in for the large-file and build-artifact exclusions CheckpointStore will configure.
+    sandbox.add_extra_ignore("big/\n*.blob\n");
 
     sandbox.write("small.txt", "keep me\n");
     sandbox.write("big/blob.bin", "x");
     sandbox.write("model.blob", "y");
     let commit = sandbox.snapshot("checkpoint");
 
-    let tracked = sandbox.tree_files(&commit);
-    assert_eq!(tracked, vec!["small.txt".to_owned()]);
+    assert_eq!(sandbox.tracked_files(commit), vec!["small.txt".to_owned()]);
     assert!(
         sandbox.exists("big/blob.bin") && sandbox.exists("model.blob"),
         "excluding a file must not delete it from the workspace"
@@ -390,44 +603,34 @@ fn exclude_rules_keep_large_files_out_of_the_shadow_repo() {
 }
 
 #[test]
-fn checkpoint_count_and_repo_size_are_queryable_for_the_budget() {
+fn checkpoint_history_and_shadow_size_are_queryable_for_the_budget() {
     let sandbox = Sandbox::new(false);
-    sandbox.init_shadow();
-
     for round in 0..5 {
         sandbox.write("file.txt", &format!("round {round}\n"));
         sandbox.snapshot(&format!("checkpoint {round}"));
     }
 
-    let commits = sandbox.shadow_ok(&["rev-list", "--count", "HEAD"]);
-    assert_eq!(commits.trim(), "5", "every snapshot must be a commit");
+    let repo = sandbox.open_shadow();
+    let mut walk = repo.revwalk().expect("revwalk");
+    walk.push_head().expect("push head");
+    assert_eq!(walk.count(), 5, "every snapshot must be a commit");
 
-    let count_objects = sandbox.shadow_ok(&["count-objects", "-vH"]);
-    let size_pack = count_objects
-        .lines()
-        .find_map(|line| line.strip_prefix("size:"))
-        .expect("count-objects reports a size");
-    assert!(!size_pack.trim().is_empty(), "size is reported");
-
-    // Budget enforcement (ADR-0006) needs a size it can compare against a limit; this asserts the
-    // query works and shows the number, the threshold logic itself lands in M2.
-    println!("shadow repo after 5 snapshots: size{size_pack}");
-    println!("{count_objects}");
+    let bytes = sandbox.shadow_dir_bytes();
+    assert!(bytes > 0, "the shadow git dir should hold objects");
+    // Budget enforcement (ADR-0006) compares this number against a limit; the threshold logic and
+    // GC land in M2. Walking the directory must stay cheap enough to do per snapshot.
+    println!("shadow git dir after 5 snapshots: {bytes} bytes");
 }
 
 #[test]
 fn snapshot_of_many_files_is_fast_enough() {
     let sandbox = Sandbox::new(false);
-    sandbox.init_shadow();
-
     const FILES: usize = 500;
-    for index in 0..FILES {
-        sandbox.write(&format!("src/file{index:04}.rs"), &format!("// {index}\n"));
-    }
+    write_files(&sandbox, "src/file", FILES);
 
     let started = Instant::now();
-    let first = sandbox.snapshot("cold snapshot");
-    let cold = started.elapsed();
+    let cold = sandbox.snapshot("cold snapshot");
+    let cold_elapsed = started.elapsed();
 
     // The common case in practice: a handful of edits on top of an existing checkpoint.
     for index in 0..10 {
@@ -437,90 +640,100 @@ fn snapshot_of_many_files_is_fast_enough() {
         );
     }
     let started = Instant::now();
-    let second = sandbox.snapshot("warm snapshot");
-    let warm = started.elapsed();
+    let warm = sandbox.snapshot("warm snapshot");
+    let warm_elapsed = started.elapsed();
 
     let started = Instant::now();
-    sandbox.shadow_ok(&["reset", "--hard", &first]);
-    let restore = started.elapsed();
+    sandbox.restore(cold, false);
+    let restore_elapsed = started.elapsed();
 
-    assert_eq!(sandbox.tree_files(&second).len(), FILES);
+    assert_eq!(sandbox.tracked_files(warm).len(), FILES);
     assert_eq!(sandbox.read("src/file0000.rs").as_deref(), Some("// 0\n"));
 
     // Generous bounds: CI machines are slow and shared. The measurements are the point.
     assert!(
-        cold.as_secs() < 60,
-        "cold snapshot of {FILES} files took {cold:?}"
+        cold_elapsed.as_secs() < 60,
+        "cold snapshot of {FILES} files took {cold_elapsed:?}"
     );
-    assert!(warm.as_secs() < 60, "warm snapshot took {warm:?}");
-    assert!(restore.as_secs() < 60, "restore took {restore:?}");
-
+    assert!(
+        warm_elapsed.as_secs() < 60,
+        "warm snapshot took {warm_elapsed:?}"
+    );
+    assert!(
+        restore_elapsed.as_secs() < 60,
+        "restore took {restore_elapsed:?}"
+    );
     println!(
-        "measured: cold snapshot of {FILES} files {cold:?}, warm snapshot after 10 edits \
-         {warm:?}, reset --hard restore {restore:?}"
+        "measured: cold snapshot of {FILES} files {cold_elapsed:?}, warm snapshot after 10 edits \
+         {warm_elapsed:?}, hard reset restore {restore_elapsed:?}"
     );
 }
 
 #[test]
 fn workspace_without_a_user_repo_works() {
     let sandbox = Sandbox::new(false);
-    assert!(
-        !sandbox.workspace.join(".git").exists(),
-        "this scenario needs a workspace that is not a git repository"
-    );
-    sandbox.init_shadow();
+    assert!(!sandbox.workspace.join(".git").exists());
     sandbox.write("file.txt", "v1\n");
     let first = sandbox.snapshot("checkpoint 1");
     sandbox.write("file.txt", "v2\n");
     sandbox.snapshot("checkpoint 2");
-    sandbox.shadow_ok(&["reset", "--hard", &first]);
+    sandbox.restore(first, false);
     assert_eq!(sandbox.read("file.txt").as_deref(), Some("v1\n"));
 }
 
 // ---------------------------------------------------------------------------
-// Which git commands are safe to run inside the user's repository.
+// Reading the user's repository: what is safe for background features to do.
 // ---------------------------------------------------------------------------
 
-/// Measured, and load-bearing for two features: the prompt `environment` section wants to know
-/// whether the workspace is a git repository (docs/design/platform.md §2.1), and tools may run git
-/// on the user's behalf. Plumbing commands leave `.git/index` alone; `git status` rewrites it as
-/// soon as a tracked file's stat info is stale. Background features must therefore stick to
-/// plumbing — a prompt assembler has no business dirtying the user's index.
+/// The prompt `environment` section wants to know whether the workspace is a git repository
+/// (docs/design/platform.md §2.1). With the CLI backend `git status` rewrote the user's index; this
+/// measures whether libgit2's `statuses()` does the same. A background feature must never dirty the
+/// user's repository.
 #[test]
-fn status_rewrites_the_user_index_but_plumbing_commands_do_not() {
+fn reading_user_status_does_not_rewrite_their_index() {
     let sandbox = Sandbox::new(true);
-    // Make a tracked file's cached stat info stale so `git status` has something to refresh.
+    // Make a tracked file's cached stat info stale so a status refresh has something to do.
     sandbox.write("committed.txt", "modified behind git's back\n");
     settle();
 
     let before = sandbox
         .user_index_mtime()
         .expect("the user repo has an index");
-    let plumbing: Vec<&[&str]> = vec![
-        &["rev-parse", "HEAD"],
-        &["rev-parse", "--abbrev-ref", "HEAD"],
-        &["rev-parse", "--is-inside-work-tree"],
-        &["for-each-ref"],
-        &["log", "--oneline"],
-        &["ls-files"],
-        &["diff", "--stat"],
-    ];
-    for args in plumbing {
-        sandbox.user_git(args);
-        settle();
-        assert_eq!(
-            sandbox.user_index_mtime().expect("index"),
-            before,
-            "`git {args:?}` rewrote the user's index"
-        );
-    }
 
-    sandbox.user_git(&["status", "--porcelain"]);
+    let repo = sandbox.open_user_repo();
+    let mut options = StatusOptions::new();
+    options.include_untracked(true).recurse_untracked_dirs(true);
+    // Scoped so the borrow of `repo` ends before we drop it.
+    let entries = {
+        let statuses = repo.statuses(Some(&mut options)).expect("statuses");
+        statuses.len()
+    };
+    assert!(
+        entries > 0,
+        "the dirty user repo should report at least one entry"
+    );
+    drop(repo);
     settle();
-    assert_ne!(
-        sandbox.user_index_mtime().expect("index"),
+
+    assert_eq!(
         before,
-        "expected `git status --porcelain` to refresh and rewrite the user's index"
+        sandbox
+            .user_index_mtime()
+            .expect("the user repo has an index"),
+        "reading statuses through libgit2 rewrote the user's .git/index"
+    );
+
+    // The read-only queries the environment section needs must be side-effect free too.
+    let repo = sandbox.open_user_repo();
+    let _ = repo.head().ok().and_then(|head| head.target());
+    let _ = repo.references().map(|refs| refs.count());
+    let _ = repo.revparse_single("HEAD");
+    drop(repo);
+    settle();
+    assert_eq!(
+        before,
+        sandbox.user_index_mtime().expect("index"),
+        "read-only repository queries rewrote the user's index"
     );
 }
 

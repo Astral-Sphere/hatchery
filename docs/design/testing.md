@@ -5,7 +5,7 @@
 ## 0. 测试纪律（全项目强制）
 
 1. **不变量必测**：architecture.md §5 的 6 条核心不变量，每条至少一个专属集成测试（§5 给出映射表）；CI 中归入 `invariants` 分组，永不 skip。
-2. **实测优先**：涉及第三方行为的断言（SQL 引擎的 WAL/触发器/pragma、git CLI 边界、provider SSE 怪癖、ACP 宿主行为）必须来自真实执行或真实录制 fixture，禁止按文档/记忆推断后直接写死预期。**上游文档本身也会过时**——M0a 实测：turso 的 COMPAT.md 称 `synchronous` 只支持 OFF/FULL，实际 NORMAL 可用。spike 结论（worklog 各方向）沉淀为回归测试。
+2. **实测优先**：涉及第三方行为的断言（SQL 引擎的 WAL/触发器/pragma、libgit2 的仓库与 checkout 语义、provider SSE 怪癖、ACP 宿主行为）必须来自真实执行或真实录制 fixture，禁止按文档/记忆推断后直接写死预期。**上游文档会过时**——M0a 实测：turso 的 COMPAT.md 称 `synchronous` 只支持 OFF/FULL，实际 NORMAL 可用。**自己写下的结论同样要复核**——M0a 曾记录「git2 需要 cmake」，实测 libgit2-sys 的 build.rs 只用 `cc`，该错误结论已在 ADR-0012 更正。spike 结论（worklog 各方向）沉淀为回归测试。
 3. **Bug 修复必附回归测试**：先写复现测试（红），再修（绿）；worklog 条目引用测试名。
 4. **文档示例可运行**：公共 API 的 rustdoc 示例必须是 doctest 且进 CI；不可运行的示例不写「ignore」了事——要么改成可运行，要么改成 `text` 代码块并说明原因。
 5. **测试不碰真实用户环境**：一切文件/进程/数据库操作在 tempdir、内存或专用 fixture 工作区内；网络默认禁止，live 测试单独标记（§8）。
@@ -111,8 +111,8 @@ pub fn assert_golden(value: impl Debug);      // insta 封装，统一快照命�
 
 风险：影子 Git 碰用户仓库（灾难级）、硬门被绕过、PTY 泄漏进程。
 
-- **影子 Git 安全**（不变量 6 专属）：`shadow_git_never_touches_user_repo`——TempWorkspace 先 git init + 造脏状态（staged/unstashed/HEAD 位置/detached），跑一轮 snapshot+restore，断言用户仓库 `status --porcelain`、`rev-parse HEAD`、index mtime、refs 全部不变。
-- 检查点语义：写前必有 snapshot（MemoryFs 写序列 vs checkpoint 记录对齐）；restore 可回滚（restore 前自动 snapshot）；大文件跳过；预算熔断触发 GC（构造超预算 fixture）；非 git 工作区可用。
+- **影子 Git 安全**（不变量 6 专属）：`invariant_shadow_git_never_touches_user_repo`——TempWorkspace 先造一个脏仓库（staged/unstaged/untracked + 一次 commit），跑 snapshot + restore，断言用户仓库的 HEAD、分支、refs、`.git/index` mtime、`.git` 目录条目全部不变；外加 `no_gitlink_is_planted_in_the_user_workspace`（libgit2 的 `set_workdir(.., update_gitlink=true)` 会在用户工作区里种一个 `.git` 文件，必须传 false 并自己写 `core.worktree`/`core.bare`，ADR-0012）。**后端已从 CLI git 换成 git2 / vendored libgit2，11 项门槛测试常驻 `crates/hatchery-capabilities/tests/spike_shadow_git.rs` 且全绿。**
+- 检查点语义：写前必有 snapshot（MemoryFs 写序列 vs checkpoint 记录对齐）；restore 可回滚（restore 前自动 snapshot）；purge 才删未跟踪文件（`purge_restore_also_removes_never_tracked_files`，实现走 `checkout_index(remove_untracked)`）；忽略规则每次打开句柄都要重放（实测 `add_ignore_rule` 是 per-handle 的）；大文件跳过；预算熔断触发 GC（构造超预算 fixture）；非 git 工作区可用。
 - 硬门（不变量 5 专属）：`project_config_cannot_disable_hard_gates`——加载恶意项目配置后断言危险路径写仍需审批、规则不可 allow-always。
 - LocalFs：路径逃逸（`../`、symlink 出工作区、绝对路径）全部拦截；行范围读取边界。
 - LocalPty：真实进程（`sh -c echo/sleep/kill -0`）——输出完整性、超时杀、cancel 后无孤儿进程（`kill -0` 断言）、环形缓冲截断。

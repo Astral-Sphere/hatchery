@@ -15,9 +15,11 @@
 - [x] (M0) Cargo workspace 脚手架：12 member（11 crate + `xtask`）+ workspace Cargo.toml（共享依赖版本与 lints）+ rust-toolchain.toml
 - [x] (M0) CI：PR 门禁全套（`scripts/ci.sh`：toolchain/fmt/clippy `-D warnings`/build/nextest ci 组/doctests/fixture 确定性/i18n 占位）+ nightly（slow/gui/audit/coverage）+ `disallowed_methods` lint 配置
 - [x] (M0) xtask：`layering`（分层契约，含集成测试）、`coverage`；`i18n-extract` 与 `record-fixtures` 是 fail-loud 占位
-- [x] (M0) 三个 spike：存储引擎（→ ADR-0010 turso）、影子 Git CLI vs git2（→ CLI）、i18n gettext vs fluent（→ ADR-0011 fluent）
+- [x] (M0) 三个 spike：存储引擎（→ ADR-0010 turso）、影子 Git 后端（→ **ADR-0012 git2 vendored**；第一轮曾选 CLI，用户裁决后改 git2 并重测）、i18n gettext vs fluent（→ ADR-0011 fluent）
 - [x] (M0) MSRV 实测：`rust-version = "1.90"`（1.85/1.88 均失败，1.90.0 编译通过）
-- [ ] **(需要用户 push)** 三平台 CI 首次验证：windows MSYS2 ucrt64 + `x86_64-pc-windows-gnu` 那条 job 风险最高（rustup-in-MSYS2、prebuilt MSVC nextest、actions/cache 路径）；失败日志回传后修正
+- [x] (M0) CI 工具链改为**源码编译**（`cargo install cargo-nextest --version 0.9.146 --locked`，三平台一致；nightly 的 audit/llvm-cov 同）——用户裁决，避免预构建二进制在 MSYS2 下的不确定性
+- [x] (M0) 编译 flags：`.cargo/config.toml` 加 `[build] rustflags = ["-C", "target-cpu=native"]`（用户偏好；已实测进入 rustc 调用）。**纪律**：发布产物与交叉编译必须覆盖（`RUSTFLAGS=""`），否则二进制不可跨 CPU 移植
+- [ ] **(需要用户 push)** 三平台 CI 首次验证：windows MSYS2 ucrt64 + `x86_64-pc-windows-gnu` 那条 job 风险最高（rustup-in-MSYS2、`cargo install` 源码编译 nextest 的耗时、actions/cache 的 `C:/msys64/*` 路径、libgit2 的 cc 构建）；失败日志回传后修正
 - [x] (M0) 顶层 README 扩写：项目定位、快速开始、文档链接、MSYS2 ucrt64 环境清单、仓库布局；docs/README.md 加「代码布局」节
 - [ ] (M1) 建立 docs/glossary.md 术语表
 - [ ] (M1) MSRV CI job（`cargo +1.90.0 check`）加进 nightly，防止依赖升级悄悄抬高 MSRV
@@ -42,3 +44,8 @@
   - **「12 个 crate」与 architecture.md §3 只列 11 个不符** → 定为 **11 crate（10 产品 + testkit）+ xtask = 12 member**；配置/提示词代码落 daemon（前端经协议访问，无第二个消费者 → 按 ADR-0009 反预拆分不新建 `hatchery-platform`/`hatchery-prompts` crate）。
   - **kernel(L0) 与 capabilities(L1) 依赖环**：原设计里 kernel 的 `ToolCtx` 直接引用 capabilities 的 `FsBackend`/`TerminalBackend` → 改为 kernel 只暴露窄接口 **`ToolHost`**（snapshot/approval_for/invoke），`Tool`/`ToolCtx`/三个 backend trait 全部归 capabilities；`ToolDef`/`ToolOutput`/`ToolProgress`/`ApprovalRequest` 留 kernel（组装 LLM 请求与投影事件要用）。`cargo xtask layering` 的 LAYERS 表把这条规则变成机器检查。
 - 术语统一：wire 类型 `Thread` → **`Session`**（与方法名 `session/*`、表名 `sessions` 一致），避免一物两名。
+- **用户三项裁决后的第二轮**（M0a 收尾）：
+  - 影子 Git 后端从 CLI git 改为 **git2（vendored libgit2）** → 新增 **ADR-0012**，理由是可用性（很多用户机器没有 git）；11 项门槛在 git2 上重测全绿，热路径反而快约 2 倍。同时更正第一轮的错误记录「git2 需要 cmake」（实测 libgit2-sys 用 `cc`，不用 cmake）——教训写进 design/testing.md §0.2：**自己写下的结论也要复核**。
+  - CI 工具链一律 `cargo install --locked` 源码编译（pr.yml 三平台 + nightly 的 audit/llvm-cov），不再下载预构建二进制。
+  - `.cargo/config.toml` 加 `-C target-cpu=native`（实测已进入 rustc 调用）；连带纪律：发布产物与交叉编译必须用 `RUSTFLAGS=""` 覆盖，README 与 docs/README.md 都写明了。
+  - 运行时依赖变化：不再需要用户装 git；构建期改为需要一个 C 编译器。README、worklog/daemon.md（删掉 `git --version` 审计项）、worklog/platform.md（构建代价对照行）已同步。

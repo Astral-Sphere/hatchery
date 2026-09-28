@@ -27,18 +27,26 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Install tools
-        uses: taiki-e/install-action@v2
-        with:
-          tool: |
-            cargo-nextest@${{ env.NEXTEST_VERSION }}
-            cargo-audit
-            cargo-llvm-cov
-
       - name: Cache cargo and target
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: gate-linux
+
+      # Same policy as pr.yml: build the tools from source instead of downloading prebuilt
+      # binaries. Nightly has the time budget for it, and the cache above keeps ~/.cargo/bin.
+      - name: Install tools
+        run: |
+          set -euo pipefail
+          if ! cargo nextest --version >/dev/null 2>&1; then
+            cargo install cargo-nextest --version "${NEXTEST_VERSION}" --locked
+          fi
+          if ! cargo audit --version >/dev/null 2>&1; then
+            cargo install cargo-audit --locked
+          fi
+          if ! cargo llvm-cov --version >/dev/null 2>&1; then
+            cargo install cargo-llvm-cov --locked
+          fi
+          cargo nextest --version
 
       # Run the PR gate first so a nightly-only failure is unambiguously attributable to the
       # extra groups below.

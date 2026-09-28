@@ -9,7 +9,7 @@
 - `hatchery-protocol`：Thread/Turn/Item/事件/方法的完整类型定义 + JSON fixture 测试。
 - `hatchery-kernel`：Turn 状态机 + trait 定义 + fake provider 单测。
 - `hatchery-store`：schema v1 + writer actor + rebuild_history + 分支操作（分叉/切换/级联删）+ 属性测试。
-- spike（各半天，结论写进对应 worklog）：~~存储引擎行为实测~~ **已完成 → 选定 turso 0.7.2（ADR-0010），12 项门槛测试常驻**；git CLI vs git2；gettext vs fluent。
+- spike（各半天，结论写进对应 worklog）：**三个全部完成**——存储引擎 → turso 0.7.2（ADR-0010，12 项门槛测试常驻）；影子 Git 后端 → git2 vendored（ADR-0012，11 项门槛测试常驻）；i18n → fluent（ADR-0011）。
 - 本文档体系随代码入库。
 
 **DoD**：`./scripts/ci.sh` 三平台全绿；store 的 kill -9 崩溃恢复测试通过；三个 spike 结论落档。

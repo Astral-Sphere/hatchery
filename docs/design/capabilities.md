@@ -71,16 +71,22 @@ impl CheckpointStore {
 }
 ```
 
-实现纪律（M0a spike 实测结论，详见 [worklog/capabilities.md](../worklog/capabilities.md)）：
+实现纪律（后端 = **git2 / vendored libgit2**，ADR-0012；下列结论全部来自 `tests/spike_shadow_git.rs` 的 11 项实测）：
 
-- **git 后端已定 = CLI `git`**。实测性能够用：500 文件冷快照 24.8 ms、10 处改动的热快照 12.6 ms、`reset --hard` 恢复 5.9 ms、5 次快照后影子仓库 60 KiB。`git2` 被否：它 vendored 编译 libgit2，需要 **cmake + C 工具链**（实测在本机 cmake 4.3.0 在场时 4.6 s 构建通过），与三平台 CI（尤其 windows-gnu/MSYS2 ucrt64）的「无 C 构建」方向冲突——和 ADR-0010/0011 同一条理由链。
-- **runtime 依赖 `git` 二进制**：daemon 启动审计检查 `git --version`，缺失即 fail-loud 拒绝服务（ADR-0009），`hatchery doctor` 报告版本；flatpak 打包必须 bundle git。
-- 所有影子仓库调用显式 `--git-dir=<影子> --work-tree=<用户工作区>`；启动时断言影子 git-dir ≠ 用户任何 `.git`（含向上查找）。**已实测**：快照/恢复全程用户的 HEAD、分支、refs、`.git/index` mtime、`.git` 目录条目全部不变（`invariant_shadow_git_never_touches_user_repo`）。
-- **禁止在用户工作区跑 `git status`**（实测：一旦有 tracked 文件的 stat 信息过期，它就会重写用户的 `.git/index`）。只读信息一律用 plumbing：`rev-parse`、`for-each-ref`、`log`、`ls-files`、`diff --stat`（实测均不改 index）。这条同样约束 prompt 的 environment 节（platform.md §2.1）与任何后台特性。
-- 快照范围默认全工作区，排除项写进 `<git-dir>/info/exclude`（实测 `big/`、`*.blob` 生效且不删除文件本身）；`.git/` 必须显式在排除列表里；单文件超过阈值（默认 10MB）跳过并记录。
-- **restore 语义（实测）**：`reset --hard <commit>` 会回滚已跟踪文件，并删除「被后续快照跟踪过的新文件」，但**不会**删除从未被任何快照跟踪的文件。因此 `purge_untracked=false` 时 rewind 是「回滚已知变更」，`=true` 才是「精确回到那一刻」——后者必须走审批并先展示待删清单。
+- **不依赖用户的 git 二进制**（这是选它的首要理由：很多用户机器上没有 git）。构建期需要一个 C 编译器——libgit2-sys 用 `cc` 编译 vendored libgit2 与 pcre2，**不需要 cmake**（实测 build.rs 未调用它）。daemon 启动审计因此不检查 git，但仍要检查数据目录可写。
+- **打开影子仓库的固定配方**（`CheckpointStore::open`）：
+  1. 首次创建：`Repository::init_opts(git_dir, opts)`，opts = `no_dotgit_dir(true)` + `bare(true)` + `external_template(false)`（不读开发者机器上的模板目录）。
+  2. 自己写 config：`core.worktree = <用户工作区>`、`core.bare = false`。**必须手写**——libgit2 的 `set_workdir(path, update_gitlink=false)` 只改内存句柄；而 `update_gitlink=true` 会在用户工作区里种一个 `.git` gitlink 文件（`repository.c:3259`，读源码 + 实测双确认）。
+  3. `set_workdir(<用户工作区>, false)` 让当前句柄生效；之后重新 `Repository::open(git_dir)` 靠第 2 步的 config 恢复 work tree。
+  4. 钉住配置以隔绝开发者机器：`core.autocrlf=false`、`core.excludesFile=<不存在的路径>`（否则用户的全局 excludes 会悄悄缩小快照范围）、`core.fsmonitor=false`、`user.name/email`。测试里的 `harden()` 就是这份清单，实现照抄。
+- **不变量 6 已实测**：快照 + 恢复全程，用户仓库的 HEAD、分支、refs、`.git/index` mtime、`.git` 目录条目全部不变，且工作区里不会出现 `.git`（`invariant_shadow_git_never_touches_user_repo`、`no_gitlink_is_planted_in_the_user_workspace`）。启动时仍要断言影子 git-dir ≠ 用户任何 `.git`（含向上查找）。
+- **读用户仓库是安全的**：libgit2 的 `statuses()` 实测**不会**重写用户的 `.git/index`（CLI 的 `git status` 会）。prompt 的 environment 节（platform.md §2.1）因此可以直接读分支/脏状态，不再需要「禁用 status」那类脆弱纪律。
+- **忽略规则是 per-handle 的**：`add_ignore_rule` 只作用于当前 `Repository` 句柄（实测：临时句柄上加的规则对下一次打开无效）。`CheckpointStore` 每次打开都要按配置重放规则；`.git/` 恒在规则里；大文件（默认 >10MB）与构建产物走配置化排除，且**排除不等于删除**（实测文件本身保留）。
+- **restore 语义（实测）**：`reset(Hard)` 会回滚已跟踪文件、并删除「被后续快照跟踪过的新文件」，但**不会**删除从未被任何快照跟踪的文件；给它传 `remove_untracked` 也无效（hard reset 的 checkout 只覆盖与目标有差异的路径）。所以 `purge_untracked=true` 要额外走一遍 `checkout_index(None, force().remove_untracked(true))`，且**不加 `remove_ignored`**（否则会删构建产物与用户的 `.env`）。默认 `false`：rewind 永不删用户自己的未跟踪文件；开启需审批 + 二次确认 + 先列出待删清单。
 - restore 前先 snapshot 当前状态（回滚也可回滚）。
 - 用户工作区不是 git 仓库时一切照常（实测通过）——影子仓库不依赖用户仓库存在。
+- 预算核算：`revwalk` 数快照数，影子 git-dir 占用直接遍历目录求和（实测 5 次快照仅 3457 B，因为 libgit2 不铺 hooks/模板）；GC 与熔断逻辑 M2。
+- 性能（实测，Linux x86_64 / 24 核）：500 文件冷快照 48.9 ms、10 处改动的热快照 6.0 ms、硬恢复 2.8 ms。热路径（每次写前打点）是常态，比 CLI 后端快约 2 倍。
 
 ## 3. hatchery-tools：内置工具
 
