@@ -14,20 +14,26 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 use hatchery_protocol::method::{
-    ClientInfo, ConfigEntry, ConfigGetParams, ConfigOrigin, ConfigPatch, ConfigSetParams,
-    DaemonCapabilities, EditItemParams, ExportJsonlParams, HelloParams, HelloResult,
-    PromptRenderParams, PromptSection, RewindParams, RewindReport, SessionCancelParams,
-    SessionDeleteParams, SessionListParams, SessionLoadParams, SessionNewParams,
-    SessionPromptParams, SessionRenameParams, SetConfigParams, SetModeParams,
+    ApprovalRespondParams, ApprovalRespondResult, BranchDeleteParams, BranchDeleteResult,
+    BranchListParams, BranchListResult, BranchNode, BranchSwitchParams, BranchSwitchResult,
+    ClientInfo, ConfigEntry, ConfigGetParams, ConfigGetResult, ConfigOrigin, ConfigPatch,
+    ConfigSetParams, ConfigSetResult, DaemonCapabilities, EditItemParams, EditItemResult,
+    ExportJsonlParams, ExportJsonlResult, HelloParams, HelloResult, PromptRenderParams,
+    PromptRenderResult, PromptSection, RewindParams, RewindReport, RewindResult,
+    SessionCancelParams, SessionCancelResult, SessionDeleteParams, SessionDeleteResult,
+    SessionListParams, SessionListResult, SessionLoadParams, SessionLoadResult, SessionNewParams,
+    SessionNewResult, SessionPromptParams, SessionPromptResult, SessionRenameParams,
+    SessionRenameResult, SetConfigParams, SetConfigResult, SetModeParams, SetModeResult,
 };
 use hatchery_protocol::{
     ApprovalId, ApprovalOption, ApprovalRequest, BranchNote, Checkpoint, CheckpointKind,
     Compaction, Content, ContentPart, DaemonEvent, ErrorCode, ErrorObject, EventError, Item,
     ItemId, ItemIdRange, ItemKind, ItemKindTag, JsonRpcVersion, ModeSwitch, ModelRef, Notification,
-    PROTOCOL_VERSION, ReasoningBlock, ReasoningEffort, Request, Response, RiskLevel, ServerEvent,
-    Session, SessionEvent, SessionModeId, SessionPatch, SessionStatus, SignatureBlock,
-    SpilledOutput, StopReason, Timestamp, ToolArtifact, ToolCall, ToolCallSummary, ToolOutput,
-    ToolProgress, ToolResult, ToolStatus, TurnCompletion, TurnId, Usage,
+    PROTOCOL_VERSION, ReasoningBlock, ReasoningEffort, Request, Response, RiskLevel,
+    SUPPORTED_PROTOCOL_VERSIONS, ServerEvent, Session, SessionEvent, SessionModeId, SessionPatch,
+    SessionStatus, SignatureBlock, SpilledOutput, StopReason, Timestamp, ToolArtifact, ToolCall,
+    ToolCallSummary, ToolOutput, ToolProgress, ToolResult, ToolStatus, TurnCompletion, TurnId,
+    Usage,
 };
 
 /// Session id used by every sample.
@@ -87,6 +93,26 @@ pub fn session() -> Session {
         active_branch_head: Some(item_id_2()),
         generation: 3,
         status: SessionStatus::WaitingApproval,
+    }
+}
+
+/// A session that has never run: no title, no workspace, no head.
+///
+/// The mirror image of [`session`], and the shape the store's foreign keys depend on:
+/// `active_branch_head` must be *absent* rather than dangling (ADR-0010).
+pub fn fresh_session() -> Session {
+    Session {
+        id: session_id(),
+        title: None,
+        mode: SessionModeId::chat(),
+        workspace: None,
+        model: ModelRef::new("deepseek", "deepseek-reasoner"),
+        config_patch: None,
+        created_at: TIMESTAMP,
+        updated_at: TIMESTAMP,
+        active_branch_head: None,
+        generation: 0,
+        status: SessionStatus::Idle,
     }
 }
 
@@ -314,11 +340,8 @@ pub fn frames() -> Vec<(&'static str, Value)> {
         })
         .expect("params are representable");
     let notification = Notification::new(hatchery_protocol::method::SESSION_CANCEL);
-    let response_ok = Response::ok(
-        7_i64,
-        &hatchery_protocol::method::SessionCancelResult { cancelled: true },
-    )
-    .expect("result is representable");
+    let response_ok = Response::ok(7_i64, &SessionCancelResult { cancelled: true })
+        .expect("result representable");
     let response_err = Response::err(
         8_i64,
         ErrorObject::new(ErrorCode::SessionNotFound, "no session with that id")
@@ -423,20 +446,20 @@ pub fn method_params() -> Vec<(&'static str, Value)> {
         ),
         (
             m::SESSION_BRANCH_LIST,
-            to_value(&hatchery_protocol::method::BranchListParams {
+            to_value(&BranchListParams {
                 session_id: session_id(),
             }),
         ),
         (
             m::SESSION_BRANCH_SWITCH,
-            to_value(&hatchery_protocol::method::BranchSwitchParams {
+            to_value(&BranchSwitchParams {
                 session_id: session_id(),
                 head: item_id(),
             }),
         ),
         (
             m::SESSION_BRANCH_DELETE,
-            to_value(&hatchery_protocol::method::BranchDeleteParams {
+            to_value(&BranchDeleteParams {
                 session_id: session_id(),
                 head: item_id(),
                 confirm: true,
@@ -466,7 +489,7 @@ pub fn method_params() -> Vec<(&'static str, Value)> {
         ),
         (
             m::APPROVAL_RESPOND,
-            to_value(&hatchery_protocol::method::ApprovalRespondParams {
+            to_value(&ApprovalRespondParams {
                 request_id: approval_id(),
                 option: ApprovalOption::AllowOnce,
             }),
@@ -509,17 +532,29 @@ pub fn method_params() -> Vec<(&'static str, Value)> {
     samples
 }
 
-/// A loosely populated result value, for the method results that have no parameters of their own.
+/// Every method's result struct, so each one is pinned by a golden and stays deserializable.
+///
+/// The method name is the key used by [`result_stem`] and [`results_validator`]. Results are
+/// pinned with the same rigour as parameters: they are what a frontend has to render, and an
+/// unpinned result type is a wire shape nobody reviewed.
 pub fn method_results() -> Vec<(&'static str, Value)> {
     use hatchery_protocol::method as m;
 
-    vec![
+    let session = session();
+    // `items()` gives every sample the same id and the same parent, which is fine for one-item
+    // fixtures but not for a replayed branch: this one has to be a real chain, root first.
+    let mut replay: Vec<Item> = items().into_iter().take(2).map(|(_, item)| item).collect();
+    replay[0].parent = None;
+    replay[1].id = item_id_2();
+    replay[1].parent = Some(item_id());
+
+    let samples: Vec<(&'static str, Value)> = vec![
         (
-            "result_hello",
+            m::DAEMON_HELLO,
             to_value(&HelloResult {
                 protocol_version: PROTOCOL_VERSION.to_owned(),
                 daemon_version: "0.1.0".to_owned(),
-                supported_versions: hatchery_protocol::SUPPORTED_PROTOCOL_VERSIONS
+                supported_versions: SUPPORTED_PROTOCOL_VERSIONS
                     .iter()
                     .map(|version| (*version).to_owned())
                     .collect(),
@@ -530,22 +565,93 @@ pub fn method_results() -> Vec<(&'static str, Value)> {
             }),
         ),
         (
-            "result_branch_list",
-            to_value(&hatchery_protocol::method::BranchListResult {
-                nodes: vec![hatchery_protocol::method::BranchNode {
-                    id: item_id(),
-                    parent: None,
-                    turn: Some(turn_id()),
-                    kind: ItemKindTag::UserMessage,
-                    created_at: TIMESTAMP,
-                    active: true,
-                }],
+            m::SESSION_NEW,
+            to_value(&SessionNewResult {
+                session: session.clone(),
             }),
         ),
         (
-            "result_rewind",
-            to_value(&hatchery_protocol::method::RewindResult {
-                session: session(),
+            m::SESSION_LOAD,
+            to_value(&SessionLoadResult {
+                session: session.clone(),
+                items: replay,
+                next_cursor: Some(item_id_2()),
+            }),
+        ),
+        (
+            m::SESSION_LIST,
+            to_value(&SessionListResult {
+                sessions: vec![session.clone()],
+                next_cursor: Some("cursor-2".to_owned()),
+            }),
+        ),
+        (
+            m::SESSION_PROMPT,
+            to_value(&SessionPromptResult { turn: turn_id() }),
+        ),
+        (
+            m::SESSION_CANCEL,
+            to_value(&SessionCancelResult { cancelled: true }),
+        ),
+        (
+            m::SESSION_SET_MODE,
+            to_value(&SetModeResult {
+                session: Session {
+                    mode: SessionModeId::chat(),
+                    ..session.clone()
+                },
+            }),
+        ),
+        (
+            m::SESSION_SET_CONFIG,
+            to_value(&SetConfigResult {
+                session: session.clone(),
+            }),
+        ),
+        (
+            m::SESSION_EDIT_ITEM,
+            to_value(&EditItemResult {
+                branch_head: item_id(),
+                session: session.clone(),
+            }),
+        ),
+        (
+            m::SESSION_BRANCH_LIST,
+            to_value(&BranchListResult {
+                nodes: vec![
+                    BranchNode {
+                        id: item_id(),
+                        parent: None,
+                        turn: Some(turn_id()),
+                        kind: ItemKindTag::UserMessage,
+                        created_at: TIMESTAMP,
+                        active: true,
+                    },
+                    BranchNode {
+                        id: item_id_2(),
+                        parent: Some(item_id()),
+                        turn: Some(turn_id()),
+                        kind: ItemKindTag::AssistantMessage,
+                        created_at: TIMESTAMP,
+                        active: false,
+                    },
+                ],
+            }),
+        ),
+        (
+            m::SESSION_BRANCH_SWITCH,
+            to_value(&BranchSwitchResult {
+                session: session.clone(),
+            }),
+        ),
+        (
+            m::SESSION_BRANCH_DELETE,
+            to_value(&BranchDeleteResult { deleted_items: 4 }),
+        ),
+        (
+            m::SESSION_REWIND,
+            to_value(&RewindResult {
+                session: session.clone(),
                 report: RewindReport {
                     rolled_back: vec![PathBuf::from("src/main.rs")],
                     purged: Vec::new(),
@@ -553,8 +659,45 @@ pub fn method_results() -> Vec<(&'static str, Value)> {
             }),
         ),
         (
-            "result_prompt_render",
-            to_value(&hatchery_protocol::method::PromptRenderResult {
+            m::SESSION_DELETE,
+            to_value(&SessionDeleteResult { deleted_items: 12 }),
+        ),
+        (
+            m::SESSION_RENAME,
+            to_value(&SessionRenameResult {
+                session: Session {
+                    title: Some("store performance".to_owned()),
+                    ..session.clone()
+                },
+            }),
+        ),
+        (
+            m::APPROVAL_RESPOND,
+            to_value(&ApprovalRespondResult { handled: true }),
+        ),
+        (
+            m::CONFIG_GET,
+            to_value(&ConfigGetResult {
+                entries: vec![ConfigEntry {
+                    key: "providers.deepseek.reasoning_effort".to_owned(),
+                    value: serde_json::json!("high"),
+                    origin: ConfigOrigin::User,
+                }],
+            }),
+        ),
+        (
+            m::CONFIG_SET,
+            to_value(&ConfigSetResult {
+                entry: ConfigEntry {
+                    key: "providers.deepseek.reasoning_effort".to_owned(),
+                    value: serde_json::json!("high"),
+                    origin: ConfigOrigin::Runtime,
+                },
+            }),
+        ),
+        (
+            m::PROMPT_RENDER,
+            to_value(&PromptRenderResult {
                 text: "identity\nmode\n".to_owned(),
                 sections: vec![PromptSection {
                     id: "identity".to_owned(),
@@ -564,15 +707,41 @@ pub fn method_results() -> Vec<(&'static str, Value)> {
             }),
         ),
         (
-            "result_config_get",
-            to_value(&hatchery_protocol::method::ConfigGetResult {
-                entries: vec![ConfigEntry {
-                    key: "providers.deepseek.reasoning_effort".to_owned(),
-                    value: serde_json::json!("high"),
-                    origin: ConfigOrigin::User,
-                }],
+            m::STORE_EXPORT_JSONL,
+            to_value(&ExportJsonlResult {
+                path: PathBuf::from("/tmp/export.jsonl"),
+                lines: 42,
             }),
         ),
+    ];
+
+    assert_eq!(
+        samples.len(),
+        m::ALL.len(),
+        "every method needs a result sample; add one when adding a method"
+    );
+    samples
+}
+
+/// Shapes whose *absent* fields are the contract.
+///
+/// Every other golden pins what is on the wire; these two pin what must not be there. A root item
+/// and a session that never ran carry their optional links as absent keys, never as `null`, so
+/// that "no parent" and "a parent we do not know" stay distinguishable in the store (ADR-0010).
+pub fn absent_field_shapes() -> Vec<(&'static str, Value)> {
+    vec![
+        (
+            "item_root",
+            to_value(
+                &Item::with_id(
+                    item_id(),
+                    session_id(),
+                    ItemKind::UserMessage(Content::text("the first thing said")),
+                )
+                .with_created_at(TIMESTAMP),
+            ),
+        ),
+        ("session_fresh", to_value(&fresh_session())),
     ]
 }
 
@@ -670,18 +839,22 @@ pub fn as_json_string() -> Check {
     })
 }
 
-/// A validator for an object containing the named keys.
-pub fn as_object_with(keys: &'static [&'static str]) -> Check {
-    Box::new(move |value: &Value| match value {
-        Value::Object(object) => {
-            for key in keys {
-                if !object.contains_key(*key) {
-                    return Err(format!("missing key {key:?}"));
-                }
-            }
-            Ok(format!("{} keys", object.len()))
+/// A validator for the patch that clears the title.
+///
+/// Deserializing into [`SessionPatch`] is not enough on its own: serde maps JSON `null` onto the
+/// *outer* option, so a patch that lost its clear marker still deserializes — as "leave the title
+/// alone". The value is the thing this fixture exists to pin.
+pub fn as_title_clearing_patch() -> Check {
+    Box::new(|value: &Value| {
+        let patch = serde_json::from_value::<SessionPatch>(value.clone())
+            .map_err(|error| error.to_string())?;
+        if patch.title != Some(None) {
+            return Err(format!(
+                "title is {:?}, expected Some(None): a null title must read back as 'clear it'",
+                patch.title
+            ));
         }
-        other => Err(format!("expected an object, got {other}")),
+        Ok(format!("{patch:?}"))
     })
 }
 
@@ -699,19 +872,59 @@ pub fn params_validator(method: &str) -> Check {
         m::SESSION_SET_MODE => as_type::<SetModeParams>(),
         m::SESSION_SET_CONFIG => as_type::<SetConfigParams>(),
         m::SESSION_EDIT_ITEM => as_type::<EditItemParams>(),
-        m::SESSION_BRANCH_LIST => as_type::<hatchery_protocol::method::BranchListParams>(),
-        m::SESSION_BRANCH_SWITCH => as_type::<hatchery_protocol::method::BranchSwitchParams>(),
-        m::SESSION_BRANCH_DELETE => as_type::<hatchery_protocol::method::BranchDeleteParams>(),
+        m::SESSION_BRANCH_LIST => as_type::<BranchListParams>(),
+        m::SESSION_BRANCH_SWITCH => as_type::<BranchSwitchParams>(),
+        m::SESSION_BRANCH_DELETE => as_type::<BranchDeleteParams>(),
         m::SESSION_REWIND => as_type::<RewindParams>(),
         m::SESSION_DELETE => as_type::<SessionDeleteParams>(),
         m::SESSION_RENAME => as_type::<SessionRenameParams>(),
-        m::APPROVAL_RESPOND => as_type::<hatchery_protocol::method::ApprovalRespondParams>(),
+        m::APPROVAL_RESPOND => as_type::<ApprovalRespondParams>(),
         m::CONFIG_GET => as_type::<ConfigGetParams>(),
         m::CONFIG_SET => as_type::<ConfigSetParams>(),
         m::PROMPT_RENDER => as_type::<PromptRenderParams>(),
         m::STORE_EXPORT_JSONL => as_type::<ExportJsonlParams>(),
         other => panic!("no validator for method {other:?}; add one"),
     }
+}
+
+/// The validator for one method's result, keyed by method name.
+pub fn results_validator(method: &str) -> Check {
+    use hatchery_protocol::method as m;
+
+    match method {
+        m::DAEMON_HELLO => as_type::<HelloResult>(),
+        m::SESSION_NEW => as_type::<SessionNewResult>(),
+        m::SESSION_LOAD => as_type::<SessionLoadResult>(),
+        m::SESSION_LIST => as_type::<SessionListResult>(),
+        m::SESSION_PROMPT => as_type::<SessionPromptResult>(),
+        m::SESSION_CANCEL => as_type::<SessionCancelResult>(),
+        m::SESSION_SET_MODE => as_type::<SetModeResult>(),
+        m::SESSION_SET_CONFIG => as_type::<SetConfigResult>(),
+        m::SESSION_EDIT_ITEM => as_type::<EditItemResult>(),
+        m::SESSION_BRANCH_LIST => as_type::<BranchListResult>(),
+        m::SESSION_BRANCH_SWITCH => as_type::<BranchSwitchResult>(),
+        m::SESSION_BRANCH_DELETE => as_type::<BranchDeleteResult>(),
+        m::SESSION_REWIND => as_type::<RewindResult>(),
+        m::SESSION_DELETE => as_type::<SessionDeleteResult>(),
+        m::SESSION_RENAME => as_type::<SessionRenameResult>(),
+        m::APPROVAL_RESPOND => as_type::<ApprovalRespondResult>(),
+        m::CONFIG_GET => as_type::<ConfigGetResult>(),
+        m::CONFIG_SET => as_type::<ConfigSetResult>(),
+        m::PROMPT_RENDER => as_type::<PromptRenderResult>(),
+        m::STORE_EXPORT_JSONL => as_type::<ExportJsonlResult>(),
+        other => panic!("no validator for the result of method {other:?}; add one"),
+    }
+}
+
+/// True when the developer asked for fixture regeneration *and* the gate is not running.
+///
+/// Shared by `golden_fixtures.rs`, which writes, and `version_compat.rs`, which reads: nextest
+/// runs test binaries concurrently, so a reader that ignored an update in progress would report a
+/// half-written golden as a compatibility break.
+pub fn updating() -> bool {
+    let asked = std::env::var("UPDATE_FIXTURES").is_ok_and(|value| value == "1");
+    let gated = std::env::var("INSTA_UPDATE").is_ok_and(|value| value == "no");
+    asked && !gated
 }
 
 /// Where the goldens live for the current major version.
@@ -731,6 +944,18 @@ pub struct Fixture {
     pub value: Value,
     /// How to deserialize it again.
     pub check: Check,
+}
+
+/// One registered fixture by its stem, for tests that pin a specific value.
+///
+/// # Panics
+///
+/// When no fixture carries `stem`, which is a typo in the test rather than a protocol change.
+pub fn fixture_by_stem(stem: &str) -> Fixture {
+    all()
+        .into_iter()
+        .find(|entry| entry.stem == stem)
+        .unwrap_or_else(|| panic!("no fixture named {stem}; see tests/support/mod.rs"))
 }
 
 /// Assembles the whole fixture set.
@@ -788,28 +1013,47 @@ pub fn all() -> Vec<Fixture> {
 
     for (method, value) in method_params() {
         fixtures.push(Fixture {
-            stem: leak(method),
+            stem: params_stem(method),
             shape: "params",
             value,
             check: params_validator(method),
         });
     }
 
-    for (stem, value) in method_results() {
+    for (method, value) in method_results() {
         fixtures.push(Fixture {
-            stem,
+            stem: result_stem(method),
             shape: "result",
             value,
-            check: as_object_with(&[]),
+            check: results_validator(method),
         });
     }
 
     for (stem, value) in session_patches() {
+        let check = match stem {
+            "session_patch_clear_title" => as_title_clearing_patch(),
+            "session_patch_empty" => as_type::<SessionPatch>(),
+            other => panic!("no validator for session patch {other:?}"),
+        };
         fixtures.push(Fixture {
             stem,
             shape: "SessionPatch",
             value,
-            check: as_type::<SessionPatch>(),
+            check,
+        });
+    }
+
+    for (stem, value) in absent_field_shapes() {
+        let check = match stem {
+            "item_root" => as_type::<Item>(),
+            "session_fresh" => as_type::<Session>(),
+            other => panic!("no validator for absent-field shape {other:?}"),
+        };
+        fixtures.push(Fixture {
+            stem,
+            shape: "absent-field shape",
+            value,
+            check,
         });
     }
 
@@ -834,33 +1078,64 @@ pub fn all() -> Vec<Fixture> {
     fixtures
 }
 
-/// Turns a method name into a `'static` fixture stem.
+/// The fixture stem for one method's parameters.
 ///
-/// The names are compile-time constants, so leaking them keeps the fixture table free of an
-/// allocation for every entry without turning `all()` into an owned-string iterator.
-fn leak(name: &'static str) -> &'static str {
-    // Fixture stems should read like file names, not like RPC paths.
-    match name {
-        hatchery_protocol::method::DAEMON_HELLO => "params_daemon_hello",
-        hatchery_protocol::method::SESSION_NEW => "params_session_new",
-        hatchery_protocol::method::SESSION_LOAD => "params_session_load",
-        hatchery_protocol::method::SESSION_LIST => "params_session_list",
-        hatchery_protocol::method::SESSION_PROMPT => "params_session_prompt",
-        hatchery_protocol::method::SESSION_CANCEL => "params_session_cancel",
-        hatchery_protocol::method::SESSION_SET_MODE => "params_session_set_mode",
-        hatchery_protocol::method::SESSION_SET_CONFIG => "params_session_set_config",
-        hatchery_protocol::method::SESSION_EDIT_ITEM => "params_session_edit_item",
-        hatchery_protocol::method::SESSION_BRANCH_LIST => "params_session_branch_list",
-        hatchery_protocol::method::SESSION_BRANCH_SWITCH => "params_session_branch_switch",
-        hatchery_protocol::method::SESSION_BRANCH_DELETE => "params_session_branch_delete",
-        hatchery_protocol::method::SESSION_REWIND => "params_session_rewind",
-        hatchery_protocol::method::SESSION_DELETE => "params_session_delete",
-        hatchery_protocol::method::SESSION_RENAME => "params_session_rename",
-        hatchery_protocol::method::APPROVAL_RESPOND => "params_approval_respond",
-        hatchery_protocol::method::CONFIG_GET => "params_config_get",
-        hatchery_protocol::method::CONFIG_SET => "params_config_set",
-        hatchery_protocol::method::PROMPT_RENDER => "params_prompt_render",
-        hatchery_protocol::method::STORE_EXPORT_JSONL => "params_store_export_jsonl",
-        other => panic!("no fixture stem for method {other:?}; add one"),
+/// Stems read like file names, not like RPC paths, so `session/branch/list` becomes
+/// `params_session_branch_list`. A method missing here panics rather than silently losing its
+/// golden.
+pub fn params_stem(method: &str) -> &'static str {
+    use hatchery_protocol::method as m;
+
+    match method {
+        m::DAEMON_HELLO => "params_daemon_hello",
+        m::SESSION_NEW => "params_session_new",
+        m::SESSION_LOAD => "params_session_load",
+        m::SESSION_LIST => "params_session_list",
+        m::SESSION_PROMPT => "params_session_prompt",
+        m::SESSION_CANCEL => "params_session_cancel",
+        m::SESSION_SET_MODE => "params_session_set_mode",
+        m::SESSION_SET_CONFIG => "params_session_set_config",
+        m::SESSION_EDIT_ITEM => "params_session_edit_item",
+        m::SESSION_BRANCH_LIST => "params_session_branch_list",
+        m::SESSION_BRANCH_SWITCH => "params_session_branch_switch",
+        m::SESSION_BRANCH_DELETE => "params_session_branch_delete",
+        m::SESSION_REWIND => "params_session_rewind",
+        m::SESSION_DELETE => "params_session_delete",
+        m::SESSION_RENAME => "params_session_rename",
+        m::APPROVAL_RESPOND => "params_approval_respond",
+        m::CONFIG_GET => "params_config_get",
+        m::CONFIG_SET => "params_config_set",
+        m::PROMPT_RENDER => "params_prompt_render",
+        m::STORE_EXPORT_JSONL => "params_store_export_jsonl",
+        other => panic!("no parameter fixture stem for method {other:?}; add one"),
+    }
+}
+
+/// The fixture stem for one method's result. See [`params_stem`].
+pub fn result_stem(method: &str) -> &'static str {
+    use hatchery_protocol::method as m;
+
+    match method {
+        m::DAEMON_HELLO => "result_daemon_hello",
+        m::SESSION_NEW => "result_session_new",
+        m::SESSION_LOAD => "result_session_load",
+        m::SESSION_LIST => "result_session_list",
+        m::SESSION_PROMPT => "result_session_prompt",
+        m::SESSION_CANCEL => "result_session_cancel",
+        m::SESSION_SET_MODE => "result_session_set_mode",
+        m::SESSION_SET_CONFIG => "result_session_set_config",
+        m::SESSION_EDIT_ITEM => "result_session_edit_item",
+        m::SESSION_BRANCH_LIST => "result_session_branch_list",
+        m::SESSION_BRANCH_SWITCH => "result_session_branch_switch",
+        m::SESSION_BRANCH_DELETE => "result_session_branch_delete",
+        m::SESSION_REWIND => "result_session_rewind",
+        m::SESSION_DELETE => "result_session_delete",
+        m::SESSION_RENAME => "result_session_rename",
+        m::APPROVAL_RESPOND => "result_approval_respond",
+        m::CONFIG_GET => "result_config_get",
+        m::CONFIG_SET => "result_config_set",
+        m::PROMPT_RENDER => "result_prompt_render",
+        m::STORE_EXPORT_JSONL => "result_store_export_jsonl",
+        other => panic!("no result fixture stem for method {other:?}; add one"),
     }
 }

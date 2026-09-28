@@ -4,7 +4,7 @@ use std::fmt;
 use std::path::PathBuf;
 use std::str::FromStr;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
 use crate::id::{ItemId, SessionId};
@@ -194,6 +194,44 @@ impl Session {
     }
 }
 
+/// Reads a clearable text field back the way [`SessionPatch`] writes it.
+///
+/// Serde maps JSON `null` onto the *outer* option, so the default deserialization of
+/// `Option<Option<String>>` would read `{"title":null}` as "leave the title alone" — exactly the
+/// distinction the double option exists to carry. Here: absent stays `None`, `null` becomes
+/// `Some(None)`, a string becomes `Some(Some(_))`, anything else is an error.
+fn clearable_text<'de, D>(deserializer: D) -> Result<Option<Option<String>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct ClearableText;
+
+    impl<'de> serde::de::Visitor<'de> for ClearableText {
+        type Value = Option<Option<String>>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("a string, or null to clear")
+        }
+
+        fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+            Ok(Some(None))
+        }
+
+        fn visit_none<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+            Ok(Some(None))
+        }
+
+        fn visit_some<D: Deserializer<'de>>(
+            self,
+            deserializer: D,
+        ) -> Result<Self::Value, D::Error> {
+            String::deserialize(deserializer).map(|text| Some(Some(text)))
+        }
+    }
+
+    deserializer.deserialize_option(ClearableText)
+}
+
 /// A partial update to a session's metadata.
 ///
 /// Double options where "clear it" is a real operation: `title: None` means "leave alone" and
@@ -202,7 +240,11 @@ impl Session {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct SessionPatch {
     /// New title, or `Some(None)` to clear it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "clearable_text"
+    )]
     pub title: Option<Option<String>>,
     /// New mode. Takes effect at the next turn boundary (ADR-0005).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -333,6 +375,40 @@ mod tests {
             serde_json::to_string(&untouched).expect("serialize"),
             "{}",
             "an absent field means 'leave alone'"
+        );
+
+        // Reading is the other half of the contract: serde would map `null` onto the outer
+        // option, silently turning "clear it" back into "leave it alone".
+        let read = |json: &str| {
+            serde_json::from_str::<SessionPatch>(json)
+                .unwrap_or_else(|error| panic!("{json} did not deserialize: {error}"))
+                .title
+        };
+        assert_eq!(
+            read(r#"{"title":null}"#),
+            Some(None),
+            "a null title must read back as 'clear it'"
+        );
+        assert_eq!(
+            read("{}"),
+            None,
+            "an absent title must read back as 'leave it alone'"
+        );
+        assert_eq!(
+            read(r#"{"title":"renamed"}"#),
+            Some(Some("renamed".to_owned()))
+        );
+        assert_eq!(
+            serde_json::from_str::<SessionPatch>(
+                &serde_json::to_string(&cleared).expect("serialize")
+            )
+            .expect("deserialize"),
+            cleared,
+            "a clearing patch must survive a round trip"
+        );
+        assert!(
+            serde_json::from_str::<SessionPatch>(r#"{"title":5}"#).is_err(),
+            "a title that is neither a string nor null must not be guessed at"
         );
     }
 

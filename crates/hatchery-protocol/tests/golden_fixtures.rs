@@ -35,19 +35,28 @@ use std::path::Path;
 
 use serde_json::Value;
 
-use support::{all, fixture_dir};
-
-/// True when the developer asked for regeneration *and* the gate is not running.
-fn updating() -> bool {
-    let asked = std::env::var("UPDATE_FIXTURES").is_ok_and(|value| value == "1");
-    let gated = std::env::var("INSTA_UPDATE").is_ok_and(|value| value == "no");
-    asked && !gated
-}
+use support::{all, fixture_dir, updating};
 
 fn render(value: &Value) -> String {
     let mut text = serde_json::to_string_pretty(value).expect("a fixture is pretty-printable");
     text.push('\n');
     text
+}
+
+/// Puts a fixture in place with a rename, so no reader ever sees a half-written file.
+///
+/// `version_compat.rs` reads these goldens from another test binary while nextest runs the
+/// binaries concurrently; a plain `fs::write` would let it observe a truncated fixture and report
+/// a compatibility break that never happened.
+fn write_atomic(path: &Path, text: &str) {
+    let temporary = path.with_extension(format!("json.tmp.{}", std::process::id()));
+    fs::write(&temporary, text).unwrap_or_else(|error| {
+        panic!("cannot write {}: {error}", temporary.display());
+    });
+    fs::rename(&temporary, path).unwrap_or_else(|error| {
+        let _ = fs::remove_file(&temporary);
+        panic!("cannot move {} into place: {error}", temporary.display());
+    });
 }
 
 #[test]
@@ -63,7 +72,7 @@ fn every_fixture_matches_its_golden_file() {
         let expected = render(&fixture.value);
 
         if updating() {
-            fs::write(&path, &expected).expect("write a fixture");
+            write_atomic(&path, &expected);
             written.push(fixture.stem);
             continue;
         }

@@ -8,11 +8,39 @@ mod support;
 use serde_json::Value;
 
 use hatchery_protocol::{
-    FrameDecoder, Incoming, Notification, Request, Response, classify, decode_frame, encode_frame,
-    method,
+    FrameDecoder, FrameError, Incoming, Notification, Request, Response, classify, decode_frame,
+    encode_frame, method,
 };
 
 use support::{frames, method_params};
+
+#[test]
+fn a_null_id_is_not_taken_for_a_correlation() {
+    // JSON-RPC 2.0 lets a peer answer a request it could not identify with `"id": null`. Every
+    // hatchery id is minted before its request is written, so such a frame is junk rather than a
+    // reply we lost — `classify` refuses it instead of inventing a correlation (see its docs).
+    let value = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": null,
+        "error": {"code": -32600, "message": "invalid request"},
+    });
+    assert_eq!(classify(value.clone()), Err(FrameError::Unclassifiable));
+
+    // The same frame arriving on the transport: reported, and the stream stays usable.
+    let frame = encode_frame(&value).expect("encode");
+    let mut decoder = FrameDecoder::default();
+    let lines = decoder.push(frame.as_bytes()).expect("push");
+    assert_eq!(lines.len(), 1);
+    assert_eq!(decode_frame(&lines[0]), Err(FrameError::Unclassifiable));
+    let after = decoder
+        .push(
+            encode_frame(&Request::new(1_i64, method::SESSION_CANCEL))
+                .expect("encode")
+                .as_bytes(),
+        )
+        .expect("the next frame still decodes");
+    assert_eq!(after.len(), 1);
+}
 
 #[test]
 fn every_methods_params_survive_a_real_frame() {

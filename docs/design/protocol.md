@@ -180,9 +180,9 @@ pub enum ErrorCode {                   // 数值一旦发布不可变（golden �
 
 - `PROTOCOL_VERSION = "1.0.0"`，`PROTOCOL_MAJOR = 1`；**兼容判定只看 major**（`is_compatible`），无法解析的版本一律拒绝而不是猜。
 - `daemon/hello` 协商版本；`SUPPORTED_PROTOCOL_VERSIONS` 是区间下界与拒绝路径的凭据。
-- 方法/字段只增不改语义；wire 类型**不用** `deny_unknown_fields`（旧客户端必须忽略未知字段）；可选字段一律 `skip_serializing_if`，不写 `null`（`SessionPatch::title` 的 `Some(None)` 是唯一例外：它意味着「清空标题」）。
-- golden fixture 在 `tests/fixtures/protocol-v<N>/`（N = major），共 62 个：每个 `ItemKind`、每个事件、每个方法参数与若干结果、四个帧形态、以及方法表与错误码表。生成方式 `UPDATE_FIXTURES=1 cargo nextest run -p hatchery-protocol`；`scripts/ci.sh` 导出的 `INSTA_UPDATE=no` 会让它在门禁里拒绝重写自己的契约。
-- **不用 insta**：insta 的快照名由断言表达式推导且要求字面量，数据驱动的 fixture 注册表无法驱动它（除非手写 62 条断言去重复注册表）。纯 JSON 另有好处：版本兼容 fixture 任何实现都能读，不只 Rust。代价是 key 按字母序（Value 是 BTreeMap）——确定性不受影响，声明序由 `typed_serialization_keeps_declaration_order` 单独锁定。
+- 方法/字段只增不改语义；wire 类型**不用** `deny_unknown_fields`（旧客户端必须忽略未知字段）；可选字段一律 `skip_serializing_if`，不写 `null`（`SessionPatch::title` 的 `Some(None)` 是唯一例外：它意味着「清空标题」）。**枚举值在 major 内冻结**：新增 `ItemKind`、事件 `type` 或状态拼写属于 major bump——未知枚举值一律硬失败（`an_unknown_enum_value_is_refused_rather_than_defaulted` 钉死），不静默降级；未知字段则必须被忽略。数字错误码是唯一的开放集（`ErrorObject.code: i64`），因为规范要求原样传递。
+- golden fixture 在 `tests/fixtures/protocol-v<N>/`（N = major），共 79 个：每个 `ItemKind`（含无父项的根形态）、每个事件、每个方法的参数**与结果**、空会话形态、四个帧形态、以及方法表与错误码表。生成方式 `UPDATE_FIXTURES=1 cargo nextest run -p hatchery-protocol`；`scripts/ci.sh` 导出的 `INSTA_UPDATE=no` 会让它在门禁里拒绝重写自己的契约。
+- **不用 insta**：insta 的快照名由断言表达式推导且要求字面量，数据驱动的 fixture 注册表无法驱动它（除非手写 79 条断言去重复注册表）。纯 JSON 另有好处：版本兼容 fixture 任何实现都能读，不只 Rust。代价是 key 按字母序（Value 是 BTreeMap）——确定性不受影响，声明序由 `typed_serialization_keeps_declaration_order` 单独锁定。
 - 版本兼容测试读**磁盘上的** fixture 反序列化，不与内存样本比对（后者是 golden 测试的职责），所以「改了 wire 形态」与「fixture 过期」是两种不同的失败。
 
 ## M0b 修正（相对初稿草图）

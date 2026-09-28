@@ -52,6 +52,29 @@ impl SessionEvent {
     }
 }
 
+/// Generates an event enum's `type_name` and its `ALL_TYPE_NAMES` from one variant list.
+///
+/// One list, two outputs, so neither can drift: `type_name`'s match is exhaustive over the enum,
+/// so a variant added to the enum without a wire name here fails to compile, and
+/// `ALL_TYPE_NAMES` is what the fixture registry is checked against
+/// (`tests/serde_roundtrip.rs`) — a new event therefore cannot skip its golden.
+macro_rules! event_type_names {
+    ($event:ident { $($variant:ident => $name:literal),* $(,)? }) => {
+        impl $event {
+            /// The event's wire type name, matching the serde tag.
+            #[must_use]
+            pub const fn type_name(&self) -> &'static str {
+                match self {
+                    $(Self::$variant { .. } => $name,)*
+                }
+            }
+
+            /// Every wire type name this event uses, in declaration order.
+            pub const ALL_TYPE_NAMES: &'static [&'static str] = &[$($name),*];
+        }
+    };
+}
+
 /// Something that happened inside one session.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -145,27 +168,25 @@ pub enum ServerEvent {
     GenerationBumped,
 }
 
-impl ServerEvent {
-    /// The event's wire type name, matching the serde tag.
-    #[must_use]
-    pub const fn type_name(&self) -> &'static str {
-        match self {
-            Self::ItemStarted { .. } => "item_started",
-            Self::TextDelta { .. } => "text_delta",
-            Self::ReasoningDelta { .. } => "reasoning_delta",
-            Self::ItemFinished { .. } => "item_finished",
-            Self::ToolCallStarted { .. } => "tool_call_started",
-            Self::ToolCallProgress { .. } => "tool_call_progress",
-            Self::ApprovalRequested { .. } => "approval_requested",
-            Self::TurnFinished { .. } => "turn_finished",
-            Self::TurnFailed { .. } => "turn_failed",
-            Self::SessionUpdated { .. } => "session_updated",
-            Self::ModeSwitched { .. } => "mode_switched",
-            Self::RateLimited { .. } => "rate_limited",
-            Self::GenerationBumped => "generation_bumped",
-        }
+event_type_names! {
+    ServerEvent {
+        ItemStarted => "item_started",
+        TextDelta => "text_delta",
+        ReasoningDelta => "reasoning_delta",
+        ItemFinished => "item_finished",
+        ToolCallStarted => "tool_call_started",
+        ToolCallProgress => "tool_call_progress",
+        ApprovalRequested => "approval_requested",
+        TurnFinished => "turn_finished",
+        TurnFailed => "turn_failed",
+        SessionUpdated => "session_updated",
+        ModeSwitched => "mode_switched",
+        RateLimited => "rate_limited",
+        GenerationBumped => "generation_bumped",
     }
+}
 
+impl ServerEvent {
     /// True for the streaming deltas, which the daemon may coalesce before sending.
     ///
     /// Control events must never be coalesced or reordered (`docs/design/testing.md` §3.6), so
@@ -193,13 +214,9 @@ pub enum DaemonEvent {
     },
 }
 
-impl DaemonEvent {
-    /// The event's wire type name, matching the serde tag.
-    #[must_use]
-    pub const fn type_name(&self) -> &'static str {
-        match self {
-            Self::DaemonShuttingDown { .. } => "daemon_shutting_down",
-        }
+event_type_names! {
+    DaemonEvent {
+        DaemonShuttingDown => "daemon_shutting_down",
     }
 }
 
@@ -308,6 +325,13 @@ mod tests {
         unique.sort_unstable();
         unique.dedup();
         assert_eq!(names.len(), unique.len(), "duplicate event type names");
+
+        let mut declared = ServerEvent::ALL_TYPE_NAMES.to_vec();
+        declared.sort_unstable();
+        assert_eq!(
+            unique, declared,
+            "every variant needs a sample and every sample a variant"
+        );
         assert_eq!(
             names.len(),
             13,
@@ -399,6 +423,11 @@ mod tests {
         let event = DaemonEvent::DaemonShuttingDown {
             reason: "user asked".to_owned(),
         };
+        assert_eq!(
+            DaemonEvent::ALL_TYPE_NAMES,
+            [event.type_name()].as_slice(),
+            "the single daemon-wide event must be the whole registry"
+        );
         let json = serde_json::to_value(&event).expect("serialize");
         assert_eq!(
             json.get("type").and_then(serde_json::Value::as_str),

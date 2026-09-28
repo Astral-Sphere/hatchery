@@ -1,0 +1,7 @@
+{
+  "entry": {
+    "key": "providers.deepseek.reasoning_effort",
+    "origin": "runtime",
+    "value": "high"
+  }
+}

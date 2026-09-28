@@ -99,11 +99,11 @@ impl Request {
     /// [`FrameError`] when the parameters are missing or do not fit `T` — a malformed call must
     /// be answered with `InvalidParams`, not guessed at.
     pub fn params_as<T: DeserializeOwned>(&self) -> Result<T, FrameError> {
-        let value = self
+        let params = self
             .params
-            .clone()
+            .as_ref()
             .ok_or_else(|| FrameError::MissingParams(self.method.clone()))?;
-        serde_json::from_value(value).map_err(FrameError::from)
+        T::deserialize(params).map_err(FrameError::from)
     }
 }
 
@@ -197,8 +197,9 @@ impl Response {
         if let Some(error) = &self.error {
             return Err(FrameError::Remote(error.clone()));
         }
-        let value = self.result.clone().unwrap_or(Value::Null);
-        serde_json::from_value(value).map_err(FrameError::from)
+        let absent = Value::Null;
+        let result = self.result.as_ref().unwrap_or(&absent);
+        T::deserialize(result).map_err(FrameError::from)
     }
 }
 
@@ -268,6 +269,12 @@ impl From<serde_json::Error> for FrameError {
 
 /// Classifies a JSON value into a request, a notification or a response.
 ///
+/// `"id": null` is not an id here. JSON-RPC 2.0 lets a peer answer a request it could not
+/// identify with a null-id error response; this build reports that frame as
+/// [`FrameError::Unclassifiable`] rather than inventing a correlation for it, because every
+/// hatchery id is minted by the caller before the request is written — so a null id is junk, not
+/// a reply we lost. Interop with a spec-literal foreign agent is the ACP bridge's job (M3).
+///
 /// # Errors
 ///
 /// [`FrameError`] when the value is not a JSON-RPC frame at all — including a wrong or missing
@@ -278,28 +285,35 @@ pub fn classify(value: Value) -> Result<Incoming, FrameError> {
     }
 
     // The version field is typed, so a missing or wrong one fails here rather than silently
-    // producing a frame that no peer will accept.
-    let probe: Probe = serde_json::from_value(value.clone()).map_err(FrameError::from)?;
+    // producing a frame that no peer will accept. Borrowing keeps the payload out of a clone:
+    // a `result` can be a whole session.
+    let Probe {
+        jsonrpc,
+        method,
+        id,
+        params,
+        result,
+        error,
+    } = Probe::deserialize(&value).map_err(FrameError::from)?;
 
-    match (probe.method, probe.id) {
-        (Some(method), Some(id)) => {
-            let request = Request {
-                jsonrpc: probe.jsonrpc,
-                id,
-                method,
-                params: probe.params,
-            };
-            Ok(Incoming::Request(request))
-        }
-        (Some(method), None) => Ok(Incoming::Notification(Notification {
-            jsonrpc: probe.jsonrpc,
+    match (method, id) {
+        (Some(method), Some(id)) => Ok(Incoming::Request(Request {
+            jsonrpc,
+            id,
             method,
-            params: probe.params,
+            params,
         })),
-        (None, Some(id)) => {
-            let response: Response = serde_json::from_value(value).map_err(FrameError::from)?;
-            Ok(Incoming::Response(Response { id, ..response }))
-        }
+        (Some(method), None) => Ok(Incoming::Notification(Notification {
+            jsonrpc,
+            method,
+            params,
+        })),
+        (None, Some(id)) => Ok(Incoming::Response(Response {
+            jsonrpc,
+            id,
+            result,
+            error,
+        })),
         (None, None) => Err(FrameError::Unclassifiable),
     }
 }
@@ -329,6 +343,9 @@ pub fn encode_frame<T: Serialize>(value: &T) -> Result<String, FrameError> {
 }
 
 /// The shape used to tell the three frame kinds apart before committing to one.
+///
+/// Carries every field of all three kinds, so the value is walked once and nothing is cloned: the
+/// arms of [`classify`] move the payload out of the probe into the frame they build.
 #[derive(Deserialize)]
 struct Probe {
     jsonrpc: JsonRpcVersion,
@@ -338,6 +355,10 @@ struct Probe {
     id: Option<Id>,
     #[serde(default)]
     params: Option<Value>,
+    #[serde(default)]
+    result: Option<Value>,
+    #[serde(default)]
+    error: Option<crate::ErrorObject>,
 }
 
 /// Accumulates bytes and yields complete lines.
@@ -348,6 +369,9 @@ struct Probe {
 #[derive(Debug, Default)]
 pub struct FrameDecoder {
     buffer: Vec<u8>,
+    /// How many leading bytes of `buffer` are already known to hold no newline. A frame that
+    /// arrives in many chunks is scanned once instead of from byte 0 on every read.
+    scanned: usize,
 }
 
 impl FrameDecoder {
@@ -363,24 +387,38 @@ impl FrameDecoder {
     ///
     /// # Errors
     ///
-    /// [`FrameError::TooLong`] when an unterminated frame exceeds the limit, or
-    /// [`FrameError::NotUtf8`] when a completed line is not valid UTF-8.
+    /// [`FrameError::TooLong`] when a frame exceeds the limit, terminated or not, or
+    /// [`FrameError::NotUtf8`] when a completed line is not valid UTF-8. Both drop the offending
+    /// bytes, so the next `push` starts on a clean buffer rather than failing forever.
     pub fn push(&mut self, chunk: &[u8]) -> Result<Vec<String>, FrameError> {
         self.buffer.extend_from_slice(chunk);
         let mut lines = Vec::new();
         let mut consumed = 0;
+        let mut scanned = self.scanned;
 
-        while let Some(offset) = self.buffer[consumed..]
+        while let Some(offset) = self.buffer[scanned..]
             .iter()
             .position(|byte| *byte == b'\n')
         {
-            let end = consumed + offset;
+            let end = scanned + offset;
             let raw = &self.buffer[consumed..end];
             consumed = end + 1;
+            scanned = end + 1;
             if raw.is_empty() {
                 continue;
             }
-            let line = std::str::from_utf8(raw).map_err(|_| FrameError::NotUtf8)?;
+            if raw.len() > Self::MAX_FRAME_BYTES {
+                self.buffer.clear();
+                self.scanned = 0;
+                return Err(FrameError::TooLong);
+            }
+            // Draining *before* reporting is what keeps the decoder usable: the alternative
+            // leaves the bad line buffered and every later push fails on the same bytes.
+            let Ok(line) = std::str::from_utf8(raw) else {
+                self.buffer.drain(..consumed);
+                self.scanned = 0;
+                return Err(FrameError::NotUtf8);
+            };
             lines.push(line.to_owned());
         }
 
@@ -389,8 +427,11 @@ impl FrameDecoder {
         }
         if self.buffer.len() > Self::MAX_FRAME_BYTES {
             self.buffer.clear();
+            self.scanned = 0;
             return Err(FrameError::TooLong);
         }
+        // Everything still buffered was scanned to the end without a newline.
+        self.scanned = self.buffer.len();
         Ok(lines)
     }
 
@@ -575,10 +616,124 @@ mod tests {
     }
 
     #[test]
+    fn the_limit_also_applies_to_a_frame_that_arrives_terminated() {
+        // A terminator must not buy a frame its way past the limit: the check has to see complete
+        // lines too, not only the unterminated leftover.
+        let mut decoder = FrameDecoder::default();
+        let mut chunk = vec![b'a'; FrameDecoder::MAX_FRAME_BYTES + 1];
+        chunk.push(b'\n');
+        assert_eq!(decoder.push(&chunk), Err(FrameError::TooLong));
+        assert_eq!(decoder.buffered_bytes(), 0, "the buffer is released");
+
+        let lines = decoder
+            .push(
+                encode_frame(&Request::new(1_i64, method::DAEMON_HELLO))
+                    .expect("encode")
+                    .as_bytes(),
+            )
+            .expect("the decoder stays usable after refusing an oversized frame");
+        assert_eq!(lines.len(), 1);
+    }
+
+    #[test]
     fn invalid_utf8_in_a_complete_line_is_reported() {
         let mut decoder = FrameDecoder::default();
         let mut bytes = vec![0xff, 0xfe];
         bytes.push(b'\n');
         assert_eq!(decoder.push(&bytes), Err(FrameError::NotUtf8));
+    }
+
+    #[test]
+    fn the_decoder_recovers_from_an_invalid_utf8_line() {
+        // Reporting the error is half of it; the other half is that the bad bytes are gone. A
+        // decoder that kept them would fail every later push on the same line, forever.
+        let mut decoder = FrameDecoder::default();
+        assert_eq!(decoder.push(&[0xff, 0xfe, b'\n']), Err(FrameError::NotUtf8));
+        assert_eq!(
+            decoder.buffered_bytes(),
+            0,
+            "the offending line must be dropped rather than re-read"
+        );
+
+        let frame = encode_frame(&Request::new(1_i64, method::DAEMON_HELLO)).expect("encode");
+        let lines = decoder
+            .push(frame.as_bytes())
+            .expect("the next push must work");
+        assert_eq!(lines.len(), 1);
+        assert!(matches!(
+            decode_frame(&lines[0]).expect("decode"),
+            Incoming::Request(_)
+        ));
+    }
+
+    #[test]
+    fn a_frame_trailing_an_invalid_utf8_line_still_arrives() {
+        let mut decoder = FrameDecoder::default();
+        let good = encode_frame(&Notification::new("x/y")).expect("encode");
+        let mut chunk = vec![0xff, b'\n'];
+        chunk.extend_from_slice(good.as_bytes());
+
+        assert_eq!(decoder.push(&chunk), Err(FrameError::NotUtf8));
+        let lines = decoder
+            .push(&[])
+            .expect("only the bad line is discarded, not the whole read");
+        assert_eq!(lines, vec![good.trim_end_matches('\n')]);
+    }
+
+    #[test]
+    fn the_lines_do_not_depend_on_how_the_transport_chunked_them() {
+        let mut stream = String::new();
+        stream
+            .push_str(&encode_frame(&Request::new(1_i64, method::SESSION_CANCEL)).expect("encode"));
+        stream.push_str(&encode_frame(&Notification::new("x/y")).expect("encode"));
+        stream.push_str(
+            &encode_frame(
+                &Request::new(2_i64, method::SESSION_PROMPT)
+                    .with_params(&serde_json::json!({"text": "日本語"}))
+                    .expect("encode"),
+            )
+            .expect("encode"),
+        );
+
+        let mut whole = FrameDecoder::default();
+        let expected = whole.push(stream.as_bytes()).expect("one push");
+        assert_eq!(expected.len(), 3);
+
+        for size in [1, 2, 3, 7, 64, 4096] {
+            let mut decoder = FrameDecoder::default();
+            let mut lines = Vec::new();
+            for part in stream.as_bytes().chunks(size) {
+                lines.extend(decoder.push(part).expect("chunked push"));
+            }
+            assert_eq!(
+                lines, expected,
+                "chunking by {size} bytes changed the frames"
+            );
+            assert_eq!(decoder.buffered_bytes(), 0);
+        }
+    }
+
+    #[test]
+    fn a_long_frame_in_many_chunks_is_scanned_once_not_from_the_start_every_time() {
+        // The bound is generous: scanning 2 MiB linearly costs milliseconds even with 65k pushes.
+        // What it rules out is rescanning the buffered prefix on every push, which is quadratic in
+        // the chunk count and would take tens of seconds here.
+        let mut stream = vec![b'a'; 2 * 1024 * 1024];
+        stream.push(b'\n');
+
+        let started = std::time::Instant::now();
+        let mut decoder = FrameDecoder::default();
+        let mut lines = Vec::new();
+        for part in stream.chunks(32) {
+            lines.extend(decoder.push(part).expect("push"));
+        }
+        let elapsed = started.elapsed();
+
+        assert_eq!(lines.len(), 1);
+        assert_eq!(decoder.buffered_bytes(), 0);
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "decoding took {elapsed:?}; a partial frame must not be rescanned from byte 0"
+        );
     }
 }

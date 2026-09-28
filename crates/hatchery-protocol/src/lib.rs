@@ -15,6 +15,10 @@
 //! 2. **the methods** — client → daemon calls, typed in [`method`];
 //! 3. **the events** — daemon → client notifications, [`SessionEvent`] and [`DaemonEvent`].
 //!
+//! Within a major the vocabulary only grows: a field added by a newer peer is ignored, but enum
+//! values are frozen — an unknown one is refused rather than guessed at, so a peer from a later
+//! major cannot be half-understood (`docs/design/protocol.md` §6).
+//!
 //! Design: `docs/design/protocol.md`.
 //!
 //! # Examples

@@ -245,41 +245,44 @@ pub enum ItemKindTag {
     BranchNote,
 }
 
-impl ItemKindTag {
-    /// Every tag, in declaration order. Tests iterate this to keep the mapping honest.
-    pub const ALL: &'static [Self] = &[
-        Self::UserMessage,
-        Self::AssistantMessage,
-        Self::Reasoning,
-        Self::ToolCall,
-        Self::ToolResult,
-        Self::Checkpoint,
-        Self::Compaction,
-        Self::ModeSwitch,
-        Self::BranchNote,
-    ];
+/// Generates [`ItemKindTag`]'s `ALL`, `as_str` and `from_name` from one variant list.
+///
+/// One list, three outputs, so none of them can drift: `as_str`'s match is exhaustive over the
+/// enum, so a variant added to the enum without its spelling here fails to compile, and `ALL` —
+/// which `from_name` searches and the fixtures are checked against — is built from the same list.
+macro_rules! item_kind_tags {
+    ($($variant:ident => $name:literal),* $(,)?) => {
+        impl ItemKindTag {
+            /// Every tag, in declaration order. Tests iterate this to keep the mapping honest.
+            pub const ALL: &'static [Self] = &[$(Self::$variant),*];
 
-    /// The wire and database spelling (`snake_case`).
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::UserMessage => "user_message",
-            Self::AssistantMessage => "assistant_message",
-            Self::Reasoning => "reasoning",
-            Self::ToolCall => "tool_call",
-            Self::ToolResult => "tool_result",
-            Self::Checkpoint => "checkpoint",
-            Self::Compaction => "compaction",
-            Self::ModeSwitch => "mode_switch",
-            Self::BranchNote => "branch_note",
+            /// The wire and database spelling (`snake_case`).
+            #[must_use]
+            pub const fn as_str(self) -> &'static str {
+                match self {
+                    $(Self::$variant => $name,)*
+                }
+            }
+
+            /// Parses the database or wire spelling.
+            #[must_use]
+            pub fn from_name(name: &str) -> Option<Self> {
+                Self::ALL.iter().copied().find(|tag| tag.as_str() == name)
+            }
         }
-    }
+    };
+}
 
-    /// Parses the database or wire spelling.
-    #[must_use]
-    pub fn from_name(name: &str) -> Option<Self> {
-        Self::ALL.iter().copied().find(|tag| tag.as_str() == name)
-    }
+item_kind_tags! {
+    UserMessage => "user_message",
+    AssistantMessage => "assistant_message",
+    Reasoning => "reasoning",
+    ToolCall => "tool_call",
+    ToolResult => "tool_result",
+    Checkpoint => "checkpoint",
+    Compaction => "compaction",
+    ModeSwitch => "mode_switch",
+    BranchNote => "branch_note",
 }
 
 impl fmt::Display for ItemKindTag {
@@ -458,6 +461,34 @@ mod tests {
             assert_eq!(ItemKindTag::from_name(tag.as_str()), Some(tag));
             assert_eq!(tag.to_string(), tag.as_str());
         }
+    }
+
+    #[test]
+    fn every_tag_in_the_registry_roundtrips_through_its_spelling() {
+        // `ALL` is generated from the same list as `as_str`, so this covers every variant the
+        // enum has — including any added later, which the macro forces into that list.
+        let mut seen = Vec::new();
+        for tag in ItemKindTag::ALL {
+            let name = tag.as_str();
+            assert_eq!(
+                serde_json::to_value(tag).expect("serialize"),
+                Value::String(name.to_owned()),
+                "{name}: as_str() and the serde spelling drifted apart"
+            );
+            assert_eq!(
+                ItemKindTag::from_name(name),
+                Some(*tag),
+                "{name} did not parse back"
+            );
+            assert_eq!(tag.to_string(), name);
+            seen.push(name);
+        }
+
+        let mut unique = seen.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(seen.len(), unique.len(), "two tags share a spelling");
+        assert_eq!(ItemKindTag::from_name("nonsense"), None);
     }
 
     #[test]

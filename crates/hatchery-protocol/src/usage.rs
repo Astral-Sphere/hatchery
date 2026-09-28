@@ -76,15 +76,23 @@ pub enum StopReason {
     MaxRounds,
     /// The provider hit its output-token limit.
     MaxTokens,
+    /// The provider's safety filter cut the output short. The turn is over and retrying the same
+    /// prompt verbatim would hit the same filter, so the user is told rather than shown a
+    /// half-answer as if it were complete.
+    ContentFilter,
     /// The user interrupted.
     Interrupted,
 }
 
 impl StopReason {
-    /// True when the turn ended because a limit or the user cut it short, which the UI flags.
+    /// True when the turn ended because a limit, a filter or the user cut it short, which the UI
+    /// flags.
     #[must_use]
     pub const fn is_truncated(self) -> bool {
-        matches!(self, Self::MaxRounds | Self::MaxTokens | Self::Interrupted)
+        matches!(
+            self,
+            Self::MaxRounds | Self::MaxTokens | Self::ContentFilter | Self::Interrupted
+        )
     }
 
     /// The wire and database spelling (`snake_case`), which is what `turns.stop_reason` holds.
@@ -94,6 +102,7 @@ impl StopReason {
             Self::ModelDone => "model_done",
             Self::MaxRounds => "max_rounds",
             Self::MaxTokens => "max_tokens",
+            Self::ContentFilter => "content_filter",
             Self::Interrupted => "interrupted",
         }
     }
@@ -198,6 +207,16 @@ mod tests {
             serde_json::from_str::<StopReason>("\"model_done\"").expect("deserialize"),
             StopReason::ModelDone
         );
+        assert_eq!(
+            serde_json::to_string(&StopReason::ContentFilter).expect("serialize"),
+            "\"content_filter\""
+        );
+        assert_eq!(
+            serde_json::from_str::<StopReason>("\"content_filter\"").expect("deserialize"),
+            StopReason::ContentFilter,
+            "a filtered turn must survive the wire as filtered, not as model_done"
+        );
+        assert!(StopReason::ContentFilter.is_truncated());
     }
 
     #[test]
@@ -206,13 +225,21 @@ mod tests {
             (StopReason::ModelDone, "model_done"),
             (StopReason::MaxRounds, "max_rounds"),
             (StopReason::MaxTokens, "max_tokens"),
+            (StopReason::ContentFilter, "content_filter"),
             (StopReason::Interrupted, "interrupted"),
         ] {
             assert_eq!(reason.to_string(), spelling);
+            assert_eq!(reason.as_str(), spelling);
             assert_eq!(
                 serde_json::to_string(&reason).expect("serialize"),
                 format!("\"{spelling}\""),
                 "Display and the wire spelling must not drift"
+            );
+            assert_eq!(
+                serde_json::from_str::<StopReason>(&format!("\"{spelling}\""))
+                    .expect("deserialize"),
+                reason,
+                "the wire spelling must read back as the same variant"
             );
         }
     }

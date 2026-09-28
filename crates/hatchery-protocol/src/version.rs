@@ -17,18 +17,29 @@ pub const PROTOCOL_MAJOR: u32 = 1;
 /// path has something concrete to report and so a future major bump has to touch this constant.
 pub const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["1.0.0"];
 
-/// The major component of a `major.minor.patch` string.
+/// The major component of a `major.minor[.patch]` string.
+///
+/// A version must carry at least two dot-separated numeric segments: `"1.0"` and `"1.0.0"` parse,
+/// `"1"`, `"1."` and `"1.x"` do not. A bare major is refused rather than trusted, because
+/// [`is_compatible`] decides per major and `"1"` says nothing about which minor a peer speaks.
+/// Later segments are not inspected, so a pre-release spelling (`"1.0.0-rc1"`) still negotiates.
 ///
 /// Hand-rolled rather than via a semver crate: the only question asked of a version anywhere in
 /// the protocol is "same major?", and a dependency that parses ranges nobody uses would be
 /// weight without value (ADR-0009's anti-premature-abstracting brake).
 #[must_use]
 pub fn major_of(version: &str) -> Option<u32> {
-    let major = version.split('.').next()?;
-    if major.is_empty() {
+    let mut segments = version.split('.');
+    let major = segments.next()?;
+    let minor = segments.next()?;
+    if !is_numeric(major) || !is_numeric(minor) {
         return None;
     }
     major.parse().ok()
+}
+
+fn is_numeric(segment: &str) -> bool {
+    !segment.is_empty() && segment.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 /// True when a peer speaking `version` can talk to this build.
@@ -66,8 +77,30 @@ mod tests {
         assert_eq!(major_of(""), None);
         assert_eq!(major_of("latest"), None);
         assert_eq!(major_of(".1.0"), None);
+        assert_eq!(
+            major_of("1"),
+            None,
+            "a bare major says nothing about the minor"
+        );
+        assert_eq!(major_of("1."), None);
+        assert_eq!(major_of("1.x"), None);
         assert!(!is_compatible("latest"));
         assert!(!is_compatible(""));
+        for junk in ["1", "1.", "1.x"] {
+            assert!(!is_compatible(junk), "{junk} must not pass as compatible");
+        }
+    }
+
+    #[test]
+    fn a_major_and_a_minor_are_enough_to_negotiate() {
+        assert_eq!(major_of("1.0"), Some(1));
+        assert_eq!(major_of("1.0.0"), Some(1));
+        assert!(is_compatible("1.0"));
+        assert_eq!(
+            major_of("1.0.0-rc1"),
+            Some(1),
+            "a pre-release of a supported major still negotiates"
+        );
     }
 
     #[test]
