@@ -762,6 +762,7 @@ mod tests {
                 mode: SessionModeId::code(),
                 workspace: None,
                 model: ModelRef::new("deepseek", "deepseek-chat"),
+                config_patch: None,
                 created_at: Timestamp::UNIX_EPOCH,
                 updated_at: Timestamp::UNIX_EPOCH,
                 active_branch_head: None,

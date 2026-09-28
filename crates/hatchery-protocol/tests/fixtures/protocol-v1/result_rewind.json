@@ -6,6 +6,11 @@
   },
   "session": {
     "active_branch_head": "01890f47-0000-7000-8000-000000000003",
+    "config_patch": {
+      "ui": {
+        "show_reasoning": true
+      }
+    },
     "created_at": 1780000000000,
     "generation": 3,
     "id": "01890f47-0000-7000-8000-000000000001",

@@ -268,6 +268,7 @@ mod tests {
                     mode: SessionModeId::code(),
                     workspace: None,
                     model: ModelRef::new("deepseek", "deepseek-reasoner"),
+                    config_patch: None,
                     created_at: Timestamp::from_unix_millis(1),
                     updated_at: Timestamp::from_unix_millis(2),
                     active_branch_head: Some(item.id),

@@ -301,6 +301,14 @@ impl FromStr for ItemKindTag {
 #[error("unknown item kind {0:?}")]
 pub struct UnknownItemKind(String);
 
+impl UnknownItemKind {
+    /// The name that was not recognised, for a report or a log line.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.0
+    }
+}
+
 /// Payload of [`ItemKind::Reasoning`].
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ReasoningBlock {

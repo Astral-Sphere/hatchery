@@ -165,6 +165,11 @@ pub struct Session {
     pub workspace: Option<PathBuf>,
     /// Provider and model.
     pub model: ModelRef,
+    /// The session-level override document, merged over the layered configuration
+    /// (`docs/design/platform.md` §1). Stored verbatim: it is the user's own shape, and the daemon
+    /// is what gives it meaning.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_patch: Option<Value>,
     /// When the session was created.
     pub created_at: Timestamp,
     /// When the session last changed — `session/list` is ordered by this.
@@ -275,6 +280,7 @@ mod tests {
             mode: SessionModeId::code(),
             workspace: Some(PathBuf::from("/ws")),
             model: ModelRef::new("deepseek", "deepseek-reasoner"),
+            config_patch: None,
             created_at: Timestamp::from_unix_millis(10),
             updated_at: Timestamp::from_unix_millis(20),
             active_branch_head: None,

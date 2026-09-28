@@ -81,6 +81,7 @@ pub fn session() -> Session {
         mode: SessionModeId::code(),
         workspace: Some(PathBuf::from("/home/dev/project")),
         model: ModelRef::new("deepseek", "deepseek-reasoner"),
+        config_patch: Some(serde_json::json!({"ui": {"show_reasoning": true}})),
         created_at: TIMESTAMP,
         updated_at: TIMESTAMP,
         active_branch_head: Some(item_id_2()),

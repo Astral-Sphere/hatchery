@@ -1,5 +1,7 @@
 //! Token accounting and how a turn ended.
 
+use std::fmt;
+
 use serde::{Deserialize, Serialize};
 
 /// What a turn or a single provider round cost.
@@ -83,6 +85,23 @@ impl StopReason {
     #[must_use]
     pub const fn is_truncated(self) -> bool {
         matches!(self, Self::MaxRounds | Self::MaxTokens | Self::Interrupted)
+    }
+
+    /// The wire and database spelling (`snake_case`), which is what `turns.stop_reason` holds.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ModelDone => "model_done",
+            Self::MaxRounds => "max_rounds",
+            Self::MaxTokens => "max_tokens",
+            Self::Interrupted => "interrupted",
+        }
+    }
+}
+
+impl fmt::Display for StopReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
@@ -179,5 +198,22 @@ mod tests {
             serde_json::from_str::<StopReason>("\"model_done\"").expect("deserialize"),
             StopReason::ModelDone
         );
+    }
+
+    #[test]
+    fn the_display_form_is_what_the_database_stores() {
+        for (reason, spelling) in [
+            (StopReason::ModelDone, "model_done"),
+            (StopReason::MaxRounds, "max_rounds"),
+            (StopReason::MaxTokens, "max_tokens"),
+            (StopReason::Interrupted, "interrupted"),
+        ] {
+            assert_eq!(reason.to_string(), spelling);
+            assert_eq!(
+                serde_json::to_string(&reason).expect("serialize"),
+                format!("\"{spelling}\""),
+                "Display and the wire spelling must not drift"
+            );
+        }
     }
 }
