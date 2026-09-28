@@ -252,6 +252,16 @@ pub fn parse_json(text: &str) -> Result<Json, StoreError> {
     serde_json::from_str(text).map_err(StoreError::database)
 }
 
+/// Reads rows to the end.
+///
+/// Not cosmetic: a statement dropped with rows still pending rolls its transaction back (the
+/// engine says so on `Statement::query_row`), so a half-read query can make a *later* write fail
+/// for reasons that look nothing like the cause.
+pub async fn drain(mut rows: turso::Rows) -> Result<(), StoreError> {
+    while rows.next().await.map_err(StoreError::database)?.is_some() {}
+    Ok(())
+}
+
 /// Column access that reports the engine's own error.
 fn get(row: &turso::Row, index: usize) -> Result<Value, StoreError> {
     row.get_value(index).map_err(StoreError::database)

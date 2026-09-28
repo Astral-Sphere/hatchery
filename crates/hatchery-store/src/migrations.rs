@@ -8,6 +8,7 @@
 use turso::Connection;
 
 use crate::error::StoreError;
+use crate::sql;
 
 /// Every migration, in order.
 ///
@@ -38,7 +39,7 @@ pub async fn user_version(conn: &Connection) -> Result<u32, StoreError> {
             ));
         }
     };
-    drain(rows).await?;
+    sql::drain(rows).await?;
     u32::try_from(crate::sql::as_int(&value).unwrap_or_default()).map_err(|_| {
         StoreError::Database("PRAGMA user_version is not a non-negative integer".to_owned())
     })
@@ -60,7 +61,7 @@ pub async fn schema_version(conn: &Connection) -> Result<Option<u32>, StoreError
         }
         None => None,
     };
-    drain(rows).await?;
+    sql::drain(rows).await?;
     Ok(found)
 }
 
@@ -140,12 +141,6 @@ fn migration_error(version: u32, error: impl std::fmt::Display) -> StoreError {
         version,
         message: error.to_string(),
     }
-}
-
-/// Reads rows to the end, so a statement is finished before the connection is reused.
-async fn drain(mut rows: turso::Rows) -> Result<(), StoreError> {
-    while rows.next().await.map_err(StoreError::database)?.is_some() {}
-    Ok(())
 }
 
 #[cfg(test)]

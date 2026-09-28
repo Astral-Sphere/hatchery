@@ -15,7 +15,7 @@ An open source AI harness -- hatchery for your code!
 
 ## 当前状态
 
-**M0（地基）完成**：设计文档定稿（10 份方向设计 + 11 份 ADR + 14 份 worklog），workspace 脚手架、门禁与三平台 CI 就绪，三个技术 spike 实测收口（存储引擎、影子 Git、i18n），地基三个 crate 已实现并全绿——`hatchery-protocol`（wire 类型、20 个方法与事件、JSON-RPC 帧、版本协商）、`hatchery-kernel`（turn 状态机与四个接缝）、`hatchery-store`（schema 迁移、单写者 actor、分支操作、kill -9 崩溃恢复），共 219 项测试 + 7 个可运行 doctest。LLM provider 层、daemon 与前端尚未开工（M1）。里程碑与验收标准见 [docs/roadmap.md](docs/roadmap.md)。
+**M0（地基）完成**：设计文档定稿（10 份方向设计 + 12 份 ADR + 12 份 worklog），workspace 脚手架、门禁与三平台 CI 就绪，三个技术 spike 实测收口（存储引擎、影子 Git、i18n），地基三个 crate 已实现并全绿——`hatchery-protocol`（wire 类型、20 个方法与事件、JSON-RPC 帧、版本协商）、`hatchery-kernel`（turn 状态机与四个接缝）、`hatchery-store`（schema 迁移、单写者 actor、分支操作、kill -9 崩溃恢复），共 219 项测试 + 7 个可运行 doctest。LLM provider 层、daemon 与前端尚未开工（M1）。里程碑与验收标准见 [docs/roadmap.md](docs/roadmap.md)。
 
 ## 文档
 

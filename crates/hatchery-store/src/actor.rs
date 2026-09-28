@@ -372,7 +372,7 @@ impl Writer {
             Some(row) => Some(sql::read_session(&row, 0)?),
             None => None,
         };
-        drain(rows).await?;
+        sql::drain(rows).await?;
         found.ok_or(StoreError::SessionNotFound(session))
     }
 
@@ -595,7 +595,7 @@ impl Writer {
             Some(row) => Some(sql::read_item(&row, 0)?),
             None => None,
         };
-        drain(rows).await?;
+        sql::drain(rows).await?;
         let found = found.ok_or(StoreError::ItemNotFound(item))?;
         if found.session != session {
             return Err(StoreError::SessionMismatch { item, session });
@@ -883,7 +883,7 @@ impl Writer {
             }
             None => None,
         };
-        drain(rows).await?;
+        sql::drain(rows).await?;
         Ok(found)
     }
 
@@ -900,7 +900,7 @@ impl Writer {
                 return Err(StoreError::Database("count(*) returned no row".to_owned()));
             }
         };
-        drain(rows).await?;
+        sql::drain(rows).await?;
         as_int(&value).ok_or_else(|| StoreError::Database("count(*) is not an integer".to_owned()))
     }
 
@@ -908,15 +908,6 @@ impl Writer {
     fn tree_error(&self, error: tree::TreeError) -> StoreError {
         StoreError::Database(format!("item tree is corrupt: {error}"))
     }
-}
-
-/// Reads rows to the end.
-///
-/// Not cosmetic: a statement dropped with rows still pending rolls its transaction back, so a
-/// half-read query can make a later write fail for reasons that look nothing like the cause.
-async fn drain(mut rows: turso::Rows) -> Result<(), StoreError> {
-    while rows.next().await.map_err(StoreError::database)?.is_some() {}
-    Ok(())
 }
 
 /// Parses a `session/list` cursor: `updated_at_millis:id`.
