@@ -6,7 +6,7 @@
 
 ## 当前状态
 
-**M0b 完成（2026-09-28）**：schema v1 迁移、writer actor、`SessionStore` 全量实现（含分支操作与 JSONL 导出）、属性测试与 kill -9 崩溃恢复测试全部落地；64 个测试全绿（12 项引擎门槛 + 22 项 store 集成 + 1 项属性测试 + 6 项崩溃恢复 + 单元测试）。设计文档 `docs/design/storage.md` 已按实现重写。
+**M0b 完成（2026-09-28），评审后的两轮修复已入库（2026-09-29 / 2026-09-30）**：schema v1 迁移、writer actor、`SessionStore` 全量实现（含分支操作与 JSONL 导出）、属性测试与 kill -9 崩溃恢复测试全部落地；评审发现的契约缺口（错误分类、事务边界、导出原子性、迁移死支）与测试可信度问题已修完。设计文档 `docs/design/storage.md` 已按实现重写。
 
 ## 待办
 
@@ -19,6 +19,7 @@
 - [x] (M0b) ExportJsonl（从 M2 提前：逃生通道成本低、测试便宜）
 - [ ] (M1) 只读连接池与 spawn_blocking 读路径接线
 - [ ] (M2) checkpoints 表与 CheckpointStore 联动（级联删除时 GC；checkpoint 的级联已由引擎门槛测试锁定）
+- [ ] (M5) compaction 的 span 解析：`ItemIdRange` 是**位置**语义，要在树遍历里按链定位两端点（protocol 侧不提供 `contains`，理由见 worklog/protocol.md 2026-09-30 条）
 - [ ] (M5) 导入
 
 ## 实测记录（2026-09-28，turso 0.7.2，Linux x86_64）
@@ -78,6 +79,28 @@ API 怪癖（写 store 实现时一定会踩）：
 - 2026-09-28 选型关闭：候选优先级 turso > libsql(`features=["core"]`) > rusqlite(bundled)。turso 首轮门槛全过（唯一缺口 `WITH RECURSIVE` 有廉价绕法），故未评估后两者。**libsql 0.9.30 保留为第一顺位替代**——若 turso 出现阻塞性回归就切回，并把 ADR-0010 标 superseded。选 turso 的决定性理由之一是纯 Rust：CI 三平台（含 windows MSYS2 ucrt64 + `x86_64-pc-windows-gnu`）不必背 mingw。
 
 ## 变更日志
+
+### 2026-09-30 · 评审后的两轮修复（2026-09-29 与 2026-09-30）
+
+**「会话不存在」必须是 `SessionNotFound`，不能让外键代答。** append（单条与批量）、`start_turn`、`finish_turn` 原本都把这件事交给 `items.session_id`/`turns.session_id` 的外键：引擎的约束消息被裹成 `StoreError::Database`，而按 design/storage.md §1 的映射，「调用方指了一个不存在的会话」是 `SessionNotFound`（调用方错误），「引擎拒绝了一条合法写入」才是 `StoreError`（存储故障）——两者到前端是两个错误码。turso 0.7.2 的错误类型只有 `Constraint(String)`，**不区分是哪条约束**（外键、非空、`items_no_update` 触发器全走它），所以按错误变体分类不可靠；改成写前一次 `SELECT id FROM sessions` 显式确认（在正要写的路径上，一次主键查询的代价可忽略）。`finish_turn` 尤其要说清楚：删会话会 cascade 掉它的 `turns` 行，那条 `UPDATE ... WHERE id AND session_id` 于是什么都匹配不到，原本报 `UnknownTurn`——把「会话没了」说成「你从没起过这个 turn」。
+
+**一批 item 必须同属一个会话。** 本轮新发现的洞：`append_items` 的 head 推进只认**最后一个** item 的会话，混批会把另一个会话的 item 插进去却永不推进它的 head，那些 item 从任何 head 都走不到。`sessions.active_head` 的外键看不见这件事（它只证明 item 存在），与 M0b 已经补过的「跨会话父节点」是同一类洞。改动前先把新测试跑红确认过：混批原本返回 `Ok(())`。
+
+**`drain` 纪律要覆盖失败路径。** 行循环原本是 `while let Some(row) = rows.next().await? { out.push(read(&row)?) }`——解析失败就带着未读完的结果集提前返回，正是 `sql::drain` 要防的形状，而最容易踩它的就是「链中间有一条坏 payload」。`sql::collect` 现在无论成功失败都排空。**实测**：在 turso 0.7.2 上这个形状是良性的（上游那句「否则 drop 语句会回滚事务」的注释挂在 `Statement::query_row` 的实现上，这些查询不走那条路），但纪律在引擎升级时是承重的，失败形态是「此后每次写入都报错直到重启」，所以照修，并补一条 tripwire 测试把引擎契约本身钉住。
+
+**校验要在事务里面做。** `delete_branch` 的走树/级联交叉校验原本在 `commit` **之后**：不一致时报的是一个已经不复存在的数据库状态。两个计数现在都在事务内取，不一致就靠 drop 掉 `tx` 回滚。它的测试也才第一次有可能触发——唯一能让两种走法不一致的形状是跨会话三明治（背后用第二条连接插进去）；第一次构造时先撞上的是 `sessions.active_head` 的外键（引擎自己的防线比我们的交叉校验先响），把 head 停到待删子树外面才对。
+
+**原子性靠 `create_new`，不靠「先看再写」。** 导出的「绝不悄悄覆盖上一份」原本是 exists-then-write 的 TOCTOU，而写文件发生在 writer actor **之外**（`std::fs`），并发导出同一会话真能撞上。改 `OpenOptions::create_new`（O_EXCL）；写失败时删掉自己的半截文件，否则重试会被自己的残骸挡住。
+
+**`export_jsonl(all_branches)` 必须一次快照。** 原本 item 与 tip 是两条命令：并发写入的会话会得到两个快照，审计文件里的 branches 标注可能与它自己的 item 行自相矛盾。合成一条 `ExportBody`，顺带拒绝不存在的会话（原本会写一个空文件，然后拿正确 id 的重试被「不许覆盖」挡住）。
+
+**`shutdown` 既等回复也等任务结束。** 回复成功只证明 actor 处理了 Shutdown；writer 在回复之后 panic 或被 abort 原本是 `let _ = writer.await` 静默吞掉，调用方无从得知。
+
+**迁移不给「没有 schema」留成功路径。** `migrate` 原本有一条 `None if recorded == 0 => Ok(0)`：`schema_meta` 没有版本行且 `user_version` 是 0 就算开库成功。实际不可达（迁移表从 1 开始，走到这一步必然写过两个记录），但它的存在意味着「一个没有 schema 的库算打开成功」；删掉之后缺行一律报 `Migration`，并补了测试（背后删掉那一行 → 重开被拒）。
+
+**崩溃测试的超时必须真的能触发。** 30 s 的 ready 期限原本只在两次 `read_line` **之间**检查，而 `read_line` 是阻塞的：子进程在打印就绪行之前挂住，父进程会一直停在那里，直到 CI 作业超时。读线程化 + `recv_timeout` 之后，超时与 EOF 两条路都会杀掉子进程并报出它打印了什么、怎么退出的。同一处还有：`Child::kill()` 不再因为「子进程报完就绪就自己死了」而 panic——那是一次成功的实验，不该报成测试失败。
+
+**空 patch 不写库。** `SessionPatch::is_empty` 的文档写着「store 会跳过这次写」，实现却照样 bump `updated_at` 并重写整行：一次心跳 patch 会把这个会话重新顶到所有「最近优先」列表的最前面。
 
 ### 2026-09-28
 

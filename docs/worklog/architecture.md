@@ -6,7 +6,7 @@
 
 ## 当前状态
 
-**M0b 完成（2026-09-28）**：`hatchery-protocol`/`hatchery-kernel`/`hatchery-store` 三个 crate 实现落地并全绿（93 + 40 + 64 项测试，7 个可运行 doctest，219 项默认组），`hatchery-testkit` 交付 M0b 子集。本地 `./scripts/ci.sh` 全绿；三平台 CI 上一轮已跑通（M0a 收尾），M0b 的代码尚未 push。**M0 里程碑达成**（roadmap.md 的 M0 DoD：门禁三平台绿 + store 的 kill -9 崩溃恢复测试通过 + 三个 spike 结论落档）。
+**M0b 完成（2026-09-28），评审后的两轮修复已入库（2026-09-29 / 2026-09-30）**：`hatchery-protocol`/`hatchery-kernel`/`hatchery-store` 三个 crate 实现落地，`hatchery-testkit` 交付 M0b 子集；M0b 代码经一轮按 crate 分块的评审后，契约缺口、测试可信度问题与可修的实现缺陷都已修完（细节见下面 2026-09-30 那条变更日志与各 crate 的 worklog）。本地 `./scripts/ci.sh` 全绿；三平台 CI 上一轮已跑通（M0a 收尾），M0b 及其后的代码尚未 push。**M0 里程碑达成**（roadmap.md 的 M0 DoD：门禁三平台绿 + store 的 kill -9 崩溃恢复测试通过 + 三个 spike 结论落档）。
 
 仓库现状：`crates/`（11 crate，其中 3 个已实现）+ `xtask/` + `scripts/ci.sh` + `.github/workflows/{pr,nightly}.yml` + `docs/`。
 
@@ -22,7 +22,7 @@
 - [x] (M0) 三平台 CI 跑通（第 1 次失败于 windows 的 `rustup-init --component` 参数 arity，已在 5b953fb 修复并补 windows-gnu 的 ABI 断言；细节见 worklog/testing.md「实测记录 · CI 首跑」）
 - [x] (M0) 顶层 README 扩写：项目定位、快速开始、文档链接、MSYS2 ucrt64 环境清单、仓库布局；docs/README.md 加「代码布局」节
 - [x] (M0b) 分层修正：protocol 沉为唯一最底层，kernel 升 L1（见下「M0b 修正」）
-- [x] (M0b) protocol/kernel/store 三个 crate 实现 + testkit M0b 子集 + 219 项测试
+- [x] (M0b) protocol/kernel/store 三个 crate 实现 + testkit M0b 子集 + 各自的测试套件
 - [ ] (M1) 建立 docs/glossary.md 术语表
 - [ ] (M1) MSRV CI job（`cargo +1.90.0 check`）加进 nightly，防止依赖升级悄悄抬高 MSRV
 - [ ] (M1) `hatchery-tests` 成员 crate（跨 crate e2e 与不变量套件的家；虚拟 manifest 不能有顶层 `tests/`，见 design/testing.md §1）
@@ -34,6 +34,23 @@
 3. ~~references/ 目录的 license 与体积~~ → **已由用户自行解决**：`.gitignore` 里的 `/references` 使其不入库，只保留 `references.md` 的分析结论。
 
 ## 变更日志
+
+### 2026-09-30 · M0b 评审后的两轮修复
+
+M0b 的三个 crate 按范围分块评审了一遍（protocol 源码 / protocol 测试 / kernel 源码 / kernel 测试与 testkit / store 源码 / store 测试 / 跨 crate 一致性），约 50 条发现逐条对着代码复核后分成四组：① 协议健壮性，② 行为与契约缺陷，③ 测试可信度，④ 打磨与前瞻。用户裁决「②③ 全修，④ 留到 M1」（2026-09-29 落地），随后又裁决「④ 里能修的都修掉」（2026-09-30 落地，本条）。crate 内的细节在各自的 worklog，这里只记跨方向的部分。
+
+**四个跨 crate 的决策**
+
+1. **接缝枚举不加 `#[non_exhaustive]`**（`KernelEvent`/`AgentCommand`/`StreamEvent`/`TurnCompletion`/`TurnState`）。消费方全部在本 workspace 内，穷尽匹配正是「加一个变体时编译器替你找齐所有消费方」的机制；加上它只会逼出 `_ =>`，把新变体藏起来。wire 层的开放性由 protocol 承担，而且规则更强：枚举值在 major 内冻结、未知值一律硬失败（design/protocol.md §6）。反方理由是「第三方前端会 match 我们的类型」，但按同一条冻结规则，加变体本身就是 major bump，`#[non_exhaustive]` 换不来在 minor 里加变体的自由。
+2. **LLM 接缝改借用**：`chat_stream(&ChatOptions, &[Message])`（原为按值）。adapter 在发起请求时就地把两者序列化进 body，返回的流仍是 `'static`，所以按值传只是让长会话每轮多拷一份全量上下文。**在 M1 写 adapter 之前定案比之后改便宜**——这是本轮唯一一处主动改动公开签名。
+3. **显式 `"id": null` 一律拒绝**（`FrameError::NullId`），与「字段缺失 = 通知」严格区分（worklog/protocol.md）。
+4. **`ItemIdRange` 不提供成员判定**：span 是位置语义，只有持有链的一方能解析（worklog/protocol.md）。解析函数留到 M5 与它的第一个消费者一起落地，避免又造一个没有调用方的 API。
+
+**分层契约**：`cargo xtask layering` 现在检查全部三种依赖（normal / build / dev）。构建图 = normal + build，要求无环且严格向下；dev 边也必须向下，只有指向 Dev 层 crate 的例外（kernel 的 dev-dependency 指向 testkit，而 testkit 正常依赖 kernel，这条边不参与环检测）。
+
+**文档计数纪律（用户裁决）**：README、roadmap 与设计文档不再写测试数与 fixture 数——这轮修复本身就是证据：同一个 M0b 在四处写着 219 / 198 / 197 三个互不相同的数。数字只留在 worklog 的日期化条目里；覆盖率改由测试自己机器检查（protocol 的 fixture 覆盖率有三条测试兜着，见 design/protocol.md §6）。
+
+**门禁（本轮实测）**：`cargo nextest list --workspace` 默认组共 258 项、全绿——protocol 109、kernel 46、store 73、testkit 5、capabilities 11、xtask 13、cli 1；另有 1 项 `#[ignore]`（崩溃测试重入的子进程入口），invariants 组 4 项，doctest 7 个。`./scripts/ci.sh` 全绿，`cargo xtask layering` 报 12 members、22 build edges + 8 dev edges，严格向下无环。三平台 CI 仍未看到 M0b 之后的代码（push 由用户执行）。
 
 ### 2026-09-28 · M0b（分层修正 + 三个 crate 落地）
 

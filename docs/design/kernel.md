@@ -82,8 +82,8 @@ pub enum TurnState {
 pub trait LlmProvider: Send + Sync {
     async fn chat_stream(
         &self,
-        options: ChatOptions,
-        messages: Vec<Message>,
+        options: &ChatOptions,            // 借用：adapter 在发起请求时就地把两者序列化进 body，
+        messages: &[Message],             // 返回的流仍是 'static。按值传会让长会话每一轮多拷一份全量上下文
         cancel: CancellationToken,        // 中断要能真正掐掉 HTTP 请求，而不只是 drop 流
     ) -> Result<BoxStream<'static, StreamEvent>, LlmError>;
 }
@@ -110,8 +110,9 @@ pub enum StreamEvent {             // 变体用命名字段而非 newtype：
 ```
 
 - `Message` 是 kernel 自有类型（`role` + `Content` + `reasoning: Option<ReasoningBlock>` + `tool_calls` + `tool_call_id` + `is_error`），与 openai-interface 类型的转换只存在于 hatchery-llm（ADR-0007）。
-- `FinishReason`（provider 给的）与 `StopReason`（turn 级、落库的）是两个概念：`Length → MaxTokens`，其余 → `ModelDone`。
+- `FinishReason`（provider 给的）与 `StopReason`（turn 级、落库的）是两个概念：`Length → MaxTokens`、`ContentFilter → ContentFilter`（被策略截断不是干净结束，用户必须能分辨），其余 → `ModelDone`。
 - 流在没有 `Done` 的情况下结束（半途断开）→ `LlmError::retryable`，turn 失败但已收到的部分照常提交。provider 自己报的 `StreamEvent::Error` 同理。
+- **`ReasoningDone` 必须早于紧随其后的首个 `TextDelta`**——这是 adapter 的义务，kernel 补不了：它一次只开一个 item，text delta 会关闭并提交 reasoning item，而 item 是 append-only，晚到的签名再也贴不上去。turn 内部照常带签名重放（下一轮请求用的是内存里这一轮的签名），但**从库里重建**出来的 reasoning 是无签名的，kernel 记一条 warning。代价由 `a_signature_that_arrives_after_the_text_cannot_be_stored_but_still_replays` 钉住；各家 provider 的真实事件顺序等 M1 的 adapter 落地后实测（若确实有晚到的，再决定值不值得缓冲一个事件）。
 
 ## 5. 工具调用接缝
 
@@ -139,7 +140,7 @@ pub struct ToolInvocation { pub output: ToolOutput, pub is_error: bool }
 
 1. **`summarize`**：`edit src/main.rs (+12 -3)` 需要知道工具语义，kernel 不该去解析工具参数。
 2. **`ToolInvocation`**：工具「跑失败了」和「根本没跑成」是两件事——前者要以 `is_error` 告诉模型，后者才是 `KernelError`。
-3. **进度走通道而不是 `Arc<dyn Fn>`**：kernel 必须在 await 工具的同时异步转发进度，同步回调做不到；同一个 select 循环也正是「中断能取消工具」的实现方式。
+3. **进度走通道而不是 `Arc<dyn Fn>`**：kernel 必须在 await 工具的同时异步转发进度，同步回调做不到；同一个 select 循环也正是「中断能取消工具」的实现方式。工具**返回的那一刻**还排在通道里的进度要先排空再收尾：biased select 先 poll 进度通道、再 poll invoke，所以「一次 poll 内发进度并返回」的工具，它最后那条进度会留在通道里被丢掉（`progress_sent_as_the_tool_finishes_still_reaches_the_sink` 钉住；带 gate 的测试看不见这个窗口）。中断路径不排空——那次调用正要被记成 `Cancelled`，事后再冒出来的进度会描述一件记录上说没做完的事。
 4. **Turn Tool Snapshot**：turn 开始时冻结 `snapshot()`，整轮（包括多轮往返）都用同一份 `tool_defs`；注册表的 `replace()` 是整表原子替换（ADR-0009 纪律 3），进行中的 turn 不受影响。
 
 工具并行：同一 round 的多个 tool call 目前**串行**执行（输出顺序确定性利于回放）；`parallel_safe` 只读工具的并行是 M2+ 优化。

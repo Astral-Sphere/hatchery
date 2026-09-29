@@ -12,6 +12,8 @@
 
 帧的编解码在 `rpc.rs`：`encode_frame`（带换行符）与 `decode_frame` / `classify`（请求 / 通知 / 响应三类判别，`jsonrpc` 字段类型化，写错版本会被拒），外加 `FrameDecoder`——增量解码器，按**行**而不是按 chunk 解码，所以被两个 chunk 劈开的 UTF-8 字符不是错误；未结束的帧超过 4 MiB 报 `TooLong` 而不是无限缓冲。
 
+**显式 `"id": null` 一律拒绝**（`FrameError::NullId`），且与「字段缺失」严格区分：缺失的 id 是通知（规范里唯一表示「不用回复」的写法），而带 method 的 null id 是**一个本该有回复的请求**，当成通知收下会让调用方永远等下去——漏写 `skip_serializing_if` 的 `Option<Id>` 序列化出来正好是这种帧，所以它是要报告的客户端 bug，不是要吸收的噪声。规范允许的那种「无法识别的请求」的 null-id 错误响应，由 M3 的 ACP bridge 归一化（我们的 id 全部在写请求之前就铸好，null id 对我们不可能是「丢失的回复」）。
+
 ## 2. 数据模型
 
 ```rust
@@ -89,7 +91,7 @@ pub enum StopReason { ModelDone, MaxRounds, MaxTokens, Interrupted }
 - `ToolOutput` 是**结构体而不是枚举**：capabilities.md §3 的 `{ text, artifacts?, spilled? }` 与 kernel.md §5 的 `Spilled` 变体两说之间，真实形状是「溢出后仍有预览文本」，可选字段对演进也更友好。
 - `ApprovalOption` **一个枚举兼作请求选项与答复**：答复必然是被提供的选项之一，两个镜像枚举只会制造漂移（capabilities.md 草图里的 `ApprovalOutcome` 即此）。
 - `Usage` 的 token 字段是 `Option`：「未知」与「零」是两件事，前端展示不同。
-- `ItemIdRange { first, last }`（**两端含**）替代草图中的 `std::ops::Range<ItemId>`——后者不实现 `Serialize`，且半开区间的端点语义在两端都是真实行时容易写错。
+- `ItemIdRange { first, last }`（**两端含**）替代草图中的 `std::ops::Range<ItemId>`——后者不实现 `Serialize`，且半开区间的端点语义在两端都是真实行时容易写错。span 是**位置**语义而不是序数语义：它的成员是「沿这条链落在两端点之间」的 item，只有持有链的一方能解析（M5 的 compaction 在 store 的树遍历里做）。用 id 比大小看着等价其实不是——UUIDv7 的序跟创建**时间**走，进程在时钟回拨后重启会铸出比父节点更小的 id，而 compaction 判错一次就是静默的历史损坏（该摘要的 item 被当成没摘要的继续重放，或反过来）。所以类型上不提供 `contains`。
 
 **`Content` 与 `Message` 的分工**：`Content` 是 wire 与存储的形态；kernel 另有自己的 `Message`（含 role/reasoning/tool_calls），由 daemon 侧的装配器从 item 链构造（kernel.md §6）。
 
@@ -180,9 +182,9 @@ pub enum ErrorCode {                   // 数值一旦发布不可变（golden �
 
 - `PROTOCOL_VERSION = "1.0.0"`，`PROTOCOL_MAJOR = 1`；**兼容判定只看 major**（`is_compatible`），无法解析的版本一律拒绝而不是猜。
 - `daemon/hello` 协商版本；`SUPPORTED_PROTOCOL_VERSIONS` 是区间下界与拒绝路径的凭据。
-- 方法/字段只增不改语义；wire 类型**不用** `deny_unknown_fields`（旧客户端必须忽略未知字段）；可选字段一律 `skip_serializing_if`，不写 `null`（`SessionPatch::title` 的 `Some(None)` 是唯一例外：它意味着「清空标题」）。**枚举值在 major 内冻结**：新增 `ItemKind`、事件 `type` 或状态拼写属于 major bump——未知枚举值一律硬失败（`an_unknown_enum_value_is_refused_rather_than_defaulted` 钉死），不静默降级；未知字段则必须被忽略。数字错误码是唯一的开放集（`ErrorObject.code: i64`），因为规范要求原样传递。
-- golden fixture 在 `tests/fixtures/protocol-v<N>/`（N = major），共 79 个：每个 `ItemKind`（含无父项的根形态）、每个事件、每个方法的参数**与结果**、空会话形态、四个帧形态、以及方法表与错误码表。生成方式 `UPDATE_FIXTURES=1 cargo nextest run -p hatchery-protocol`；`scripts/ci.sh` 导出的 `INSTA_UPDATE=no` 会让它在门禁里拒绝重写自己的契约。
-- **不用 insta**：insta 的快照名由断言表达式推导且要求字面量，数据驱动的 fixture 注册表无法驱动它（除非手写 79 条断言去重复注册表）。纯 JSON 另有好处：版本兼容 fixture 任何实现都能读，不只 Rust。代价是 key 按字母序（Value 是 BTreeMap）——确定性不受影响，声明序由 `typed_serialization_keeps_declaration_order` 单独锁定。
+- 方法/字段只增不改语义；wire 类型**不用** `deny_unknown_fields`（旧客户端必须忽略未知字段）；可选字段一律 `skip_serializing_if`，不写 `null`（`SessionPatch::title` 的 `Some(None)` 是唯一例外：它意味着「清空标题」）。这条纪律是对称的：自己不发 `null`，收到别人发的 `"id": null` 也就必须拒绝而不是猜（§1）。**枚举值在 major 内冻结**：新增 `ItemKind`、事件 `type` 或状态拼写属于 major bump——未知枚举值一律硬失败（`an_unknown_enum_value_is_refused_rather_than_defaulted` 钉死），不静默降级；未知字段则必须被忽略。数字错误码是唯一的开放集（`ErrorObject.code: i64`），因为规范要求原样传递。
+- golden fixture 在 `tests/fixtures/protocol-v<N>/`（N = major），一个都不少地覆盖：每个 `ItemKind`（含无父项的根形态）、每个事件、每个方法的参数**与结果**、空会话形态、四个帧形态、以及方法表与错误码表——覆盖率由 `the_fixture_set_covers_every_event_and_item_kind`、`every_method_has_a_result_fixture_checked_by_its_type` 与 `no_golden_file_is_orphaned` 三条测试机器检查，不靠文档里的数字。生成方式 `UPDATE_FIXTURES=1 cargo nextest run -p hatchery-protocol`；`scripts/ci.sh` 导出的 `INSTA_UPDATE=no` 会让它在门禁里拒绝重写自己的契约。
+- **不用 insta**：insta 的快照名由断言表达式推导且要求字面量，数据驱动的 fixture 注册表无法驱动它（除非手写等量的断言去重复注册表）。纯 JSON 另有好处：版本兼容 fixture 任何实现都能读，不只 Rust。代价是 key 按字母序（Value 是 BTreeMap）——确定性不受影响，声明序由 `typed_serialization_keeps_declaration_order` 单独锁定。
 - 版本兼容测试读**磁盘上的** fixture 反序列化，不与内存样本比对（后者是 golden 测试的职责），所以「改了 wire 形态」与「fixture 过期」是两种不同的失败。
 
 ## M0b 修正（相对初稿草图）

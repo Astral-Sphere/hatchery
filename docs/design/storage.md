@@ -51,7 +51,8 @@ pub type Reply<T> = oneshot::Sender<Result<T, StoreError>>;
 ```
 
 - 单 tokio task 持有唯一写连接，串行消费；channel 有界（`COMMAND_CAPACITY = 1024`），写满时提交方 await——**背压就是通道填满**，不靠无限排队。
-- 调用方等在 reply slot 上：`ask(|reply| StoreCmd::X { .., reply })`；actor 任务消失 → `WriterGone`。
+- 调用方等在 reply slot 上：`ask(|reply| StoreCmd::X { .., reply })`；actor 任务消失 → `WriterGone`。`shutdown` 既等这个回复、也等 writer 任务真正结束：任务在回复之后 panic 或被 abort 会报 `Database`，不静默吞掉。
+- **写入前先认会话**：`append_items`/`start_turn`/`finish_turn` 都先确认会话存在，报 `SessionNotFound`，而不是让外键拒绝后把引擎的消息裹成 `Database`——按 §1 的映射，前者是调用方错误、后者是存储故障，到前端是两个不同的错误码。一批 item 还必须**同属一个会话**：head 推进只认最后一个 item 的会话，混批会让另一个会话的 item 永远够不着（`sessions.active_head` 的外键只证明 item 存在，证不了同会话——与 `insert_item` 已有的跨会话父节点校验是同一类洞）。
 - 流式 delta **不进** writer actor（内存聚合，item 完成才落库）；崩溃最多丢当前 item。
 - **事务边界**：单条 append 也让「插 item + 推进 active_head + 更新 updated_at」同事务（不是为速度，是为正确性——插入失败时 head 绝不能动）；`append_items` 整批一个事务。实测反直觉的结论是「单事务批量 500 insert 比逐条自动提交更慢」，所以不做无谓的合并。
 - 读命令 M0b 也走同一个 actor（**M1 才接只读连接池**，见 worklog 待办）；`export_jsonl` 的渲染走 actor、写文件在 store 侧（`std::fs`：tokio 的 feature 集没有 `fs`，而导出是偶发的小文件写，不值得为此加 feature）。
@@ -76,12 +77,12 @@ pub fn tips_map(skeleton) -> Result<HashMap<ItemId, Vec<ItemId>>, TreeError>;  /
 - **编辑**：`edit_fork(session, X, C')` → 新 item N（`parent = X.parent`、`turn` 同 X、**kind 同 X**、内容换成 C'），`active_head = N`；X 及其旧子树保留。只能编辑带内容的 kind（`UserMessage`/`AssistantMessage`），其余返回 `NotEditable`——编辑的载体是 `Content`。
 - **切换**：`active_head` 指向任意 item；rebuild 自动生效。分支 = active_head 所在的根到节点链，没有显式 branch 实体。
 - **删除**：内存 BFS 收子树（只删后代，共享祖先不动）→ 校验 `active_head` 不在子树内（否则 `ActiveHeadInside`）→ 删子树根，靠 `ON DELETE CASCADE` 完成 → **交叉校验**：删除前后的 item 行数差必须等于 BFS 收到的数量，不等就报错（引擎的 `execute` 只回报直接删除的行数，计数必须来自我们自己的走树；两者不一致说明有一边错了，不能把错的数字报给调用方）。实测兜底：即使应用层漏了校验，`sessions.active_head` 的外键也会拒绝删除。
-- **跨会话父节点**：schema 的 `parent_id` 外键只能证明父节点**存在**，不能证明它属于同一会话；`insert_item` 额外校验，否则会造出一棵谁都不走的树。
+- **跨会话父节点**：schema 的 `parent_id` 外键只能证明父节点**存在**，不能证明它属于同一会话；`insert_item` 额外校验，否则会造出一棵谁都不走的树。同一类校验覆盖 `switch_branch`/`delete_branch` 的 head 参数（`SessionMismatch`）与整批 append（§3）。
 - **命名分支**（可选，M4）：`branch_note` item 给用户标注分支用途。
 
 ## 6. 迁移
 
-`PRAGMA user_version`（实测跨重开保留）+ `schema_meta.schema_version` **双记录**，两者不一致即报 `Migration` 错——说明有东西绕过了迁移。每个迁移一个事务（半套 schema 比没有更糟：重试会撞上第一次已建的表）；`PRAGMA user_version = N` 的值是本进程算出的 u32，不是用户输入，所以格式化进语句是安全的（pragma 不接受绑定参数）。数据库来自更新版本的 hatchery（`user_version > latest`）时**拒绝启动**，而不是按旧 schema 去读。
+`PRAGMA user_version`（实测跨重开保留）+ `schema_meta.schema_version` **双记录**，两者不一致即报 `Migration` 错——说明有东西绕过了迁移。`schema_meta` 少了那一行同样拒绝启动，**不为 `user_version = 0` 开口子**：迁移表从版本 1 开始（`the_migration_list_is_ordered_and_starts_at_one` 钉死），能走到这一步的库必然已经写过两个记录，缺一个就说明有人动过它，而「没有 schema 也算开库成功」是最糟的那种成功。每个迁移一个事务（半套 schema 比没有更糟：重试会撞上第一次已建的表）；`PRAGMA user_version = N` 的值是本进程算出的 u32，不是用户输入，所以格式化进语句是安全的（pragma 不接受绑定参数）。数据库来自更新版本的 hatchery（`user_version > latest`）时**拒绝启动**，而不是按旧 schema 去读。
 
 ## 7. JSONL 导出格式
 
@@ -95,7 +96,7 @@ pub fn tips_map(skeleton) -> Result<HashMap<ItemId, Vec<ItemId>>, TreeError>;  /
 ## 8. 测试
 
 - **引擎门槛测试**（M0a）：`tests/spike_engine.rs` 12 项，锁定 turso 的真实行为（触发器、外键级联、WAL 并发读、`user_version`、`WITH RECURSIVE` 缺失、写入延迟）。两个 `SPIKE_*` 常量是 tripwire：上游补上递归 CTE 或 `synchronous` 行为变化时测试主动失败。
-- **`tests/session_store.rs`**（22 项）：会话 CRUD 与分页、append 与 head 推进、批量原子性、跨会话父节点拒绝、300 条链的重建顺序、编辑分叉与旧分支保留、切换、级联删除与拒绝、姐妹分支不受影响、branch_tree 的 active 标记、turn 起止、导出（active / 全树 / 拒绝覆盖）、迁移与重开、损坏 payload 报告。其中两个走「store 背后」用第二条连接：
+- **`tests/session_store.rs`**：会话 CRUD 与分页、append 与 head 推进、批量原子性、跨会话父节点与跨会话批次拒绝、写进不存在的会话（单条 / 批量 / turn 起止）报 `SessionNotFound`、300 条链的重建顺序、编辑分叉与旧分支保留、切换、切换与删除拒绝别的会话的 item、级联删除与拒绝、姐妹分支不受影响、branch_tree 的 active 标记、turn 起止、导出（active / 全树及其逐行顺序 / 空会话 / 拒绝覆盖）、迁移与重开（含更新的 build 与 `schema_meta` 缺行两种拒绝）、损坏 payload 报告。其中两个走「store 背后」用第二条连接：
   - `invariant_items_are_never_rewritten`：编辑后原 item 逐字段不变；
   - `invariant_the_database_refuses_to_update_an_item`：直接 `UPDATE items` 被触发器拒绝，错误里带着我们的消息；
   - `a_corrupt_payload_is_reported_with_its_item`：手写一条不匹配的行，读回时报 `CorruptItem` 且带 item id。

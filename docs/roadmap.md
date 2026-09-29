@@ -1,18 +1,18 @@
 # 路线图（M0–M5）
 
-> 每个里程碑的完成定义（DoD）都包含：`cargo test`/`clippy` 全绿 + 列出的端到端验证 + worklog 更新。测试分层、CI 门禁与「不变量 → 测试」映射见 [design/testing.md](design/testing.md)；各里程碑的测试交付物已列入其范围与 [worklog/testing.md](worklog/testing.md)。当前进度：**M0 完成**（脚手架 + 门禁 + 三平台 CI 跑通 + 三个 spike + protocol/kernel/store 实现，219 项测试），M1（最小对话闭环）未开工。
+> 每个里程碑的完成定义（DoD）都包含：`cargo test`/`clippy` 全绿 + 列出的端到端验证 + worklog 更新。测试分层、CI 门禁与「不变量 → 测试」映射见 [design/testing.md](design/testing.md)；各里程碑的测试交付物已列入其范围与 [worklog/testing.md](worklog/testing.md)。当前进度：**M0 完成**（脚手架 + 门禁 + 三平台 CI 跑通 + 三个 spike + protocol/kernel/store 实现，`./scripts/ci.sh` 本地全绿），M1（最小对话闭环）未开工。
 
 ## M0 — 地基（scaffold + 核心类型）
 
 **范围**
 - Cargo workspace 脚手架：12 个 workspace member（11 个 crate = 10 个产品 crate + dev-only 的 `hatchery-testkit`，外加 `xtask`；见 architecture.md §3）+ CI PR 门禁全套（testing.md §8）+ nextest 分组。
-- `hatchery-protocol`：Session/Turn/Item/事件/方法的完整类型定义 + JSON fixture 测试。**已完成**：9 种 ItemKind、13 种会话事件 + 1 种 daemon 事件、20 个方法与其参数/结果类型、JSON-RPC 帧（含增量解码器）、14 个错误码、版本协商；93 个测试 + 4 个 doctest + 62 个 golden fixture。
-- `hatchery-kernel`：Turn 状态机 + trait 定义 + fake provider 单测。**已完成**：四个接缝、显式状态机（每次迁移发事件）、审批 id 往返、中断矩阵；40 个测试 + 2 个 doctest。
-- `hatchery-store`：schema v1 + writer actor + rebuild_chain + 分支操作（分叉/切换/级联删）+ 属性测试。**已完成**：迁移框架、单写者 actor、纯树遍历、JSONL 导出、属性测试对拍独立参考模型、kill -9 崩溃恢复；64 个测试。
+- `hatchery-protocol`：Session/Turn/Item/事件/方法的完整类型定义 + JSON fixture 测试。**已完成**：9 种 ItemKind、13 种会话事件 + 1 种 daemon 事件、20 个方法与其参数/结果类型、JSON-RPC 帧（含增量解码器）、14 个错误码、版本协商；golden fixture 覆盖每个 ItemKind、每个事件、每个方法的参数与结果（覆盖率由测试机器检查）。
+- `hatchery-kernel`：Turn 状态机 + trait 定义 + fake provider 单测。**已完成**：四个接缝、显式状态机（每次迁移发事件）、审批 id 往返、中断矩阵；每条路径由 `tests/turn_state_machine.rs` 的集成测试钉住（清单见 design/testing.md §3.2）。
+- `hatchery-store`：schema v1 + writer actor + rebuild_chain + 分支操作（分叉/切换/级联删）+ 属性测试。**已完成**：迁移框架、单写者 actor、纯树遍历、JSONL 导出、属性测试对拍独立参考模型、kill -9 崩溃恢复。
 - spike（各半天，结论写进对应 worklog）：**三个全部完成**——存储引擎 → turso 0.7.2（ADR-0010，12 项门槛测试常驻）；影子 Git 后端 → git2 vendored（ADR-0012，11 项门槛测试常驻）；i18n → fluent（ADR-0011）。
 - 本文档体系随代码入库。
 
-**DoD**：`./scripts/ci.sh` 三平台全绿；store 的 kill -9 崩溃恢复测试通过；三个 spike 结论落档。 → **本地全绿**（219 项测试 + 7 个 doctest），kill -9 测试 6 项通过（五种 StoreCmd + 恢复后仍可用），spike 结论在 ADR-0010/0011/0012。三平台 CI 待 M0b 代码 push 后确认。
+**DoD**：`./scripts/ci.sh` 三平台全绿；store 的 kill -9 崩溃恢复测试通过；三个 spike 结论落档。 → **本地全绿**（`./scripts/ci.sh` 每一步：fmt / clippy / build / nextest 默认组与 invariants 组 / doctest / fixture 确定性 / i18n），kill -9 测试覆盖五种 StoreCmd + 恢复后仍可用，spike 结论在 ADR-0010/0011/0012。三平台 CI 待 M0b 代码 push 后确认。
 
 ## M1 — 最小对话闭环（Chat 模式端到端）
 

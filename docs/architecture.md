@@ -99,7 +99,7 @@ dev hatchery-testkit       测试基建：fake 后端 / ScriptedProvider / TestD
 前端 ──session/prompt──▶ daemon
   daemon 校验租约/代际 ──▶ kernel.submit(TurnInput)
   kernel: 组装上下文（prompt sections + active 分支历史重建）
-        ──▶ LlmProvider.chat_stream(ChatOptions)
+        ──▶ LlmProvider.chat_stream(&ChatOptions, &[Message])   // 借用：长会话不必每轮重拷一份上下文
         ◀── StreamEvent::{TextDelta, ReasoningDelta, ToolCall, Done…}
   每个事件:
     ├─▶ store writer actor（item 边界落库；delta 内存聚合）

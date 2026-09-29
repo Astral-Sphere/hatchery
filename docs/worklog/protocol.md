@@ -6,7 +6,7 @@
 
 ## 当前状态
 
-**M0b 完成（2026-09-28）**：crate 的类型、方法表、事件、帧编解码与版本协商全部落地，93 个测试 + 4 个可运行 doctest 全绿，62 个 golden fixture 入库（`tests/fixtures/protocol-v1/`）。设计文档 `docs/design/protocol.md` 已按实现重写，含一张「草图 vs 实际」的修正表。
+**M0b 完成（2026-09-28），评审后的两轮加固已入库（2026-09-29 / 2026-09-30）**：crate 的类型、方法表、事件、帧编解码与版本协商全部落地；golden fixture 在 `tests/fixtures/protocol-v1/`，覆盖率由测试自己机器检查（不靠文档里的数字）。设计文档 `docs/design/protocol.md` 已按实现重写，含一张「草图 vs 实际」的修正表。
 
 ## 待办
 
@@ -27,6 +27,22 @@
 - 2026-09-28 ItemId → UUIDv7（用户裁决）。ULID 被否：26 字符可读性的收益不足以抵消「项目里出现第二种 id 格式」的成本；UUIDv7 同样时间有序，且 SQL/JSON/日志工具链天然认。
 
 ## 变更日志
+
+### 2026-09-30 · 评审后的两轮加固（2026-09-29 与 2026-09-30）
+
+**读回来的形态要和写出去的形态分开验证。** `SessionPatch { title: Some(None) }`（「清空标题」的记号）写出去是 `"title":null`，读回来却成了外层 `None`（「别动」）——serde 不处理嵌套 Option，双 Option 存在的意义正好被吃掉。自定义 visitor 之后三态分明：缺失 = `None`、`null` = `Some(None)`、有值 = `Some(Some(_))`；写出去的形态没变，所以没有一个 golden 动过。同一套写法现在也用在帧的 `id` 上。
+
+**显式 `"id": null` 一律拒绝（`FrameError::NullId`）。** `Probe.id` 原本是 `Option<Id>` + `#[serde(default)]`，于是 `null` 与「字段缺失」塌成同一个值：`{"id":null,"method":"session/prompt"}` 被分类成通知——一个本该有回复的请求被静默降级，调用方永远等下去。漏写 `skip_serializing_if` 的 `Option<Id>` 序列化出来正好是这种帧，所以它是要报告的客户端 bug，不是要吸收的噪声。`classify` 的文档早就这么写了，这轮是让代码追上文档；规范允许的那种 null-id 错误响应由 M3 的 ACP bridge 归一化。
+
+**`FrameDecoder` 的三处修正（2026-09-29）**：坏行必须在报错**之前**排空，否则此后每次 push 都在同一批字节上失败；`MAX_FRAME_BYTES` 要在线循环**内部**检查，否则带终止符的超长帧能整帧通过；扫描要记住水位（`scanned`）——原本每次 push 都从字节 0 重扫，实测 2 MiB 帧按 32 字节分块喂要 157 s，加水位后 0.02 s。
+
+**方法结果与枚举覆盖改成机器强制（2026-09-29）。** 20 个方法里只有 5 个的结果有 fixture，而所谓「typed 校验」接受任意 JSON 对象；现在每个方法都有 fixture + 会拒绝 `{}` 的校验器。枚举 → 注册表的覆盖由宏从同一份来源生成名字表与变体表，编译器兜底。未知枚举值是硬失败、未知字段必须忽略，两条都写进设计文档 §6 并各有测试。
+
+**fixture 生成要能并发跑。** nextest 并行跑多个测试二进制，而 `version_compat` 从磁盘读 golden、`golden_fixtures` 往磁盘写：非原子的重写会让读者看到半截文件，报一个从没发生过的兼容性破坏。改成 tempfile + rename，读者在 `UPDATE_FIXTURES=1` 期间跳过。
+
+**UUIDv7 的 id 在同一进程内严格递增（实测，uuid 1.26.1）。** `Uuid::now_v7()` 走进程级共享的 `ContextV7`：同毫秒内计数器递增而不是重新随机，计数器溢出就把时间戳往前推一毫秒。`ids_minted_back_to_back_increase` 连铸 1000 个 id 把这条钉住（上游改换上下文会主动失败，性质同 store 的 `SPIKE_*` tripwire）。依赖它的地方：`list_sessions` 的 `id ASC` tiebreak、`all_items`/`branch_tree` 的 `ORDER BY created_at ASC, id ASC`。**跨进程不成立**：时钟回拨后重启的进程会铸出比库里已有 id 更小的 id。（此前多处注释把同毫秒的 id 说成「随机尾巴、不保证顺序」，与实现相反，已一并改正。）
+
+**`ItemIdRange` 不提供成员判定。** 原来的 `contains` 比 id 大小，前提是「id 序 == 链序」，而按上一条，这个前提只在同进程、时钟未回拨时成立。compaction（M5）用它判「这条 item 是否已被摘要覆盖」，错一次就是静默的历史损坏（该重放的不再重放，或反之）。span 因此是**位置**语义：成员是沿链落在两端点之间的那些 item，只有持有链的一方能解析——M5 与它的第一个消费者一起在 store 的树遍历里实现，现在不加没有调用方的 API。类型上只剩 `first`/`last` 与「两端含」的约定。
 
 ### 2026-09-28
 

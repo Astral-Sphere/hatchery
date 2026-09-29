@@ -76,6 +76,24 @@
 
 ## 变更日志
 
+### 2026-09-30 · M0b 评审后的两轮修复（测试面）
+
+**「测试通过」不等于「测试在测」。** 这轮抓出三处结构上不可能失败的测试，都是同一类错误——测试观察的位置与被测行为发生的位置错开了：
+
+1. `an_interrupt_with_no_turn_running_is_ignored` 在当前线程 runtime 上**空转**：`mpsc::send` 在有容量时不挂起，所以 spawn 出去的 agent 任务在断言之前根本没被 poll，随后又被 abort。改成走同一条 FIFO 通道驱动一个真实 turn，空闲中断才真的排在前面被处理。
+2. 工具取消**不可观测**：fake 在 gate 之后才记录调用，而 kernel 的 select 是取消优先、并且会 **drop 掉 invoke future**——所以 `cancelled` 永远不可能是 true，测试里那句「让被取消的工具返回」描述的是一个不可能发生的顺序。改成进门即记录 + drop guard 写结论。
+3. 工具进度的丢失被 gate **掩盖**：`tool_progress_is_forwarded_while_the_tool_runs` 用的是 gated host，而放开 gate 会多给 select 一轮，进度分支就赢了；不带 gate 时「同一次 poll 内发进度并返回」的工具，它最后那条进度是确定性丢弃的。补的不带 gate 的测试在改 kernel 之前先跑了一次，确认是红的。
+
+**纪律**：本轮所有「修行为」的新测试都先证明它会红（进度排空、跨会话批次、会话缺失的错误分类），再改实现。「先绿后红」的测试只能证明它当时没在测东西。
+
+**共享的断言面搬进 testkit。** `completion`/`reason`/`error`/`finished_items`/`kinds`/`states`/`tool_result_texts` 原本定义在 kernel 的集成测试文件里，现在是 `hatchery_testkit::events`——M1 的 daemon 测试要对同一批事件问同样的问题，第二份 `completion()` 就是第二个忘记「一个 turn 恰好一个 `TurnEnded`」的地方。`RecordingSink` 的 `wait_for_from`/`wait_for_end_from`（2026-09-29 加）同理：`wait_for` 从头扫，多 turn 测试等第二次结束时会重新匹配到第一次，拿到一份过期快照。
+
+**未使用的 API：能给真调用方的补上，其余删掉（用户裁决）。** `ScriptedApproval::{AllowOnce,DenyAlways,Script}` 原本没有调用方，现在有一个：新增 kernel 测试「一轮里两次工具调用，第一次允许、第二次拒绝」——它顺带补上了此前没有覆盖的「一轮多审批」路径（两个 request id 必须不同、状态序列要出现两组 `awaiting_approval→executing`）。`Gate::available` 与 `ScriptedProvider::last_messages` 删掉（测试都用 `requests()[n].messages`）；kernel 的 `AgentHandle::try_submit` 同样删掉（把「队列满」和「agent 已停」都报成 `AgentGone`，零调用方）。
+
+**文档里的计数一律去掉（用户裁决）**：README、roadmap 与设计文档不再写测试数与 fixture 数。证据就是这轮修复本身——同一个 M0b 在四处写着 219 / 198 / 197 三个互不相同的数，而且每改一次代码它们就再错一次。数字只留在 worklog 的日期化条目里；覆盖率交给测试自己机器检查（protocol 的 fixture 覆盖率有三条测试兜着）。
+
+**本轮实测计数**（`cargo nextest list --workspace`，2026-09-30）：默认组共 **258** 项、全绿——protocol 109、kernel 46、store 73、testkit 5、capabilities 11、xtask 13、cli 1；另有 1 项 `#[ignore]`（崩溃测试重入的子进程入口，运行时计为 skipped）。invariants 组 4 项，doctest 7 个。`./scripts/ci.sh` 全绿；`cargo xtask layering` 报 12 members、22 build edges + 8 dev edges。三平台 CI 仍未看到 M0b 之后的代码（push 由用户执行）。
+
 ### 2026-09-28
 
 **M0b 落地**：不变量分组从 1 条涨到 4 条（新增 `invariant_items_are_never_rewritten`、`invariant_the_database_refuses_to_update_an_item`）；默认组从 23 项涨到 219 项（其中 protocol 94、store 64、kernel 40）。testkit 交付 kernel 四接缝的 fake、`ScriptedApproval`/`answer_approvals`、`Gate` 与 store 的参考模型 `ReferenceTree`；`fixture`/`assert_golden` 推迟到 M1（protocol 的 golden 是纯 JSON，SSE fixture 要等 llm crate）。崩溃测试的形态按实测定案（测试二进制自重入），design/testing.md 开放问题 1 关闭。详见上面「实测记录 · M0b」。

@@ -45,10 +45,11 @@ pub struct MockWire;        // wiremock 装配：按 fixture 回放 SSE 字节�
 
 // kernel 的另外三个接缝
 pub struct MemoryHistory;   // 固定对话 + 可控 head
-pub struct RecordingSink;   // 记录每个事件、可按谓词等待（带超时，避免挂死）
+pub struct RecordingSink;   // 记录每个事件、可按谓词等待（带超时，避免挂死）；wait_for_from 带游标，多 turn 测试才等得到第二次结束
 pub struct ScriptedToolHost; // 目录 / 审批 / 结果全部脚本化；entries 可排队、可 gate
-pub enum ScriptedApproval { AutoAllow, AutoDeny, Script(Vec<ApprovalOption>) }
+pub enum ScriptedApproval { AllowOnce, AllowAlways, Deny, DenyAlways, Script(Vec<ApprovalOption>) }  // 与协议的 ApprovalOption 同一套词汇
 pub fn answer_approvals(handle, events, policy);   // 替测试应答审批请求
+pub mod events;             // completion/reason/error/finished_items/kinds/states/tool_result_texts：从录下的事件里读出结论（daemon 的测试复用同一套）
 
 // 能力后端（capabilities 接缝的内存实现，M1–M2）
 pub struct MemoryFs;        // HashMap<PathBuf, Vec<u8>>，支持断言读写序列
@@ -90,16 +91,18 @@ M0b 已实现的是 kernel 四接缝的 fake 与 `ReferenceTree`（`ScriptedProv
 
 风险：状态机死角、取消语义、上下文组装错误。
 
-- 状态机全迁移矩阵：ScriptedProvider 脚本化每条路径（含错误注入）。M0b 已落地的 20 项集成测试（`tests/turn_state_machine.rs`）覆盖：
+- 状态机全迁移矩阵：ScriptedProvider 脚本化每条路径（含错误注入）。M0b 已落地的集成测试（`tests/turn_state_machine.rs`）覆盖：
   - `interrupt_during_streaming_ends_the_turn_early_and_keeps_what_was_said`（中断点之后的 item 仍提交）
   - `interrupt_during_tool_execution_cancels_the_tool`（ScriptedToolHost 断言收到取消）
   - `interrupt_while_awaiting_approval_ends_the_turn`
   - `max_rounds_fuse_trips_at_limit`
   - `the_tool_snapshot_is_frozen_for_the_whole_turn`（turn 中途换注册表不影响本轮）
-  - 审批：`an_approval_request_pauses_the_turn_until_it_is_answered`、`a_denied_call_becomes_an_error_result_the_model_can_read`（拒绝对话继续，item 记 `Denied`）
-  - 工具：`a_tool_result_is_appended_to_the_next_request`、`a_tool_the_model_reported_as_failed_is_recorded_but_the_turn_continues`、`tool_progress_is_forwarded_while_the_tool_runs`、`a_tool_that_cannot_be_invoked_fails_the_turn`
+  - `a_mid_turn_prompt_is_dropped_not_queued`、`a_second_turn_chains_onto_the_first_turns_head`（一次一个 turn；第二个 turn 接在第一个的 head 上）
+  - 审批：`an_approval_request_pauses_the_turn_until_it_is_answered`、`a_denied_call_becomes_an_error_result_the_model_can_read`（拒绝对话继续，item 记 `Denied`）、`two_calls_in_one_round_are_each_approved_separately`（一轮里的两次调用各有各的 request id 与等待，一个被拒不代替另一个作答）
+  - 工具：`a_tool_result_is_appended_to_the_next_request`、`a_tool_the_model_reported_as_failed_is_recorded_but_the_turn_continues`、`tool_progress_is_forwarded_while_the_tool_runs`、`progress_sent_as_the_tool_finishes_still_reaches_the_sink`（工具在同一次 poll 内发出并返回的进度不能跟着 invoke future 一起丢）、`a_tool_that_cannot_be_invoked_fails_the_turn`
+  - reasoning：`reasoning_is_streamed_and_stored_verbatim`、`a_signature_that_arrives_after_the_text_cannot_be_stored_but_still_replays`（adapter 违反事件顺序时的代价，见 kernel.md §4）
   - 失败：provider 起不来 / 流中途断 / 流没有 finish reason / 工具没跑成
-  - 确定性：`the_same_script_produces_the_same_event_sequence_twice`（事件名、item 种类、迁移序列三重比对）
+  - 确定性：`the_same_script_produces_the_same_event_sequence_twice`（事件名、item 种类、迁移序列三重比对）、`the_documented_event_sequence_is_emitted_exactly`（逐字比对文档里那条序列）
 - 组装（M1）：reasoning 块按能力表保留/丢弃；compaction 区间替换；token 裁剪顺序（先旧 round 的工具结果）。M0b 只到「把用户输入落成 item、把工具结果回填给下一轮」为止，过滤与裁剪住在 daemon 的装配器里（kernel.md §6）。
 
 ### 3.3 llm
@@ -120,13 +123,13 @@ M0b 已实现的是 kernel 四接缝的 fake 与 `ReferenceTree`（`ScriptedProv
 风险：分支树 SQL 错误、并发丢失、崩溃损坏——数据层错误最不可原谅，测试最重。
 
 - **引擎门槛（M0a 已落地）**：`crates/hatchery-store/tests/spike_engine.rs` 12 项，锁定 turso 0.7.2 的真实行为——append-only 触发器、外键级联、WAL 下写事务与并发读、`user_version`、写入延迟、`WITH RECURSIVE` 缺失（tripwire 常量，上游补上就主动失败）。引擎升级必须重跑（ADR-0010）。
-- **store 层（M0b 已落地）**：`crates/hatchery-store/tests/session_store.rs` 22 项——会话 CRUD 与分页游标、append 与 head 推进、批量原子性、跨会话父节点拒绝、300 条链的重建顺序（覆盖 payload 分块边界）、编辑分叉与旧分支保留、切换、级联删除与拒绝、姐妹分支不受影响、`branch_tree` 的 active 标记、turn 起止、导出（active / 全树 / 拒绝覆盖）、迁移与重开、损坏 payload 报告。两个测试用第二条连接绕过 store：`invariant_the_database_refuses_to_update_an_item`（直接 UPDATE 被触发器拒绝，错误里带我们的消息）与 `a_corrupt_payload_is_reported_with_its_item`。
+- **store 层（M0b 已落地）**：`crates/hatchery-store/tests/session_store.rs`——会话 CRUD 与分页游标、append 与 head 推进、批量原子性、跨会话父节点拒绝、**跨会话批次拒绝**、**写进不存在的会话报 `SessionNotFound` 而不是外键的消息**（两者在 wire 上是「调用方错误」与「存储故障」两种码）、300 条链的重建顺序（覆盖 payload 分块边界）、编辑分叉与旧分支保留、切换、**切换/删除拒绝别的会话的 item**、级联删除与拒绝、姐妹分支不受影响、`branch_tree` 的 active 标记、turn 起止、导出（active / 全树的逐行顺序 / **空会话** / 拒绝覆盖）、迁移与重开、损坏 payload 报告。两个测试用第二条连接绕过 store：`invariant_the_database_refuses_to_update_an_item`（直接 UPDATE 被触发器拒绝，错误里带我们的消息）与 `a_corrupt_payload_is_reported_with_its_item`。
 - **属性测试（核心投入，已落地）**：`crates/hatchery-store/tests/tree_proptest.rs`，随机 append/edit_fork/switch/delete 脚本同时作用于 turso 实现与 `hatchery-testkit` 里独立写出的 `ReferenceTree`（纯 `HashMap` + head，不复用生产代码），每步之后断言链形态（id/parent/kind）、head、active 集合与总行数一致。64 cases；失败种子进 `*.proptest-regressions`（已入库）。
 - 级联删除：`delete_branch_cascades_and_refuses_while_the_head_is_inside`、`deleting_a_branch_leaves_a_sibling_alone`；引擎级兜底已于 M0a 实测（`sessions.active_head` 的外键会拒绝该删除）。删除还会**交叉校验**走树数量与删除前后行数差（storage.md §5）。
 - append-only：`invariant_items_are_never_rewritten`（编辑后原 item 逐字段不变）+ 引擎级触发器已实测 + store 层没有 update item 的 API 入口。
 - **并发**：M0b 读也走 writer actor（串行但正确）；只读连接池压测（N reader + writer、1k items、无 busy 错误、背压 await 而非丢弃）排在 M1（storage.md 开放问题 6）。
 - **崩溃测试（已落地）**：`crates/hatchery-store/tests/crash_recovery.rs` 6 项。子进程是**测试二进制自重入**（`current_exe()` + `HATCHERY_CRASH_PROBE` + `#[ignore]` 入口），不新增 target、不发布二进制；子进程提交后打印就绪行并挂起，父进程 `Child::kill()`（unix SIGKILL / Windows TerminateProcess）后重开断言。五种 StoreCmd 各一个 probe（append / edit_fork / switch_branch / delete_branch / finish_turn），另有一项断言恢复后数据库**可用**。**不覆盖断电**：spike 实测 `PRAGMA synchronous` 无可测影响，「掉电不丢已提交 item」目前没有证据（storage.md 开放问题 4）。
-- 迁移：`migrations_run_once_and_both_records_agree`（`user_version` 与 `schema_meta` 双记录一致、重开不重复迁移）。v(N-1) 库文件 fixture → 自动迁移仍待有 v2 时补。
+- 迁移：`migrations_run_once_and_both_records_agree`（`user_version` 与 `schema_meta` 双记录一致、重开不重复迁移）；拒绝启动的两条也各有测试——`a_database_from_a_newer_build_is_refused`（更新版本写出的库）与 `a_database_whose_version_record_was_deleted_is_refused`（两个版本记录只剩一个）。v(N-1) 库文件 fixture → 自动迁移仍待有 v2 时补。
 
 ### 3.5 capabilities + tools
 
