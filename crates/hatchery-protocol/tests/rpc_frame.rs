@@ -24,14 +24,36 @@ fn a_null_id_is_not_taken_for_a_correlation() {
         "id": null,
         "error": {"code": -32600, "message": "invalid request"},
     });
-    assert_eq!(classify(value.clone()), Err(FrameError::Unclassifiable));
+    assert_eq!(
+        classify(value.clone()),
+        Err(FrameError::NullId { method: None })
+    );
+
+    // The dangerous spelling: an explicit null on a frame that names a method. Read as "no id"
+    // it becomes a notification, and the caller of `session/prompt` waits forever for an answer
+    // nothing is going to send.
+    let downgraded = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": null,
+        "method": "session/prompt",
+        "params": {"session_id": "s", "text": "hi"},
+    });
+    assert_eq!(
+        classify(downgraded),
+        Err(FrameError::NullId {
+            method: Some("session/prompt".to_owned())
+        })
+    );
 
     // The same frame arriving on the transport: reported, and the stream stays usable.
     let frame = encode_frame(&value).expect("encode");
     let mut decoder = FrameDecoder::default();
     let lines = decoder.push(frame.as_bytes()).expect("push");
     assert_eq!(lines.len(), 1);
-    assert_eq!(decode_frame(&lines[0]), Err(FrameError::Unclassifiable));
+    assert_eq!(
+        decode_frame(&lines[0]),
+        Err(FrameError::NullId { method: None })
+    );
     let after = decoder
         .push(
             encode_frame(&Request::new(1_i64, method::SESSION_CANCEL))

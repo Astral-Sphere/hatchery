@@ -6,7 +6,7 @@
 
 use std::fmt;
 
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde::{Deserialize, Deserializer, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 
 /// The only version this crate speaks, spelled the way the spec spells it.
@@ -244,6 +244,16 @@ pub enum FrameError {
     /// The frame carried neither a method nor an id.
     #[error("frame has neither a method nor an id")]
     Unclassifiable,
+    /// The frame carried an explicit `"id": null`, which cannot be correlated with anything.
+    ///
+    /// Kept apart from [`Self::Unclassifiable`]: a null id on a frame that *does* name a method
+    /// is a request somebody meant to have answered, and the message names the method so the
+    /// faulty client can be found.
+    #[error("frame has an explicit null id (method: {})", method.as_deref().unwrap_or("none"))]
+    NullId {
+        /// The method the frame named, if it named one.
+        method: Option<String>,
+    },
     /// A request needed parameters and had none.
     #[error("method {0} requires parameters")]
     MissingParams(String),
@@ -270,10 +280,16 @@ impl From<serde_json::Error> for FrameError {
 /// Classifies a JSON value into a request, a notification or a response.
 ///
 /// `"id": null` is not an id here. JSON-RPC 2.0 lets a peer answer a request it could not
-/// identify with a null-id error response; this build reports that frame as
-/// [`FrameError::Unclassifiable`] rather than inventing a correlation for it, because every
-/// hatchery id is minted by the caller before the request is written — so a null id is junk, not
-/// a reply we lost. Interop with a spec-literal foreign agent is the ACP bridge's job (M3).
+/// identify with a null-id error response; this build reports such a frame as
+/// [`FrameError::NullId`] rather than inventing a correlation for it, because every hatchery id
+/// is minted by the caller before the request is written — so a null id is junk, not a reply we
+/// lost. Interop with a spec-literal foreign agent is the ACP bridge's job (M3).
+///
+/// The null is told apart from an *absent* id on purpose. Reading both as "no id" would classify
+/// `{"id":null,"method":"session/prompt"}` as a notification: a request silently downgraded to a
+/// call nobody answers, with its caller waiting forever. That frame is a client bug — a missing
+/// `skip_serializing_if` on an `Option<Id>` produces exactly it — and a bug that hangs the caller
+/// has to be reported, not absorbed.
 ///
 /// # Errors
 ///
@@ -295,6 +311,12 @@ pub fn classify(value: Value) -> Result<Incoming, FrameError> {
         result,
         error,
     } = Probe::deserialize(&value).map_err(FrameError::from)?;
+
+    let id = match id {
+        Some(None) => return Err(FrameError::NullId { method }),
+        Some(Some(id)) => Some(id),
+        None => None,
+    };
 
     match (method, id) {
         (Some(method), Some(id)) => Ok(Incoming::Request(Request {
@@ -351,14 +373,49 @@ struct Probe {
     jsonrpc: JsonRpcVersion,
     #[serde(default)]
     method: Option<String>,
-    #[serde(default)]
-    id: Option<Id>,
+    /// Absent (`None`), explicitly null (`Some(None)`) or a value (`Some(Some(_))`).
+    #[serde(default, deserialize_with = "absent_null_or_id")]
+    id: Option<Option<Id>>,
     #[serde(default)]
     params: Option<Value>,
     #[serde(default)]
     result: Option<Value>,
     #[serde(default)]
     error: Option<crate::ErrorObject>,
+}
+
+/// Reads an `id` the way [`classify`] needs it: absent, explicit null and a value are three
+/// different facts, and serde's own `Option<Id>` collapses the first two into `None`.
+fn absent_null_or_id<'de, D>(deserializer: D) -> Result<Option<Option<Id>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct IdProbe;
+
+    impl<'de> serde::de::Visitor<'de> for IdProbe {
+        type Value = Option<Option<Id>>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("a number, a string, or null")
+        }
+
+        fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+            Ok(Some(None))
+        }
+
+        fn visit_none<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+            Ok(Some(None))
+        }
+
+        fn visit_some<D: Deserializer<'de>>(
+            self,
+            deserializer: D,
+        ) -> Result<Self::Value, D::Error> {
+            Id::deserialize(deserializer).map(|id| Some(Some(id)))
+        }
+    }
+
+    deserializer.deserialize_option(IdProbe)
 }
 
 /// Accumulates bytes and yields complete lines.
@@ -527,6 +584,35 @@ mod tests {
             decode_frame("{not json"),
             Err(FrameError::Malformed(_))
         ));
+    }
+
+    #[test]
+    fn an_absent_id_and_a_null_id_are_not_the_same_frame() {
+        // The null is a client bug with a hang behind it: `Option<Id>` serialized without
+        // `skip_serializing_if` produces this frame, and reading it as a notification would leave
+        // the caller waiting for an answer that nothing is going to send.
+        assert_eq!(
+            classify(serde_json::json!({
+                "jsonrpc": "2.0", "id": null, "method": "session/prompt"
+            })),
+            Err(FrameError::NullId {
+                method: Some("session/prompt".to_owned())
+            }),
+            "the message must name the method so the faulty client can be found"
+        );
+        assert_eq!(
+            classify(serde_json::json!({"jsonrpc": "2.0", "id": null, "result": {}})),
+            Err(FrameError::NullId { method: None }),
+            "and a null-id reply is refused the same way"
+        );
+
+        // Absent stays a notification: that is the one spelling the spec gives for "no answer".
+        let notification = classify(serde_json::json!({
+            "jsonrpc": "2.0", "method": "session/cancel"
+        }))
+        .expect("a notification");
+        assert_eq!(notification.method(), Some("session/cancel"));
+        assert!(!notification.expects_response());
     }
 
     #[test]
