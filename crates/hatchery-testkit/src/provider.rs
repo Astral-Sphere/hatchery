@@ -95,25 +95,14 @@ impl ScriptedProvider {
             .expect("the mutex is never poisoned")
             .clone()
     }
-
-    /// The messages of the last request.
-    #[must_use]
-    pub fn last_messages(&self) -> Vec<Message> {
-        self.requests
-            .lock()
-            .expect("the mutex is never poisoned")
-            .last()
-            .map(|request| request.messages.clone())
-            .unwrap_or_default()
-    }
 }
 
 #[async_trait]
 impl LlmProvider for ScriptedProvider {
     async fn chat_stream(
         &self,
-        options: ChatOptions,
-        messages: Vec<Message>,
+        options: &ChatOptions,
+        messages: &[Message],
         cancel: CancellationToken,
     ) -> Result<BoxStream<'static, StreamEvent>, LlmError> {
         let script = {
@@ -123,7 +112,13 @@ impl LlmProvider for ScriptedProvider {
         self.requests
             .lock()
             .expect("the mutex is never poisoned")
-            .push(RecordedRequest { options, messages });
+            // The kernel borrows both, and a real adapter serialises them into the request body
+            // before the first byte comes back. A fake has to keep them to be asserted on, so the
+            // copies here are a test-only cost.
+            .push(RecordedRequest {
+                options: options.clone(),
+                messages: messages.to_vec(),
+            });
 
         let Some(script) = script else {
             return Err(LlmError::fatal(

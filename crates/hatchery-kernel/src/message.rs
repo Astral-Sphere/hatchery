@@ -208,6 +208,10 @@ pub enum StreamEvent {
         text: String,
     },
     /// Reasoning finished, possibly with an opaque signature to store.
+    ///
+    /// Must be sent before the first [`Self::TextDelta`] of the text that follows this reasoning
+    /// block: the kernel commits the reasoning item as soon as text starts, and a committed item
+    /// cannot gain a signature afterwards (see [`crate::LlmProvider`]).
     ReasoningDone {
         /// Provider signature, when there is one.
         #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -16,7 +16,7 @@ use hatchery_protocol::{
 use crate::command::AgentCommand;
 use crate::error::{KernelError, LlmError};
 use crate::message::{
-    ChatOptions, FinishReason, Message, StreamEvent, ToolCallDelta, ToolCallRequest, ToolDef,
+    ChatOptions, FinishReason, Message, StreamEvent, ToolCallDelta, ToolCallRequest,
 };
 use crate::sink::KernelEvent;
 use crate::state::{Ports, TurnCompletion, TurnLimits, TurnState};
@@ -41,20 +41,16 @@ pub struct AgentHandle {
 impl AgentHandle {
     /// Sends a command, waiting if the queue is full.
     ///
+    /// Waiting is the point: a full queue means the agent is busy, not that it is gone, and the
+    /// only honest answers are "it ran" and "the agent is no longer running". The daemon drives
+    /// every frontend through this one path, so a flood slows the submitter down instead of
+    /// growing memory (`COMMAND_CAPACITY`).
+    ///
     /// # Errors
     ///
     /// [`AgentGone`] once the agent has stopped; the submitter must not assume its command ran.
     pub async fn submit(&self, command: AgentCommand) -> Result<(), AgentGone> {
         self.commands.send(command).await.map_err(|_| AgentGone)
-    }
-
-    /// Sends a command without waiting.
-    ///
-    /// # Errors
-    ///
-    /// [`AgentGone`] when the agent has stopped, or when the queue is full.
-    pub fn try_submit(&self, command: AgentCommand) -> Result<(), AgentGone> {
-        self.commands.try_send(command).map_err(|_| AgentGone)
     }
 
     /// True once the agent has stopped.
@@ -184,16 +180,52 @@ struct Round {
     /// The item currently being streamed, if any. At most one at a time: see
     /// [`Agent::push_delta`].
     open: Option<StreamedItem>,
-    /// Everything the model said this round.
-    text: String,
-    /// Everything it thought this round.
-    reasoning: String,
-    /// The provider's signature for that reasoning, if it issued one.
+    /// The items already closed this round, in the order they were streamed. Only the two
+    /// streamed kinds can appear here; keeping them as [`ItemKind`] means the round holds one
+    /// copy of each item's text rather than a second accumulator to keep in step with it.
+    closed: Vec<ItemKind>,
+    /// The signature from the last `ReasoningDone`, whether or not a reasoning item was still
+    /// open to take it. This is what goes back to the provider on the next round: replay must
+    /// carry the signature even in the case where the stored item could not (see
+    /// [`Agent::stream_round`]).
     signature: Option<SignatureBlock>,
     /// Tool calls, in the order the provider indexed them.
     calls: Vec<PartialCall>,
     /// Why the provider stopped, when it said.
     finish: Option<FinishReason>,
+}
+
+impl Round {
+    /// Everything the model said this round, in stream order.
+    fn text(&self) -> String {
+        let mut text = String::new();
+        for kind in &self.closed {
+            if let ItemKind::AssistantMessage(content) = kind {
+                text.push_str(&content.text);
+            }
+        }
+        text
+    }
+
+    /// Everything it thought this round, with the signature to replay it under.
+    ///
+    /// `None` when the round produced no reasoning at all: an empty reasoning block would tell
+    /// the provider something it did not say.
+    fn reasoning(&self) -> Option<ReasoningBlock> {
+        let mut text = String::new();
+        for kind in &self.closed {
+            if let ItemKind::Reasoning(block) = kind {
+                text.push_str(&block.text);
+            }
+        }
+        if text.is_empty() {
+            return None;
+        }
+        Some(ReasoningBlock {
+            text,
+            signature: self.signature.clone(),
+        })
+    }
 }
 
 /// Whether the loop should carry on after a command.
@@ -333,9 +365,13 @@ impl Agent {
         self.append(ItemKind::UserMessage(content)).await;
         messages.push(Message::user(text));
 
-        // Frozen once for the whole turn: the catalogue the model sees and the catalogue calls are
-        // dispatched through must be the same list, even if the registry is swapped mid-turn.
-        let tool_defs = self.ports.tools.snapshot();
+        // Frozen once for the whole turn: the catalogue the model sees and the catalogue calls
+        // are dispatched through must be the same list, even if the registry is swapped mid-turn.
+        // Built once rather than per round because nothing in it changes between rounds.
+        let options = ChatOptions {
+            tool_defs: self.ports.tools.snapshot(),
+            ..self.options.clone()
+        };
 
         for round in 1..=self.limits.max_rounds {
             if self.cancel.is_cancelled() {
@@ -343,7 +379,7 @@ impl Agent {
             }
             self.transition(TurnState::Streaming { round }).await;
 
-            let Some(mut stream) = self.stream_round(&tool_defs, &messages, usage).await? else {
+            let Some(mut stream) = self.stream_round(&options, &messages, usage).await? else {
                 return Ok(StopReason::Interrupted);
             };
             if self.cancel.is_cancelled() {
@@ -360,12 +396,9 @@ impl Agent {
             }
 
             // The assistant message that asked for the tools is part of the conversation too.
-            let mut assistant = Message::assistant(Content::text(&stream.text));
-            if !stream.reasoning.is_empty() {
-                assistant = assistant.with_reasoning(ReasoningBlock {
-                    text: stream.reasoning.clone(),
-                    signature: stream.signature.clone(),
-                });
+            let mut assistant = Message::assistant(Content::text(stream.text()));
+            if let Some(reasoning) = stream.reasoning() {
+                assistant = assistant.with_reasoning(reasoning);
             }
             let requests: Vec<ToolCallRequest> = std::mem::take(&mut stream.calls)
                 .into_iter()
@@ -395,18 +428,19 @@ impl Agent {
     ///
     /// `None` means the user interrupted; the items streamed so far have still been committed, so
     /// the transcript matches what they saw.
+    ///
+    /// The options and the conversation are borrowed, not handed over: an adapter serialises both
+    /// into the request body while it starts the request, and the stream it returns is
+    /// `'static`. A long session would otherwise pay for a copy of its whole transcript on every
+    /// round of every turn.
     async fn stream_round(
         &mut self,
-        tool_defs: &[ToolDef],
+        options: &ChatOptions,
         messages: &[Message],
         usage: &mut Usage,
     ) -> Result<Option<Round>, KernelError> {
-        let options = ChatOptions {
-            tool_defs: tool_defs.to_vec(),
-            ..self.options.clone()
-        };
         let provider = Arc::clone(&self.ports.provider);
-        let startup = provider.chat_stream(options, messages.to_vec(), self.cancel.clone());
+        let startup = provider.chat_stream(options, messages, self.cancel.clone());
         let Some(mut stream) = self.guarded_startup(startup).await? else {
             // Interrupted while the provider was still starting up: nothing was streamed, so
             // there is no open item to commit.
@@ -444,13 +478,11 @@ impl Agent {
                 StreamStep::Event(None) => break,
                 StreamStep::Event(Some(event)) => match event {
                     StreamEvent::TextDelta { text } => {
-                        round.text.push_str(&text);
-                        self.push_delta(&mut round, ItemKindTag::AssistantMessage, &text)
+                        self.push_delta(&mut round, ItemKindTag::AssistantMessage, text)
                             .await;
                     }
                     StreamEvent::ReasoningDelta { text } => {
-                        round.reasoning.push_str(&text);
-                        self.push_delta(&mut round, ItemKindTag::Reasoning, &text)
+                        self.push_delta(&mut round, ItemKindTag::Reasoning, text)
                             .await;
                     }
                     StreamEvent::ReasoningDone { signature } => {
@@ -462,6 +494,19 @@ impl Agent {
                             .filter(|open| open.kind == ItemKindTag::Reasoning)
                         {
                             open.signature = signature.clone();
+                        } else if signature.is_some() {
+                            // That item is already committed and items are append-only, so the
+                            // stored reasoning will replay unsigned. The signature still reaches
+                            // the provider through `round.signature` below, which keeps *this*
+                            // turn's replay intact; a rebuild from the store cannot be. An adapter
+                            // must send `ReasoningDone` before its block's first text delta
+                            // (docs/design/kernel.md §4) — this warns rather than fails the turn,
+                            // because losing a signature is recoverable and a hung turn is not.
+                            tracing::warn!(
+                                turn = %self.turn,
+                                "a reasoning signature arrived after its item was committed; \
+                                 the stored item will replay unsigned"
+                            );
                         }
                         round.signature = signature;
                     }
@@ -580,6 +625,10 @@ impl Agent {
     }
 
     /// Invokes a tool, forwarding progress and watching for an interrupt.
+    ///
+    /// The interrupted paths forward nothing that is still queued: the turn is being abandoned
+    /// and the call is about to be committed as [`ToolStatus::Cancelled`], so a chunk arriving
+    /// after the interrupt would describe work the transcript says never finished.
     async fn invoke_tool(
         &mut self,
         name: &str,
@@ -604,13 +653,19 @@ impl Agent {
             };
 
             match step {
-                ToolStep::Done(result) => return result.map(ToolRun::Done),
+                ToolStep::Done(result) => {
+                    // A tool that sends its last chunk and returns within one poll leaves that
+                    // chunk queued: the select polls the progress channel *before* the invoke
+                    // future, so it sees an empty channel, then finds the future ready and takes
+                    // this branch. Draining is what stops the "finished, wrote N bytes" line a
+                    // tool reports last from dying with the invoke future.
+                    while let Ok(progress) = progress_rx.try_recv() {
+                        self.forward_progress(call_item, progress).await;
+                    }
+                    return result.map(ToolRun::Done);
+                }
                 ToolStep::Progress(progress) => {
-                    self.emit(KernelEvent::ToolCallProgress {
-                        item: call_item,
-                        chunk: progress.chunk,
-                    })
-                    .await;
+                    self.forward_progress(call_item, progress).await;
                 }
                 ToolStep::Cancelled => return Ok(ToolRun::Interrupted),
                 ToolStep::Command(command) => {
@@ -620,6 +675,15 @@ impl Agent {
                 }
             }
         }
+    }
+
+    /// Reports one chunk of a running tool's output.
+    async fn forward_progress(&mut self, item: ItemId, progress: ToolProgress) {
+        self.emit(KernelEvent::ToolCallProgress {
+            item,
+            chunk: progress.chunk,
+        })
+        .await;
     }
 
     /// Waits for the user's answer to an approval request.
@@ -720,7 +784,10 @@ impl Agent {
     /// two open items would both have to chain onto the last *finished* item — a fork, which would
     /// hide one of them from the active branch and lose it on rebuild. Closing the reasoning item
     /// when text starts (and reopening a new one if reasoning resumes) keeps the tree a chain.
-    async fn push_delta(&mut self, round: &mut Round, kind: ItemKindTag, text: &str) {
+    ///
+    /// Takes the delta by value: it is appended to the open item and then handed to the sink, so
+    /// an owned delta is copied once instead of twice.
+    async fn push_delta(&mut self, round: &mut Round, kind: ItemKindTag, text: String) {
         let same_kind = round.open.as_ref().is_some_and(|open| open.kind == kind);
         if !same_kind {
             self.close_open(round).await;
@@ -743,9 +810,10 @@ impl Agent {
         }
 
         let open = round.open.as_mut().expect("an item was just opened");
-        open.text.push_str(text);
+        open.text.push_str(&text);
         let item = open.id;
-        let text = text.to_owned();
+        // Moved into the event rather than copied: the delta arrives owned from the provider
+        // stream, and this is the hottest line in the kernel.
         if kind == ItemKindTag::Reasoning {
             self.emit(KernelEvent::ReasoningDelta { item, text }).await;
         } else {
@@ -753,7 +821,7 @@ impl Agent {
         }
     }
 
-    /// Commits the round's open item, if any.
+    /// Commits the round's open item, if any, and keeps it for the round's assistant message.
     async fn close_open(&mut self, round: &mut Round) {
         let Some(open) = round.open.take() else {
             return;
@@ -766,6 +834,8 @@ impl Agent {
         } else {
             ItemKind::AssistantMessage(Content::text(open.text))
         };
+        // One clone per item rather than a second accumulator per delta to keep in step with it.
+        round.closed.push(kind.clone());
         self.commit(open.id, open.parent, kind).await;
     }
 

@@ -17,7 +17,7 @@ use hatchery_protocol::{
 };
 use hatchery_testkit::{
     MemoryHistory, RecordingSink, ScriptedApproval, ScriptedProvider, ScriptedToolHost,
-    answer_approvals,
+    answer_approvals, error, finished_items, kinds, reason, states, tool_result_texts,
 };
 
 /// A kernel wired to scripted fakes, already running.
@@ -93,70 +93,6 @@ impl Drop for Harness {
     fn drop(&mut self) {
         self.running.abort();
     }
-}
-
-fn completion(events: &[KernelEvent]) -> TurnCompletion {
-    // Exactly one terminal event per turn is part of the contract, so it is checked here rather
-    // than trusted: `find_map` alone would silently accept a duplicate `TurnEnded`.
-    let ended: Vec<&TurnCompletion> = events
-        .iter()
-        .filter_map(|event| match event {
-            KernelEvent::TurnEnded { completion, .. } => Some(completion),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(
-        ended.len(),
-        1,
-        "a turn must end with exactly one TurnEnded event, got {}",
-        ended.len()
-    );
-    ended.into_iter().next().expect("one event").clone()
-}
-
-fn reason(events: &[KernelEvent]) -> Option<StopReason> {
-    completion(events).stop_reason()
-}
-
-fn error(events: &[KernelEvent]) -> Option<KernelError> {
-    match completion(events) {
-        TurnCompletion::Failed { error, .. } => Some(error),
-        TurnCompletion::Completed { .. } => None,
-    }
-}
-
-fn finished_items(events: &[KernelEvent]) -> Vec<Item> {
-    events
-        .iter()
-        .filter_map(|event| match event {
-            KernelEvent::ItemFinished { item } => Some(item.clone()),
-            _ => None,
-        })
-        .collect()
-}
-
-fn kinds(events: &[KernelEvent]) -> Vec<ItemKindTag> {
-    finished_items(events).iter().map(Item::kind_tag).collect()
-}
-
-fn states(events: &[KernelEvent]) -> Vec<&'static str> {
-    events
-        .iter()
-        .filter_map(|event| match event {
-            KernelEvent::StateChanged { to, .. } => Some(to.name()),
-            _ => None,
-        })
-        .collect()
-}
-
-fn tool_result_texts(events: &[KernelEvent]) -> Vec<String> {
-    finished_items(events)
-        .into_iter()
-        .filter_map(|item| match item.kind {
-            ItemKind::ToolResult(result) => Some(result.output.text),
-            _ => None,
-        })
-        .collect()
 }
 
 // ------------------------------------------------------------------ happy paths
@@ -312,6 +248,84 @@ async fn reasoning_is_streamed_and_stored_verbatim() {
 }
 
 #[tokio::test]
+async fn a_signature_that_arrives_after_the_text_cannot_be_stored_but_still_replays() {
+    // The provider contract (docs/design/kernel.md §4) puts `ReasoningDone` before the text that
+    // follows its reasoning block. This is what an adapter that breaks it costs: that text delta
+    // closed and committed the reasoning item, and items are append-only, so the stored reasoning
+    // replays unsigned. The turn's own next request still carries the signature — losing it there
+    // as well would break a conversation that is still running, which is the half of the mistake
+    // the kernel can still avoid.
+    let reasoning = " thinking ";
+    let signature = SignatureBlock::new(SignatureBlock::OPENAI_ENCRYPTED_CONTENT, "late-blob");
+    let provider = ScriptedProvider::new(vec![
+        vec![
+            StreamEvent::ReasoningDelta {
+                text: reasoning.to_owned(),
+            },
+            StreamEvent::TextDelta {
+                text: "let me look".to_owned(),
+            },
+            StreamEvent::ReasoningDone {
+                signature: Some(signature.clone()),
+            },
+            StreamEvent::ToolCall {
+                delta: hatchery_kernel::ToolCallDelta {
+                    index: 0,
+                    id: Some("call-1".to_owned()),
+                    name: Some("read_file".to_owned()),
+                    args_delta: json!({"path": "a.rs"}).to_string(),
+                },
+            },
+            StreamEvent::Done {
+                finish_reason: FinishReason::ToolCalls,
+            },
+        ],
+        ScriptedProvider::text_round("done"),
+    ]);
+    let tools = ScriptedToolHost::new()
+        .advertising(&["read_file"])
+        .answering("read_file", ToolOutput::text("fn main() {}"));
+    let harness = Harness::new(
+        provider,
+        tools,
+        MemoryHistory::empty(),
+        TurnLimits::default(),
+    );
+    harness.prompt("read it").await;
+    let events = harness.finish().await;
+
+    let item = finished_items(&events)
+        .into_iter()
+        .find(|item| item.kind_tag() == ItemKindTag::Reasoning)
+        .expect("a reasoning item");
+    match item.kind {
+        ItemKind::Reasoning(block) => {
+            assert_eq!(block.text, reasoning, "the reasoning itself is stored");
+            assert!(
+                block.signature.is_none(),
+                "the signature arrived after this item was committed, so it cannot be on it"
+            );
+        }
+        other => panic!("expected a reasoning item, got {other:?}"),
+    }
+
+    let messages = &harness.provider.requests()[1].messages;
+    let assistant = messages
+        .iter()
+        .find(|message| !message.tool_calls.is_empty())
+        .expect("the assistant message that asked for the tool");
+    assert_eq!(
+        assistant
+            .reasoning
+            .clone()
+            .expect("reasoning is replayed")
+            .signature,
+        Some(signature),
+        "the running turn keeps replaying under the signature it was given"
+    );
+}
+
+#[tokio::test]
 async fn a_tool_result_is_appended_to_the_next_request() {
     let provider = ScriptedProvider::new(vec![
         ScriptedProvider::tool_round("call-1", "read_file", json!({"path": "a.rs"})),
@@ -428,6 +442,43 @@ async fn tool_progress_is_forwarded_while_the_tool_runs() {
 
     gate.release(1);
     let events = harness.finish().await;
+    assert_eq!(reason(&events), Some(StopReason::ModelDone));
+}
+
+#[tokio::test]
+async fn progress_sent_as_the_tool_finishes_still_reaches_the_sink() {
+    // No gate, and that is the point. An ungated invocation sends its progress and returns Ready
+    // within a single poll, so the kernel's biased select finds the progress channel empty, then
+    // finds the invoke future ready, and takes the `Done` branch with a message still queued.
+    // The gated test above cannot observe that window: releasing the gate hands the select
+    // another pass, in which the progress branch wins.
+    let tools = ScriptedToolHost::new()
+        .advertising(&["echo"])
+        .answering("echo", ToolOutput::text("ok"));
+    let provider = ScriptedProvider::new(vec![
+        ScriptedProvider::tool_round("call-1", "echo", json!({})),
+        ScriptedProvider::text_round("done"),
+    ]);
+    let harness = Harness::new(
+        provider,
+        tools,
+        MemoryHistory::empty(),
+        TurnLimits::default(),
+    );
+    harness.prompt("echo").await;
+    let events = harness.finish().await;
+
+    let chunks: Vec<&String> = events
+        .iter()
+        .filter_map(|event| match event {
+            KernelEvent::ToolCallProgress { chunk, .. } => Some(chunk),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        chunks.iter().any(|chunk| chunk.contains("echo started")),
+        "a tool's last progress must not die with the invoke future: {chunks:?}"
+    );
     assert_eq!(reason(&events), Some(StopReason::ModelDone));
 }
 
@@ -584,6 +635,114 @@ async fn approving_always_still_only_runs_the_call_once() {
     // Persisting the rule is the approval gate's job (M2); the kernel just runs the call.
     assert_eq!(harness.tools.call_names(), vec!["write_file"]);
     assert_eq!(reason(&events), Some(StopReason::ModelDone));
+}
+
+#[tokio::test]
+async fn two_calls_in_one_round_are_each_approved_separately() {
+    // A round may ask for several tools. Each gets its own request id and its own wait, and one
+    // refusal must not settle the other: the model asked for two things and is owed two answers.
+    fn call(index: u32, id: &str, name: &str, args: serde_json::Value) -> StreamEvent {
+        StreamEvent::ToolCall {
+            delta: hatchery_kernel::ToolCallDelta {
+                index,
+                id: Some(id.to_owned()),
+                name: Some(name.to_owned()),
+                args_delta: args.to_string(),
+            },
+        }
+    }
+
+    let provider = ScriptedProvider::new(vec![
+        vec![
+            call(0, "call-1", "write_file", json!({"path": "a.rs"})),
+            call(1, "call-2", "shell", json!({"command": "make"})),
+            StreamEvent::Done {
+                finish_reason: FinishReason::ToolCalls,
+            },
+        ],
+        ScriptedProvider::text_round("one written, one refused"),
+    ]);
+    let tools = ScriptedToolHost::new()
+        .advertising(&["write_file", "shell"])
+        .requiring_approval("write_file", RiskLevel::WritesWorkspace)
+        .requiring_approval("shell", RiskLevel::Executes)
+        .answering("write_file", ToolOutput::text("wrote a.rs"));
+    let harness = Harness::new(
+        provider,
+        tools,
+        MemoryHistory::empty(),
+        TurnLimits::default(),
+    );
+    let answers = harness.auto_approve(ScriptedApproval::Script(vec![
+        hatchery_protocol::ApprovalOption::AllowOnce,
+        hatchery_protocol::ApprovalOption::DenyAlways,
+    ]));
+    harness.prompt("write it, then build").await;
+    let events = harness.finish().await;
+    answers.abort();
+
+    assert_eq!(reason(&events), Some(StopReason::ModelDone));
+
+    let asked: Vec<hatchery_protocol::ApprovalId> = events
+        .iter()
+        .filter_map(|event| match event {
+            KernelEvent::ApprovalNeeded { request_id, .. } => Some(*request_id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(asked.len(), 2, "one approval request per call");
+    assert_ne!(
+        asked[0], asked[1],
+        "an answer must name the request it answers, so two calls cannot share one id"
+    );
+
+    assert_eq!(
+        harness.tools.call_names(),
+        vec!["write_file"],
+        "the refused call never runs"
+    );
+    let statuses: Vec<ToolStatus> = finished_items(&events)
+        .iter()
+        .filter_map(|item| match item.kind {
+            ItemKind::ToolCall(ref call) => Some(call.status),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        statuses,
+        vec![ToolStatus::Completed, ToolStatus::Denied],
+        "each call records its own outcome, in the order the model asked"
+    );
+    let texts = tool_result_texts(&events);
+    assert_eq!(texts.len(), 2, "both calls are answered: {texts:?}");
+    assert!(
+        texts[1].contains("denied"),
+        "the model is told about the refusal, not left guessing: {texts:?}"
+    );
+    let next_round = harness.provider.requests();
+    let results: Vec<&Message> = next_round[1]
+        .messages
+        .iter()
+        .filter(|message| message.is_tool_result())
+        .collect();
+    assert_eq!(results.len(), 2, "both outcomes go back to the model");
+    assert!(results[1].is_error, "and the refusal is marked as one");
+
+    assert_eq!(
+        states(&events),
+        vec![
+            "assembling",
+            "streaming",
+            "executing",
+            "awaiting_approval",
+            "executing",
+            "awaiting_approval",
+            "executing",
+            "streaming",
+            "idle"
+        ],
+        "each call waits, and each answer reports the machine back to executing"
+    );
 }
 
 // ------------------------------------------------------------------ interrupt

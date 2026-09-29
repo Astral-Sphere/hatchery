@@ -51,8 +51,8 @@
 //! # impl hatchery_kernel::LlmProvider for NoProvider {
 //! #     async fn chat_stream(
 //! #         &self,
-//! #         _options: ChatOptions,
-//! #         _messages: Vec<Message>,
+//! #         _options: &ChatOptions,
+//! #         _messages: &[Message],
 //! #         _cancel: CancellationToken,
 //! #     ) -> Result<futures::stream::BoxStream<'static, StreamEvent>, LlmError> {
 //! #         Err(LlmError::fatal("no provider is wired up"))

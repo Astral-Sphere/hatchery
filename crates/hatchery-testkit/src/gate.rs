@@ -41,12 +41,6 @@ impl Gate {
             Err(_) => false,
         }
     }
-
-    /// How many steps may proceed right now.
-    #[must_use]
-    pub fn available(&self) -> usize {
-        self.permits.available_permits()
-    }
 }
 
 impl Default for Gate {

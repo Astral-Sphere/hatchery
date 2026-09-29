@@ -12,11 +12,13 @@
 //! * [`ScriptedToolHost`] + [`answer_approvals`] — scripted tools and a frontend that answers
 //!   approvals;
 //! * [`ReferenceTree`] — an independently written item tree for the store's property tests;
-//! * [`Gate`] — releases a gated fake step by step, so interrupt tests have a window to act in.
+//! * [`Gate`] — releases a gated fake step by step, so interrupt tests have a window to act in;
+//! * the [`events`] helpers — read a recorded turn's outcome, items and states back out.
 //!
 //! `MemoryFs`, `MemoryTerminal`, `TempWorkspace`, `TestDaemon` and `ClientProbe` land with their
 //! consumers in M1–M2, and fixture loading arrives with the llm crate's recorded SSE streams.
 
+pub mod events;
 pub mod gate;
 pub mod history;
 pub mod model;
@@ -24,6 +26,7 @@ pub mod provider;
 pub mod sink;
 pub mod tools;
 
+pub use events::{completion, error, finished_items, kinds, reason, states, tool_result_texts};
 pub use gate::Gate;
 pub use history::MemoryHistory;
 pub use model::{ChainShape, ReferenceTree};
