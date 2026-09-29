@@ -358,7 +358,12 @@ impl SessionStore for TursoStore {
             .expect("the writer slot is never poisoned")
             .take();
         if let Some(writer) = writer {
-            let _ = writer.await;
+            // The reply above proves the actor handled the shutdown; this proves it exited. A
+            // writer that panicked or was aborted on the way out did not shut down cleanly, and
+            // the caller asked to be told: swallowed here, the panic would be visible nowhere.
+            writer.await.map_err(|error| {
+                StoreError::Database(format!("the store writer did not exit cleanly: {error}"))
+            })?;
         }
         Ok(())
     }

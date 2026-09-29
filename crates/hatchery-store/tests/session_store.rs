@@ -100,10 +100,11 @@ async fn open_directly(path: &std::path::Path) -> turso::Connection {
 /// Waits until the millisecond clock advances.
 ///
 /// `Timestamp::now()` is millisecond-resolution and `list_sessions` orders by
-/// `updated_at DESC, id ASC`. Three in-process round trips can land in the same millisecond,
-/// and then the tiebreak — a UUIDv7's random tail — decides the order a test is trying to
-/// assert. Advancing the clock between writes makes recency assertions deterministic instead of
-/// usually-right.
+/// `updated_at DESC, id ASC`. Three in-process round trips can land in the same millisecond, and
+/// then the tiebreak decides the order — by session id, which sorts by *creation* (UUIDv7 ids are
+/// monotonic within a process), not by the update this test is asserting on. Advancing the clock
+/// between writes keeps a recency assertion about recency instead of about which session was
+/// created first.
 async fn next_millisecond() {
     let now = Timestamp::now();
     while Timestamp::now() == now {
@@ -387,6 +388,77 @@ async fn an_item_cannot_be_chained_into_another_session() {
 }
 
 #[tokio::test]
+async fn writing_into_a_missing_session_says_the_session_is_missing() {
+    // Left to the foreign key, this surfaces as the engine's own message, which `to_event_error`
+    // maps to a storage failure. Writing into a session that was deleted underneath the caller is
+    // a caller error, and the two must not reach a frontend looking the same (storage.md §1).
+    let fixture = Fixture::new().await;
+    let gone = SessionId::new();
+
+    let error = fixture
+        .store
+        .append_item(message(gone, "nobody will read this", None))
+        .await
+        .expect_err("there is no such session");
+    assert_eq!(error, StoreError::SessionNotFound(gone));
+    assert_eq!(
+        error.to_event_error().code,
+        hatchery_protocol::ErrorCode::SessionNotFound,
+        "so a frontend can tell this apart from a broken disk"
+    );
+
+    assert_eq!(
+        fixture
+            .store
+            .append_items(vec![message(gone, "one", None), message(gone, "two", None)])
+            .await
+            .expect_err("a batch is refused the same way"),
+        StoreError::SessionNotFound(gone)
+    );
+}
+
+#[tokio::test]
+async fn a_batch_spanning_two_sessions_is_refused() {
+    // The head advance names the *last* item's session, so a mixed batch would write into two
+    // sessions and advance only one head: the other's items would be unreachable from any head,
+    // and no foreign key can see it (`sessions.active_head` proves the item exists, not that it
+    // belongs to the session being advanced).
+    let (fixture, session) = Fixture::with_session().await;
+    let other = fixture.new_session().await;
+
+    let error = fixture
+        .store
+        .append_items(vec![
+            message(session.id, "here", None),
+            message(other.id, "there", None),
+        ])
+        .await
+        .expect_err("one batch, one session");
+    assert!(
+        matches!(error, StoreError::Invalid(_)),
+        "a mixed batch is the caller's mistake: {error}"
+    );
+
+    // The refusal happens before the transaction opens, so neither session gained anything.
+    assert!(
+        fixture
+            .store
+            .rebuild_chain(session.id, None)
+            .await
+            .expect("chain")
+            .is_empty()
+    );
+    assert!(
+        fixture
+            .store
+            .rebuild_chain(other.id, None)
+            .await
+            .expect("chain")
+            .is_empty()
+    );
+}
+
+#[tokio::test]
 async fn rebuilding_a_chain_many_items_long_keeps_the_order() {
     // 300 items crosses the payload-lookup chunk boundary, so the chunking is exercised rather
     // than assumed.
@@ -422,6 +494,43 @@ async fn reading_an_item_refuses_a_foreign_session() {
         fixture.store.item(other.id, item.id).await,
         Err(StoreError::SessionMismatch { .. })
     ));
+}
+
+#[tokio::test]
+async fn branch_operations_refuse_an_item_from_another_session() {
+    let (fixture, session) = Fixture::with_session().await;
+    let other = fixture.new_session().await;
+    let foreign = say(&fixture.store, &other, "elsewhere", None).await;
+
+    assert!(matches!(
+        fixture.store.switch_branch(session.id, foreign.id).await,
+        Err(StoreError::SessionMismatch { .. })
+    ));
+    assert!(matches!(
+        fixture.store.delete_branch(session.id, foreign.id).await,
+        Err(StoreError::SessionMismatch { .. })
+    ));
+
+    // A refusal that quietly did something else would be worse than no check at all.
+    assert_eq!(
+        fixture
+            .store
+            .item(other.id, foreign.id)
+            .await
+            .expect("item"),
+        foreign,
+        "the foreign item is untouched"
+    );
+    assert!(
+        fixture
+            .store
+            .session(session.id)
+            .await
+            .expect("session")
+            .active_branch_head
+            .is_none(),
+        "and the head did not move"
+    );
 }
 
 // ----------------------------------------------------------------- branches
@@ -837,6 +946,32 @@ async fn a_failed_turn_keeps_its_stop_reason_empty() {
     assert!(matches!(row.get_value(1), Ok(turso::Value::Null)));
 }
 
+#[tokio::test]
+async fn a_turn_in_a_missing_session_says_the_session_is_missing() {
+    let fixture = Fixture::new().await;
+    let gone = SessionId::new();
+    let turn = TurnId::new();
+
+    assert_eq!(
+        fixture
+            .store
+            .start_turn(gone, turn, Timestamp::now())
+            .await
+            .expect_err("there is no such session"),
+        StoreError::SessionNotFound(gone),
+        "not the foreign key's message, which would read as a broken store"
+    );
+    assert_eq!(
+        fixture
+            .store
+            .finish_turn(gone, turn, None)
+            .await
+            .expect_err("there is no such session"),
+        StoreError::SessionNotFound(gone),
+        "and finishing names the session, not a turn that was never started"
+    );
+}
+
 // ------------------------------------------------------------------ exports
 
 #[tokio::test]
@@ -916,6 +1051,44 @@ async fn export_all_branches_names_every_tip() {
     let mut expected = vec![second.id.to_string(), forked.id.to_string()];
     expected.sort();
     assert_eq!(branches, expected, "the shared ancestor names both tips");
+
+    let order: Vec<String> = parsed
+        .iter()
+        .map(|line| line["item"]["id"].as_str().expect("an id").to_owned())
+        .collect();
+    assert_eq!(
+        order,
+        vec![
+            first.id.to_string(),
+            second.id.to_string(),
+            forked.id.to_string()
+        ],
+        "oldest first: an audit file's line order must not depend on the tree's shape"
+    );
+}
+
+#[tokio::test]
+async fn exporting_an_empty_session_writes_an_empty_file() {
+    // "Nothing has happened yet" is a legitimate thing to be asked for: an audit export of a
+    // fresh session must produce an empty artifact rather than an error the caller has to
+    // special-case, and rather than a placeholder line a reader would have to recognise.
+    let (fixture, session) = Fixture::with_session().await;
+    let dir = tempfile::tempdir().expect("a tempdir");
+
+    for all_branches in [false, true] {
+        let path = dir.path().join(format!("empty-{all_branches}.jsonl"));
+        let lines = fixture
+            .store
+            .export_jsonl(session.id, path.clone(), all_branches)
+            .await
+            .expect("export");
+        assert_eq!(lines, 0, "nothing to write");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("the file was created"),
+            "",
+            "and it is empty"
+        );
+    }
 }
 
 // --------------------------------------------------------------- durability
@@ -999,6 +1172,32 @@ async fn a_database_from_a_newer_build_is_refused() {
     assert!(
         matches!(error, StoreError::Migration { version: 99, .. }),
         "the refusal must name the version it saw: {error}"
+    );
+}
+
+#[tokio::test]
+async fn a_database_whose_version_record_was_deleted_is_refused() {
+    // `PRAGMA user_version` and `schema_meta.schema_version` are two records of one fact, so a
+    // database carrying only one has been touched by something that does not respect migrations.
+    // Guessing which record is right means possibly running migrations against a schema that is
+    // already there, so the store refuses to open (storage.md §6).
+    let fixture = Fixture::new().await;
+    fixture.store.shutdown().await.expect("shutdown");
+
+    let conn = open_directly(&fixture.path).await;
+    conn.execute("DELETE FROM schema_meta WHERE key = 'schema_version'", ())
+        .await
+        .expect("remove our own record behind the store's back");
+    drop(conn);
+
+    let error = match TursoStore::open(&fixture.path).await {
+        Ok(_) => panic!("a half-recorded schema must be refused, not opened"),
+        Err(error) => error,
+    };
+    let latest = hatchery_store::latest_version();
+    assert!(
+        matches!(error, StoreError::Migration { version, .. } if version == latest),
+        "the refusal must name the version the engine's counter still reports: {error}"
     );
 }
 

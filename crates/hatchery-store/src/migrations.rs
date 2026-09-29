@@ -108,10 +108,14 @@ pub async fn migrate(conn: &Connection) -> Result<u32, StoreError> {
             version: recorded,
             message: format!("user_version says {recorded} but schema_meta says {meta}"),
         }),
-        None if recorded == 0 => Ok(0),
+        // No exception for `recorded == 0`: `MIGRATIONS` starts at version 1 (pinned by
+        // `the_migration_list_is_ordered_and_starts_at_one`), so a database that reached this
+        // point has run one and written both records. A missing row means something removed it
+        // behind our back, and opening anyway would be opening a database with no schema and
+        // reporting that as success.
         None => Err(StoreError::Migration {
             version: recorded,
-            message: "user_version is set but schema_meta has no schema_version".to_owned(),
+            message: format!("schema_meta has no schema_version (user_version is {recorded})"),
         }),
     }
 }

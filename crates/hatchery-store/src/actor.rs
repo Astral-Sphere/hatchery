@@ -521,6 +521,20 @@ impl Writer {
         if items.is_empty() {
             return Ok(());
         }
+        let first = items.first().expect("checked not empty");
+        let session = first.session;
+        // One batch, one session. The head advance below names the *last* item's session, so a
+        // mixed batch would insert into two sessions and advance only one of them, leaving the
+        // other's items unreachable from any head. `sessions.active_head`'s foreign key cannot
+        // catch that: it proves the item exists, not that it belongs to the session being
+        // advanced — the same gap `insert_item` closes for a cross-session parent.
+        if items.iter().any(|item| item.session != session) {
+            return Err(StoreError::Invalid(
+                "a batch of items must belong to one session".to_owned(),
+            ));
+        }
+        self.session_exists(session).await?;
+
         let tx = self
             .conn
             .unchecked_transaction()
@@ -802,6 +816,9 @@ impl Writer {
         turn: TurnId,
         at: Timestamp,
     ) -> Result<(), StoreError> {
+        // Checked rather than left to the foreign key: "that session is gone" is a caller error on
+        // the wire and "the engine refused the insert" is a storage failure (see `session_exists`).
+        self.session_exists(session).await?;
         self.conn
             .execute(
                 "INSERT INTO turns (id, session_id, started_at) VALUES (?1, ?2, ?3)",
@@ -818,6 +835,10 @@ impl Writer {
         turn: TurnId,
         completion: Option<hatchery_protocol::TurnCompletion>,
     ) -> Result<(), StoreError> {
+        // A session deleted under a running turn takes its `turns` rows with it, and the update
+        // below would then match nothing: reporting `UnknownTurn` would tell the daemon it never
+        // started a turn it did start. Say which thing is actually missing.
+        self.session_exists(session).await?;
         let (reason, usage) = match &completion {
             Some(completion) => (
                 Some(completion.reason.to_string()),
@@ -916,6 +937,30 @@ impl Writer {
         Ok(found)
     }
 
+    /// Refuses a write whose session does not exist.
+    ///
+    /// The alternative is to let the foreign key refuse it and hand the caller the engine's
+    /// message: `docs/design/storage.md` §1 maps "no such session" to a caller error and "the
+    /// engine refused" to a storage failure, and those reach a frontend as different error codes.
+    /// Asking first costs one indexed read on a path that is about to write anyway.
+    async fn session_exists(&self, session: SessionId) -> Result<(), StoreError> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT id FROM sessions WHERE id = ?1",
+                [session.to_string()],
+            )
+            .await
+            .map_err(StoreError::database)?;
+        let found = rows.next().await.map_err(StoreError::database)?.is_some();
+        sql::drain(rows).await?;
+        if found {
+            Ok(())
+        } else {
+            Err(StoreError::SessionNotFound(session))
+        }
+    }
+
     async fn count(&self, session: SessionId, table: &str) -> Result<i64, StoreError> {
         let sql = format!("SELECT count(*) FROM {table} WHERE session_id = ?1");
         let mut rows = self
@@ -963,7 +1008,7 @@ fn reply_send<T>(reply: Reply<T>, value: Result<T, StoreError>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hatchery_protocol::{ItemIdRange, ItemKindTag};
+    use hatchery_protocol::ItemKindTag;
 
     #[test]
     fn cursors_round_trip() {
@@ -986,10 +1031,9 @@ mod tests {
     }
 
     #[test]
-    fn item_id_ranges_are_not_confused_with_paging() {
-        // The JSONL export and compaction both carry `ItemIdRange`; a cursor must never be one.
-        let range = ItemIdRange::new(ItemId::new(), ItemId::new());
-        assert!(range.contains(range.first));
+    fn the_spellings_written_into_sql_are_pinned() {
+        // `items.kind` and `sessions.status` are matched against literals in SQL, so a rename in
+        // the protocol would surface as an empty result set rather than as a compile error.
         assert_eq!(ItemKindTag::UserMessage.as_str(), "user_message");
         assert_eq!(
             status_text(sql::parse_status("idle").expect("known")),
