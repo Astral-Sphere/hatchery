@@ -1,0 +1,25 @@
+{
+  "generation": 3,
+  "session": "01890f47-0000-7000-8000-000000000001",
+  "state": {
+    "active_branch_head": "01890f47-0000-7000-8000-000000000003",
+    "config_patch": {
+      "ui": {
+        "show_reasoning": true
+      }
+    },
+    "created_at": 1780000000000,
+    "generation": 3,
+    "id": "01890f47-0000-7000-8000-000000000001",
+    "mode": "code",
+    "model": {
+      "model": "deepseek-reasoner",
+      "provider": "deepseek"
+    },
+    "status": "waiting_approval",
+    "title": "refactor the store",
+    "updated_at": 1780000000000,
+    "workspace": "/home/dev/project"
+  },
+  "type": "session_updated"
+}

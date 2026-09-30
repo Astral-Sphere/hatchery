@@ -1,0 +1,9 @@
+[alias]
+xtask = "run --package xtask --"
+
+# Build for the machine that runs the build (project preference, 2026-09-28). Two consequences
+# worth knowing before changing this: the artifacts are not portable to other CPUs, so release
+# packaging must override it; and cross-compiling out of this workspace needs `RUSTFLAGS=""`, since
+# the environment variable overrides this table rather than adding to it.
+[build]
+# rustflags = ["-C", "target-cpu=native"]

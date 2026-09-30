@@ -1,33 +1,83 @@
 # 工作记录：总体架构 / 跨方向协调
 
-- 范围：crate 分层纪律、核心不变量、进程模型、跨方向决策协调
+- 范围：crate 分层纪律、核心不变量、进程模型、跨方向决策协调、workspace 与 CI 基建
 - 设计文档：[../architecture.md](../architecture.md)、[../references.md](../references.md)
 - 相关 ADR：全部
 
 ## 当前状态
 
-**设计定稿（2026-09-28），零代码**。仓库现状：README、LICENSE、.gitignore、references/（四款参考项目源码，只读参考，不参与构建）、本文档体系。
+**M0b 完成（2026-09-28），评审后的两轮修复已入库（2026-09-29 / 2026-09-30）**：`hatchery-protocol`/`hatchery-kernel`/`hatchery-store` 三个 crate 实现落地，`hatchery-testkit` 交付 M0b 子集；M0b 代码经一轮按 crate 分块的评审后，契约缺口、测试可信度问题与可修的实现缺陷都已修完（细节见下面 2026-09-30 那条变更日志与各 crate 的 worklog）。本地 `./scripts/ci.sh` 全绿；三平台 CI 上一轮已跑通（M0a 收尾），M0b 及其后的代码尚未 push。**M0 里程碑达成**（roadmap.md 的 M0 DoD：门禁三平台绿 + store 的 kill -9 崩溃恢复测试通过 + 三个 spike 结论落档）。
+
+仓库现状：`crates/`（11 crate，其中 3 个已实现）+ `xtask/` + `scripts/ci.sh` + `.github/workflows/{pr,nightly}.yml` + `docs/`。
 
 ## 待办
 
-- [ ] (M0) Cargo workspace 脚手架：12 crate 空壳（含 dev-only `hatchery-testkit`）+ workspace Cargo.toml（共享依赖版本）+ rust-toolchain.toml
-- [ ] (M0) CI：PR 门禁全套（design/testing.md §8：fmt + clippy -D warnings + nextest 默认组 + doctests + fixture 确定性）+ nightly 占位；`disallowed_methods` lint 配置（不变量 4 的强制）
-- [ ] (M0) xtask：i18n-extract、录制回放 fixture 工具的骨架
-- [ ] (M0) 三个 spike 并按结论更新对应文档：libSQL、git CLI vs git2、gettext vs fluent
-- [ ] (M0) 顶层 README 扩写：项目定位、快速开始占位、文档链接
+- [x] (M0) Cargo workspace 脚手架：12 member（11 crate + `xtask`）+ workspace Cargo.toml（共享依赖版本与 lints）+ rust-toolchain.toml
+- [x] (M0) CI：PR 门禁全套（`scripts/ci.sh`：toolchain/fmt/clippy `-D warnings`/build/nextest ci 组/doctests/fixture 确定性/i18n 占位）+ nightly（slow/gui/audit/coverage）+ `disallowed_methods` lint 配置
+- [x] (M0) xtask：`layering`（分层契约，含集成测试）、`coverage`；`i18n-extract` 与 `record-fixtures` 是 fail-loud 占位
+- [x] (M0) 三个 spike：存储引擎（→ ADR-0010 turso）、影子 Git 后端（→ **ADR-0012 git2 vendored**；第一轮曾选 CLI，用户裁决后改 git2 并重测）、i18n gettext vs fluent（→ ADR-0011 fluent）
+- [x] (M0) MSRV 实测：`rust-version = "1.90"`（1.85/1.88 均失败，1.90.0 编译通过）
+- [x] (M0) CI 工具链改为**源码编译**（`cargo install cargo-nextest --version 0.9.146 --locked`，三平台一致；nightly 的 audit/llvm-cov 同）——用户裁决，避免预构建二进制在 MSYS2 下的不确定性
+- [x] (M0) 编译 flags：`.cargo/config.toml` 加 `[build] rustflags = ["-C", "target-cpu=native"]`（用户偏好；已实测进入 rustc 调用）。**纪律**：发布产物与交叉编译必须覆盖（`RUSTFLAGS=""`），否则二进制不可跨 CPU 移植
+- [x] (M0) 三平台 CI 跑通（第 1 次失败于 windows 的 `rustup-init --component` 参数 arity，已在 5b953fb 修复并补 windows-gnu 的 ABI 断言；细节见 worklog/testing.md「实测记录 · CI 首跑」）
+- [x] (M0) 顶层 README 扩写：项目定位、快速开始、文档链接、MSYS2 ucrt64 环境清单、仓库布局；docs/README.md 加「代码布局」节
+- [x] (M0b) 分层修正：protocol 沉为唯一最底层，kernel 升 L1（见下「M0b 修正」）
+- [x] (M0b) protocol/kernel/store 三个 crate 实现 + testkit M0b 子集 + 各自的测试套件
 - [ ] (M1) 建立 docs/glossary.md 术语表
+- [ ] (M1) MSRV CI job（`cargo +1.90.0 check`）加进 nightly，防止依赖升级悄悄抬高 MSRV
+- [ ] (M1) `hatchery-tests` 成员 crate（跨 crate e2e 与不变量套件的家；虚拟 manifest 不能有顶层 `tests/`，见 design/testing.md §1）
 
 ## 开放问题
 
-1. crate 命名前缀最终确认（`hatchery-*`）与是否发布到 crates.io（发布则 protocol crate 是公共 API，语义化版本纪律从 M0 开始）。
-2. MSRV 策略：跟 gtk4-rs/libadwaita 的 MSRV 走（它们通常最激进），M0 脚手架时定。
-3. references/ 目录体积较大且是第三方源码——确认 license 合规性（各项目均为 MIT/Apache-2.0 系，收录为学习参考应无碍，但发布仓库时考虑用 submodule 或移除，只留 references.md 结论）。
+1. ~~crate 命名前缀与是否发布到 crates.io~~ → **已定（2026-09-28）**：前缀 `hatchery-*`；**按可发布标准写全元数据**（`license = "GPL-3.0-only"`、repository、description、readme、keywords、categories、`rust-version`），但 **M0 不 publish**；`hatchery-testkit` 与 `xtask` 标 `publish = false`。protocol crate 从第一天走 semver 纪律 + `PROTOCOL_VERSION` 常量（M0b 落地）。注意 LICENSE 是 **GPL-3.0**，将来发布 library crate 会让下游必须接受 GPL，届时需重新确认。
+2. ~~MSRV 策略~~ → **已定并实测（2026-09-28）**：`rust-toolchain.toml` 用 `channel = "stable"`（浮动），`rust-version = "1.90"`。实测：1.85.1 失败（turso 的 `icu_*`/`aristo`/`home` 要求 1.88）、1.88.0 失败（`roaring 0.11.5` 要求 1.90.0）、**1.90.0 通过** `cargo check --workspace --all-targets`。GTK 生态（M4 才引入）可能再抬高下限，届时以实测为准。
+3. ~~references/ 目录的 license 与体积~~ → **已由用户自行解决**：`.gitignore` 里的 `/references` 使其不入库，只保留 `references.md` 的分析结论。
 
 ## 变更日志
 
-### 2026-09-28
+### 2026-09-30 · M0b 评审后的两轮修复
+
+M0b 的三个 crate 按范围分块评审了一遍（protocol 源码 / protocol 测试 / kernel 源码 / kernel 测试与 testkit / store 源码 / store 测试 / 跨 crate 一致性），约 50 条发现逐条对着代码复核后分成四组：① 协议健壮性，② 行为与契约缺陷，③ 测试可信度，④ 打磨与前瞻。用户裁决「②③ 全修，④ 留到 M1」（2026-09-29 落地），随后又裁决「④ 里能修的都修掉」（2026-09-30 落地，本条）。crate 内的细节在各自的 worklog，这里只记跨方向的部分。
+
+**四个跨 crate 的决策**
+
+1. **接缝枚举不加 `#[non_exhaustive]`**（`KernelEvent`/`AgentCommand`/`StreamEvent`/`TurnCompletion`/`TurnState`）。消费方全部在本 workspace 内，穷尽匹配正是「加一个变体时编译器替你找齐所有消费方」的机制；加上它只会逼出 `_ =>`，把新变体藏起来。wire 层的开放性由 protocol 承担，而且规则更强：枚举值在 major 内冻结、未知值一律硬失败（design/protocol.md §6）。反方理由是「第三方前端会 match 我们的类型」，但按同一条冻结规则，加变体本身就是 major bump，`#[non_exhaustive]` 换不来在 minor 里加变体的自由。
+2. **LLM 接缝改借用**：`chat_stream(&ChatOptions, &[Message])`（原为按值）。adapter 在发起请求时就地把两者序列化进 body，返回的流仍是 `'static`，所以按值传只是让长会话每轮多拷一份全量上下文。**在 M1 写 adapter 之前定案比之后改便宜**——这是本轮唯一一处主动改动公开签名。
+3. **显式 `"id": null` 一律拒绝**（`FrameError::NullId`），与「字段缺失 = 通知」严格区分（worklog/protocol.md）。
+4. **`ItemIdRange` 不提供成员判定**：span 是位置语义，只有持有链的一方能解析（worklog/protocol.md）。解析函数留到 M5 与它的第一个消费者一起落地，避免又造一个没有调用方的 API。
+
+**分层契约**：`cargo xtask layering` 现在检查全部三种依赖（normal / build / dev）。构建图 = normal + build，要求无环且严格向下；dev 边也必须向下，只有指向 Dev 层 crate 的例外（kernel 的 dev-dependency 指向 testkit，而 testkit 正常依赖 kernel，这条边不参与环检测）。
+
+**文档计数纪律（用户裁决）**：README、roadmap 与设计文档不再写测试数与 fixture 数——这轮修复本身就是证据：同一个 M0b 在四处写着 219 / 198 / 197 三个互不相同的数。数字只留在 worklog 的日期化条目里；覆盖率改由测试自己机器检查（protocol 的 fixture 覆盖率有三条测试兜着，见 design/protocol.md §6）。
+
+**门禁（本轮实测）**：`cargo nextest list --workspace` 默认组共 258 项、全绿——protocol 109、kernel 46、store 73、testkit 5、capabilities 11、xtask 13、cli 1；另有 1 项 `#[ignore]`（崩溃测试重入的子进程入口），invariants 组 4 项，doctest 7 个。`./scripts/ci.sh` 全绿，`cargo xtask layering` 报 12 members、22 build edges + 8 dev edges，严格向下无环。三平台 CI 仍未看到 M0b 之后的代码（push 由用户执行）。
+
+### 2026-09-28 · M0b（分层修正 + 三个 crate 落地）
+
+**M0b 修正：把 protocol 沉为唯一最底层。** M0a 把 `hatchery-protocol` 与 `hatchery-kernel` 并列在 L0，layering 契约禁止同层横向依赖（`from_layer <= to_layer` 即违规）。但 protocol 的数据模型必须引用 `ToolOutput`/`ApprovalRequest`/`Content`/`Usage`——这些值既要进 wire、又被 kernel 与 capabilities 共用。两个选择：镜像约 10 个类型 + 在 daemon 里加一层翻译，或者让 protocol 成为共享词汇表。选后者：
+
+- protocol = L0（共享词汇表 + wire 契约）；kernel = L1；llm/store/capabilities = L2；tools/acp = L3；daemon = L4；cli/gui = frontend。
+- 连带改动：`xtask::layering::LAYERS`、`Layer` 枚举 + `L4`、8 个 crate 的 lib.rs 层号注释、architecture.md §3 的分层图与纪律条目。
+- **ADR-0004 的「kernel 不得依赖 capabilities」不受影响**：那条边向上，仍然禁止。这条纪律的措辞也从「L0 反过来依赖 L1」改为「kernel 反过来依赖上层」。
+- 没有新增 ADR：层号是 architecture.md 内部的表述，推翻记录留在本文件（依约定，ADR 才需要 supersede 链）。
+- 用户四项裁决同时落定：① protocol 沉底（本条）；② store 只出有序 `Vec<Item>`（storage.md §4）；③ 审批由 kernel 发起、daemon 应答（kernel.md §7 / capabilities.md §1）；④ 崩溃测试用测试二进制自重入（testing.md 开放问题 1）。
+
+**三个 crate 的实现**（各自的 worklog 有细节）：protocol 93 测试 + 62 golden fixture；kernel 40 测试；store 64 测试（含属性测试与 kill -9）。`cargo xtask layering` 报 12 members / 22 edges，严格向下。
+
+### 2026-09-28 · M0a
 - 项目启动设计：深读四款参考项目（分析结论存 ../references.md），与用户对齐 8 项关键决策（ADR-0001~0008），产出 architecture/roadmap + 9 份方向设计文档 + 本 worklog 体系。
 - 用户明确的核心差异化诉求：完整 ACP（含 fs/terminal 委派，atomcode 的反面教材）、reasoning_content 可配置回传、历史可编辑（分叉+删除）、提示词透明、CLI+GTK 双前端。
-- 下一步：单独对 M0 做细化规划（用户明确要求先停下来对齐）。
-- 补充测试体系设计（用户要求「详尽的测试，确保所有代码都能如期运行」）：新增 design/testing.md + worklog/testing.md；crate 清单加入 dev-only 的 `hatchery-testkit`（12 个）；architecture.md 不变量节与 roadmap DoD 挂接测试文档。
-- dsh/Cordis 模块化二次深读（用户问「能否采纳其激进模块化」，探索代理做了 vendor/cordis 代码级分析）：结论 = 运行时机制不移植（Proxy ctx/字符串键字典/`!!js` eval/HMR，postmortem 0001/0002 事故实证），吸收五条语言无关纪律 → **ADR-0009**；architecture.md §3 分层纪律 +3 条（disposer 逆序/反预拆分/fail-loud 装配）；第三方扩展面定为 MCP + ACP，WASM 工具插件列 M5 评估占位；证据细节补进 references.md dsh 节。
+- 补充测试体系设计（用户要求「详尽的测试，确保所有代码都能如期运行」）：新增 design/testing.md + worklog/testing.md；crate 清单加入 dev-only 的 `hatchery-testkit`；architecture.md 不变量节与 roadmap DoD 挂接测试文档。
+- dsh/Cordis 模块化二次深读 → **ADR-0009**（吸收五条语言无关纪律，拒绝运行时机制）；第三方扩展面 = MCP + ACP，WASM 工具插件列 M5 评估占位。
+- **M0 细化规划**（用户四轮裁决）：M0 拆 M0a/M0b；CI 用 bash 编排（`scripts/ci.sh` 本地=CI 同一条命令）+ xtask 只做专属检查；PR 与 main 都跑三平台，Windows 走 **MSYS2 ucrt64 + windows-gnu**；ItemId = **UUIDv7**；三平台跑全量 default 组 + 强缓存；dev 分支分阶段 commit 不 push。
+- **M0a 执行**（6 个 commit）：脚手架 + 门禁 + CI；存储引擎 spike → **ADR-0010**；影子 Git spike → 定 CLI；i18n spike → **ADR-0011**；MSRV 实测 1.90；文档同步。
+- M0a 修正的两处设计矛盾（都是脚手架一落地就暴露的）：
+  - **「12 个 crate」与 architecture.md §3 只列 11 个不符** → 定为 **11 crate（10 产品 + testkit）+ xtask = 12 member**；配置/提示词代码落 daemon（前端经协议访问，无第二个消费者 → 按 ADR-0009 反预拆分不新建 `hatchery-platform`/`hatchery-prompts` crate）。
+  - **kernel(L0) 与 capabilities(L1) 依赖环**：原设计里 kernel 的 `ToolCtx` 直接引用 capabilities 的 `FsBackend`/`TerminalBackend` → 改为 kernel 只暴露窄接口 **`ToolHost`**（snapshot/approval_for/invoke），`Tool`/`ToolCtx`/三个 backend trait 全部归 capabilities；`ToolDef`/`ToolOutput`/`ToolProgress`/`ApprovalRequest` 留 kernel（组装 LLM 请求与投影事件要用）。`cargo xtask layering` 的 LAYERS 表把这条规则变成机器检查。
+- 术语统一：wire 类型 `Thread` → **`Session`**（与方法名 `session/*`、表名 `sessions` 一致），避免一物两名。
+- **用户三项裁决后的第二轮**（M0a 收尾）：
+  - 影子 Git 后端从 CLI git 改为 **git2（vendored libgit2）** → 新增 **ADR-0012**，理由是可用性（很多用户机器没有 git）；11 项门槛在 git2 上重测全绿，热路径反而快约 2 倍。同时更正第一轮的错误记录「git2 需要 cmake」（实测 libgit2-sys 用 `cc`，不用 cmake）——教训写进 design/testing.md §0.2：**自己写下的结论也要复核**。
+  - CI 工具链一律 `cargo install --locked` 源码编译（pr.yml 三平台 + nightly 的 audit/llvm-cov），不再下载预构建二进制。
+  - `.cargo/config.toml` 加 `-C target-cpu=native`（实测已进入 rustc 调用）；连带纪律：发布产物与交叉编译必须用 `RUSTFLAGS=""` 覆盖，README 与 docs/README.md 都写明了。
+  - 运行时依赖变化：不再需要用户装 git；构建期改为需要一个 C 编译器。README、worklog/daemon.md（删掉 `git --version` 审计项）、worklog/platform.md（构建代价对照行）已同步。
+- **CI 第 1 次实跑（用户 push 后）失败并修正**：windows job 的 `rustup-init --component rustfmt clippy` 不是合法参数（实测 1.29.1：该选项只接受单个逗号分隔值，且 `--default-toolchain none` 时组件被静默忽略）。改成 `rustup set default-host` + `rustup toolchain install "$channel-$host" --component rustfmt,clippy` + 「active toolchain 必须是 windows-gnu」的断言——顺带堵掉两个同源隐患：热缓存下 `command -v rustup` 命中镜像自带的 msvc rustup 会跳过安装、并让 job 悄悄按 MSVC 编译（与 ADR-0012 的平台决策相反）。README 里给开发者的同一条命令也改了。验证与教训：worklog/testing.md「实测记录 · CI 首跑」。

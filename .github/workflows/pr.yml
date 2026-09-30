@@ -1,0 +1,208 @@
+name: PR
+
+# Three platforms on every pull request and on main (project decision, 2026-09-28).
+# Windows builds the x86_64-pc-windows-gnu toolchain inside MSYS2 UCRT64 rather than MSVC.
+#
+# The gate sequence lives in scripts/ci.sh so that "green locally" and "green in CI" are the
+# same statement; this file only prepares the toolchain.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: pr-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+  # Snapshot mismatches must fail the run instead of rewriting committed goldens.
+  INSTA_UPDATE: "no"
+  # Pinned to the version developers install locally (docs/design/testing.md §1).
+  NEXTEST_VERSION: 0.9.146
+  # Measured on this workspace: the gate's target dir is 3.0 GiB with the default debug info,
+  # 2.0 GiB with line tables only, and the build is ~11% faster — while a panic backtrace in the
+  # log keeps its file:line either way (`debug = 0` is what loses it). Cache size is not
+  # cosmetic: the repository cache quota is shared, and going over it evicts by last-access date.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  # Compiler flags come from .cargo/config.toml (`-C target-cpu=native`) so that CI and a
+  # developer's machine build the same way. Do not duplicate them here: RUSTFLAGS in the
+  # environment would override the config file instead of adding to it.
+
+jobs:
+  unix:
+    name: gate (${{ matrix.platform }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux
+            os: ubuntu-latest
+          - platform: macos
+            os: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # No toolchain action on purpose: rust-toolchain.toml names the channel and components, and
+      # the runner's preinstalled rustup installs them on the first cargo invocation.
+      - name: Cache cargo and target
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: gate-${{ matrix.platform }}
+          # This is the invalidation switch. Without it the key is only
+          # `v0-rust-<shared-key>-<OS>-<arch>` — Cargo.lock, the manifests and the rustc version
+          # are *not* in it (verified in the action's src/config.ts, where the whole hashing block
+          # is gated behind this input). With it, every workspace member's Cargo.toml (package
+          # version and path-dependency fields normalized, so a release bump alone does not churn),
+          # Cargo.lock's external packages, rust-toolchain.toml, .cargo/config.toml and the
+          # CARGO_*/RUST*/CC_*/CFLAGS_* environment are hashed into the key: change a dependency
+          # and the cache is gone rather than being half-reused and re-resolved by cargo.
+          # A key change still restores the previous entry by prefix and pre-cleans `target`, so
+          # this is invalidation, not a cold-start cliff.
+          add-rust-environment-hash-key: "true"
+
+      # Built from source rather than downloaded as a prebuilt binary: one fewer supply-chain and
+      # one fewer platform-compatibility surface, and the same on all three runners. The cache
+      # above keeps ~/.cargo/bin, so this is a no-op on a warm run.
+      - name: Install cargo-nextest
+        run: |
+          if ! cargo nextest --version >/dev/null 2>&1; then
+            cargo install cargo-nextest --version "${NEXTEST_VERSION}" --locked --force
+          fi
+          cargo nextest --version
+
+      - name: Gate
+        run: |
+            cargo clean
+            bash scripts/ci.sh
+
+      - name: Upload test report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: junit-${{ matrix.platform }}
+          path: target/nextest/ci/junit.xml
+          if-no-files-found: warn
+
+  windows:
+    name: gate (windows-msys2-ucrt64)
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    env:
+      # Kept outside the MSYS2 home so the cache action can address them, and written with forward
+      # slashes because bash would eat backslashes. Native tools (rustup, cargo) accept these as
+      # Windows paths; bash-side file operations use the POSIX form below. rust-cache reads
+      # CARGO_HOME from this environment (its src/config.ts falls back to ~/.cargo only if unset).
+      RUSTUP_HOME: C:/msys64/rustup
+      CARGO_HOME: C:/msys64/cargo
+      CARGO_BIN_POSIX: /c/msys64/cargo/bin
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          # gcc is required: libgit2-sys compiles a vendored libgit2 with cc (no cmake involved,
+          # measured on Linux) and libz-sys does the same for zlib. pkg-config is needed by GTK4
+          # in M4. The storage engine (turso) and i18n (fluent) are pure Rust and need nothing.
+          pacboy: >-
+            gcc:p
+            pkg-config:p
+            make:p
+          # git for the determinism step in scripts/ci.sh, curl for the rustup installer.
+          install: >-
+            git
+            curl
+
+      # Deliberately before the cache step: rust-cache computes its key by asking rustc and
+      # `cargo metadata` what is installed, and it excludes any binary already present in
+      # CARGO_HOME/bin from the cache it writes (see its README "Known issues"). Installing rustup
+      # first therefore keeps the key meaningful; the cost is that rustup itself is re-downloaded
+      # each run (~15 MB) while the expensive nextest build, which appears only after the cache
+      # step, is still cached.
+
+      - name: Install rustup with the windows-gnu host
+        run: |
+          set -euo pipefail
+          # Project decision: windows-gnu inside MSYS2 UCRT64, never MSVC. The guard below may
+          # find the rustup that ships in the runner image, whose default host is msvc — so the
+          # host tuple is pinned instead of inherited.
+          host=x86_64-pc-windows-gnu
+          mkdir -p "$CARGO_BIN_POSIX"
+          export PATH="$CARGO_BIN_POSIX:$PATH"
+          if ! command -v rustup >/dev/null 2>&1; then
+            curl -sSfL https://sh.rustup.rs | sh -s -- -y --no-modify-path \
+              --default-host "$host" --default-toolchain none --profile minimal
+          fi
+          rustup set default-host "$host"
+          # The toolchain goes on in its own command, not as rustup-init arguments, for two
+          # measured reasons (rustup-init 1.29.1): `--component` takes a *single* comma-separated
+          # value, so `--component rustfmt clippy` aborts with "unexpected argument 'clippy'";
+          # and requested components are dropped with "ignoring requested components" when
+          # --default-toolchain is none. This command is also idempotent, which is what makes the
+          # step correct on every path: neither RUSTUP_HOME nor this rustup binary comes back from
+          # the cache below (rust-cache only keeps files that appeared after it ran), so the
+          # toolchain always gets installed by the run that needs it — and `stable` can never go
+          # stale against the unix jobs.
+          channel=$(sed -n 's/^channel[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' rust-toolchain.toml)
+          if [ -z "$channel" ]; then
+            printf 'cannot read the toolchain channel from rust-toolchain.toml\n' >&2
+            exit 1
+          fi
+          rustup toolchain install "$channel-$host" --profile minimal --component rustfmt,clippy
+          uname -a
+          # Fail loud rather than quietly compiling with the other ABI.
+          active=$(rustup show active-toolchain)
+          printf 'active toolchain: %s\n' "$active"
+          case "$active" in
+            *"$host"*) ;;
+            *) printf 'expected the active toolchain to target %s\n' "$host" >&2; exit 1 ;;
+          esac
+          rustc -vV
+          cargo --version
+          cargo fmt --version
+          cargo clippy --version
+
+      # Same action and same invalidation switch as the unix jobs, so all three platforms key,
+      # prune and reuse the cache identically. It also does two things the hand-rolled
+      # actions/cache block did not: it exports CARGO_INCREMENTAL=0 (incremental data is dead
+      # weight in a cache that is restored onto a different machine) and it strips non-dependency
+      # artifacts, unused dependencies and anything older than a week before saving.
+      - name: Cache cargo and target
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: gate-windows
+          add-rust-environment-hash-key: "true"
+
+      # Built from source with the same windows-gnu toolchain that builds the workspace: no
+      # MSVC-built binary has to run under MSYS2, and no release asset has to be trusted. This
+      # binary appears after the cache step, so it is part of the cache and a warm run skips the
+      # build.
+      - name: Install cargo-nextest
+        run: |
+          set -euo pipefail
+          export PATH="$CARGO_BIN_POSIX:$PATH"
+          if ! cargo nextest --version >/dev/null 2>&1; then
+            cargo install cargo-nextest --version "${NEXTEST_VERSION}" --locked --force
+          fi
+          cargo nextest --version
+
+      - name: Gate
+        run: |
+          set -euo pipefail
+          export PATH="$CARGO_BIN_POSIX:$PATH"
+          pwd
+          bash scripts/ci.sh
+
+      - name: Upload test report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: junit-windows-msys2-ucrt64
+          path: target/nextest/ci/junit.xml
+          if-no-files-found: warn

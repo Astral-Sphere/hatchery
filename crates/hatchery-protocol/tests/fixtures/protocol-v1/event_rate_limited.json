@@ -1,0 +1,6 @@
+{
+  "generation": 3,
+  "retry_after_ms": 12000,
+  "session": "01890f47-0000-7000-8000-000000000001",
+  "type": "rate_limited"
+}

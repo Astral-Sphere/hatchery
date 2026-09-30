@@ -1,0 +1,33 @@
+[package]
+name = "hatchery-llm"
+description = "LLM provider adapters built on openai-interface: Chat Completions and Responses wires, reasoning passback"
+keywords = ["llm", "openai", "reasoning", "streaming", "hatchery"]
+categories = ["api-bindings"]
+readme = "README.md"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+futures.workspace = true
+hatchery-kernel.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+hatchery-testkit.workspace = true
+
+[features]
+# Live tests hit a real provider and need credentials; they never run in CI (testing.md §8).
+live-tests = []
+
+[lints]
+workspace = true

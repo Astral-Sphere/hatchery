@@ -6,7 +6,7 @@
 
 ## 当前状态
 
-设计稿完成，未实现。
+设计稿完成，未实现（M1）。M0a 的两项决定落在这里：**配置加载与 prompt 装配的代码归属 daemon**（前端一律经 `config/get|set`、`prompt/render` 协议访问，没有第二个消费者 → 按 ADR-0009 反预拆分不新建 platform/prompts crate）；启动审计要多查一类东西——外部二进制。
 
 ## 待办
 
@@ -17,6 +17,8 @@
 - [ ] (M1) LiveHub v1：per-session broadcast、订阅管理、`session/load` replay（先不做增量 replay window）
 - [ ] (M1) 崩溃恢复：status=running → interrupted 标记
 - [ ] (M1) profile 化装配表 + 启动 fail-loud 审计（daemon.md §3.1，ADR-0009）+ 审计测试
+- [ ] (M1) 启动审计包含**外部依赖检查**：数据目录可写、UDS 目录存在、（Code 模式）检查点目录可创建；缺失即拒绝服务并列出清单。影子 Git 不再是外部依赖——ADR-0012 改用 vendored libgit2，不需要用户机器上有 git
+- [ ] (M1) 配置分层加载（platform.md §1）+ prompt 管线 v1（§2）落本 crate；坏 key 逐条忽略 + warning（platform.md 开放问题 2 的裁决）
 - [ ] (M1) disposer 逆序 teardown（订阅者→runtime→检查点→store→监听器）+ 逆序测试
 - [ ] (M2) hub coalescing（16ms 窗）+ replay window + 慢消费者踢出
 - [ ] (M2) 空闲卸载与 daemon 退出策略

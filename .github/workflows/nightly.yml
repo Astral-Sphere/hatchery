@@ -1,0 +1,87 @@
+name: nightly
+
+# Everything the PR gate must stay fast enough to skip (docs/design/testing.md §8): the slow and
+# GUI groups, coverage, dependency audit, and later fuzz / criterion / mutation runs.
+#
+# The `live` group never runs here: it needs real provider credentials and stays a manual,
+# self-hosted run (`cargo nextest run --profile live`).
+on:
+  schedule:
+    - cron: "37 2 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: nightly-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+  INSTA_UPDATE: "no"
+  NEXTEST_VERSION: 0.9.146
+  # Same as pr.yml: the gate runs here too, and a smaller target dir is what keeps the shared
+  # repository cache quota from being exhausted by one platform's artifacts.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+
+jobs:
+  nightly:
+    name: nightly (linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Cache cargo and target
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: gate-linux
+          # Same invalidation switch as pr.yml, so a run here and a gate run agree on what the key
+          # means (docs/design/testing.md §8).
+          add-rust-environment-hash-key: "true"
+
+      # Same policy as pr.yml: build the tools from source instead of downloading prebuilt
+      # binaries. Nightly has the time budget for it, and the cache above keeps ~/.cargo/bin.
+      - name: Install tools
+        run: |
+          set -euo pipefail
+          if ! cargo nextest --version >/dev/null 2>&1; then
+            cargo install cargo-nextest --version "${NEXTEST_VERSION}" --locked
+          fi
+          if ! cargo audit --version >/dev/null 2>&1; then
+            cargo install cargo-audit --locked
+          fi
+          if ! cargo llvm-cov --version >/dev/null 2>&1; then
+            cargo install cargo-llvm-cov --locked
+          fi
+          cargo nextest --version
+
+      # Run the PR gate first so a nightly-only failure is unambiguously attributable to the
+      # extra groups below.
+      - name: PR gate
+        run: bash scripts/ci.sh
+
+      # --no-tests=warn: an empty group is expected early in a milestone and must not fail the
+      # run, but it should stay visible in the log.
+      - name: Slow group
+        run: cargo nextest run --workspace --profile slow --no-tests=warn
+
+      - name: GUI group
+        run: cargo nextest run --workspace --profile gui --no-tests=warn
+
+      - name: Dependency audit
+        run: cargo audit
+
+      - name: Coverage report
+        run: cargo xtask coverage
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage
+          path: target/llvm-cov/html
+          if-no-files-found: warn
+
+      # TODO(M1): cargo-fuzz short runs, 10min per target (docs/design/testing.md §6)
+      # TODO(M2+): criterion baseline comparison, flag >20% regressions (§7)
+      # TODO(M2+): cargo-mutants limited to hatchery-store and hatchery-kernel (§8)
+      # TODO(M4): run the gui group inside a GNOME SDK container with xvfb-run (§3.9)

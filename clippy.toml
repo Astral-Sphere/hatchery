@@ -1,0 +1,35 @@
+# Invariant 4 (docs/architecture.md §5): tool implementations reach the outside world only
+# through the capability seam (ADR-0004).
+#
+# Scope: these lists apply to every crate, but the lints are `allow`ed in the workspace
+# `[lints]` table and denied by a crate attribute in `hatchery-tools` only. daemon, store,
+# capabilities and xtask touch the OS legitimately, and hatchery-acp spawns external agent
+# processes (docs/design/acp.md §2).
+disallowed-methods = [
+    { path = "std::fs::read", reason = "use FsBackend::read (ADR-0004)" },
+    { path = "std::fs::read_to_string", reason = "use FsBackend::read (ADR-0004)" },
+    { path = "std::fs::read_dir", reason = "use FsBackend::read_dir (ADR-0004)" },
+    { path = "std::fs::write", reason = "use FsBackend::write (ADR-0004)" },
+    { path = "std::fs::copy", reason = "use FsBackend (ADR-0004)" },
+    { path = "std::fs::rename", reason = "use FsBackend (ADR-0004)" },
+    { path = "std::fs::remove_file", reason = "use FsBackend (ADR-0004)" },
+    { path = "std::fs::remove_dir_all", reason = "use FsBackend (ADR-0004)" },
+    { path = "std::fs::create_dir", reason = "use FsBackend (ADR-0004)" },
+    { path = "std::fs::create_dir_all", reason = "use FsBackend (ADR-0004)" },
+    { path = "std::fs::metadata", reason = "use FsBackend::metadata (ADR-0004)" },
+    { path = "std::fs::symlink_metadata", reason = "use FsBackend::metadata (ADR-0004)" },
+    { path = "std::fs::File::open", reason = "use FsBackend (ADR-0004)" },
+    { path = "std::fs::File::create", reason = "use FsBackend (ADR-0004)" },
+    { path = "std::fs::OpenOptions::open", reason = "use FsBackend (ADR-0004)" },
+    { path = "std::process::Command::new", reason = "use TerminalBackend (ADR-0004)" },
+    { path = "std::process::Command::output", reason = "use TerminalBackend (ADR-0004)" },
+    { path = "std::process::Command::status", reason = "use TerminalBackend (ADR-0004)" },
+    { path = "std::process::Command::spawn", reason = "use TerminalBackend (ADR-0004)" },
+    { path = "std::process::abort", reason = "a harness must not abort the daemon" },
+    { path = "std::env::set_var", reason = "unsound in edition 2024; tests use TempWorkspace" },
+]
+
+disallowed-types = [
+    { path = "std::process::Command", reason = "use TerminalBackend (ADR-0004)" },
+    { path = "std::fs::File", reason = "use FsBackend (ADR-0004)" },
+]

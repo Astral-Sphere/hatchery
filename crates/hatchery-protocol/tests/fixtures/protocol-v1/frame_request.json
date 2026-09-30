@@ -1,0 +1,10 @@
+{
+  "id": 7,
+  "jsonrpc": "2.0",
+  "method": "session/load",
+  "params": {
+    "generation": 3,
+    "replay_from": "01890f47-0000-7000-8000-000000000002",
+    "session_id": "01890f47-0000-7000-8000-000000000001"
+  }
+}

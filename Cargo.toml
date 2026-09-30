@@ -1,6 +1,64 @@
 [workspace]
 resolver = "3"
-edition = "2024"
-members = []
+members = ["crates/*", "xtask"]
 
-[dependencies]
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+# Measured, not copied from dependency metadata: `cargo +1.90.0 check --workspace --all-targets`
+# passes, 1.88 fails (roaring 0.11.5 needs 1.90) and 1.85 fails (turso's icu_*/aristo need 1.88).
+# Declaring it also makes resolver 3 pick MSRV-compatible dependency versions.
+rust-version = "1.90"
+license = "GPL-3.0-only"
+repository = "https://github.com/Astral-Sphere/hatchery"
+homepage = "https://github.com/Astral-Sphere/hatchery#readme"
+authors = ["Hatchery contributors"]
+
+[workspace.dependencies]
+hatchery-protocol = { path = "crates/hatchery-protocol", version = "0.0.0" }
+hatchery-kernel = { path = "crates/hatchery-kernel", version = "0.0.0" }
+hatchery-llm = { path = "crates/hatchery-llm", version = "0.0.0" }
+hatchery-store = { path = "crates/hatchery-store", version = "0.0.0" }
+hatchery-capabilities = { path = "crates/hatchery-capabilities", version = "0.0.0" }
+hatchery-tools = { path = "crates/hatchery-tools", version = "0.0.0" }
+hatchery-acp = { path = "crates/hatchery-acp", version = "0.0.0" }
+hatchery-daemon = { path = "crates/hatchery-daemon", version = "0.0.0" }
+hatchery-cli = { path = "crates/hatchery-cli", version = "0.0.0" }
+hatchery-gui = { path = "crates/hatchery-gui", version = "0.0.0" }
+hatchery-testkit = { path = "crates/hatchery-testkit", version = "0.0.0" }
+
+anyhow = "1.0.104"
+async-trait = "0.1.92"
+futures = "0.3.34"
+# Vendored libgit2 on purpose: shadow-git checkpoints must work on machines with no git binary
+# installed (ADR-0012). git2's default features are empty, so no https/ssh and no openssl.
+git2 = { version = "0.21.0", features = ["vendored-libgit2"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+thiserror = "2.0.21"
+tokio = { version = "1.53.1", features = ["macros", "rt", "rt-multi-thread", "sync", "time"] }
+tokio-util = "0.7.19"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+# Chosen by the M0 storage spike (ADR-0010). default-features off drops mimalloc (system
+# allocator is fine) and fts (tantivy is a heavy dependency we do not use). The engine's measured
+# behaviour is pinned by crates/hatchery-store/tests/spike_engine.rs — rerun it on any upgrade.
+turso = { version = "0.7.2", default-features = false }
+uuid = { version = "1.26.1", features = ["v7", "serde"] }
+
+proptest = "1.11.0"
+tempfile = "3.27.0"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+dbg_macro = "warn"
+todo = "warn"
+# clippy.toml's disallowed lists are workspace-wide, but only tool implementations must go
+# through the capability seam (invariant 4, ADR-0004). daemon, store, capabilities and xtask touch
+# the OS legitimately, and hatchery-acp spawns external agent processes, so the lint is allowed
+# here and denied by a crate attribute in hatchery-tools only.
+disallowed_methods = "allow"
+disallowed_types = "allow"

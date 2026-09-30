@@ -54,15 +54,22 @@ sections（有序）:
 ### 2.2 存放
 
 ```
-仓库:   crates/hatchery-prompts/…（或直接各 crate 的 prompts/ 目录，M0 定）
+仓库:   各 crate 自己的 prompts/ 目录 + include_str! 嵌入（不新建 hatchery-prompts crate，
+        理由见开放问题 4：唯一消费者是 daemon）
 用户:   ~/.config/hatchery/prompts/{identity.md, mode-code.md, …}
-项目:   AGENTS.md（兼容生态惯例；同时识别 HATCHERY.md？——开放问题）
+项目:   AGENTS.md（兼容生态惯例；同时识别 HATCHERY.md？——开放问题 1）
 ```
 
 ## 3. i18n
 
-- **文案**：gettext；pot 模板由 `xtask i18n-extract` 从源码抽取（`gettext!`/`gettext_noop!` 宏标记），翻译在 `po/<lang>.po`。CLI 与 GUI 共用一个 catalog（textdomain `hatchery`）。
-- **语言选择**：`[ui] language` 覆盖 `LANGUAGE`/`LC_*` 环境推断。
+> 方案已由 **ADR-0011** 定为 fluent（原 ADR-0008 的 gettext 方案被取代）。M0a 实测依据：gtk4-rs/glib 并不集成 gettext；`gettext-rs` 需 vendored 编译 C 版 libintl（构建 37.64 s），fluent 纯 Rust（3.45 s）；xgettext 抽取 Rust 时只认函数形式，宏形式抽不出来。
+
+- **文案**：fluent（`fluent-bundle` + `unic-langid`）。catalog 是 FTL 文件，默认 `include_str!` 嵌入二进制；用户级覆盖放 `~/.config/hatchery/locales/<lang>/*.ftl`（M4）。CLI 与 GUI 共用同一套 catalog 与同一个查表模块。
+- **查表位置**：在**前端进程内**（文案渲染发生在前端）；daemon 只透传语言设置，不做文案格式化。
+- **上下文与复数**：上下文用 message id 命名约定表达（`approval-allow-button = Allow`）+ FTL 注释；复数/选择性用 FTL 的 `->` selector（`{ $n -> [one] … *[other] … }`）。
+- **bidi 隔离**：fluent 默认给插值加 U+2068/U+2069 隔离符（实测），**保持开启**以服务 RTL；golden 测试里显式写出这两个码点，避免被误当噪声清理。
+- **提取与校验**：`xtask i18n-extract`（M4）扫描源码中的 id 引用，与 catalog 对账，报告缺失/多余/未包裹的用户可见字符串。
+- **语言选择**：`[ui] language` 覆盖 `LANGUAGE`/`LC_*` 环境推断；协商用 `fluent-langneg`（需要时引入）。
 - **RTL**：GTK 端交给 Pango（ADR-0008）；TUI 端 RTL 不做（终端生态现状），仅保证不主动破坏 BiDi 文本。
 - **LLM 输出语言**：不是 i18n 问题，是 prompt/配置问题——`[ui] response_language` 注入 environment section（如「以简体中文回复」）。
 - **文档翻译**：v1 只写中文；将来若做英文文档，采用 dsh 的配对校验思路（`.i18n.yaml` hash + CI 门禁），届时另立 ADR。
@@ -76,5 +83,6 @@ sections（有序）:
 ## 开放问题
 
 1. 项目级 prompt 文件是否兼容识别 `HATCHERY.md`（自有品牌）与 `AGENTS.md`（生态）双文件名——倾向都认，AGENTS.md 优先，M1 定。
-2. 配置 schema 校验失败的降级策略（整文件拒绝 vs 逐 key 忽略 + warning）——倾向逐 key，M0 定。
-3. gettext vs fluent 的最后确认：gettext 胜在 GTK 工具链原生；fluent 胜在 Rust 生态与现代语法——M0 做一个 30 分钟 spike（复数、上下文标注）后锁定。
+2. ~~配置 schema 校验失败的降级策略~~ → **已定（2026-09-28）**：**逐 key 忽略 + warning**，不整文件拒绝。理由：一个坏 key 不该让整个 daemon 起不来（与 ADR-0009 的 fail-loud 不冲突——fail-loud 指「必需组件缺失要拒绝服务」，配置里的可选 key 缺失只需报告）；每条 warning 带 key 路径、来源层级与原因，`config/get` 能查到「此 key 被忽略」。安全相关 key 解析失败时**取最严格默认值**并升级为 error 级日志。
+3. ~~gettext vs fluent~~ → **已定（2026-09-28，ADR-0011）**：fluent。实测依据见 §3 开头与 worklog/platform.md。
+4. prompt 文件存放：~~独立 crate vs 各 crate prompts/ 目录~~ → **已定（2026-09-28）**：各 crate 自己的 `prompts/` 目录 + `include_str!` 嵌入，**不新建 `hatchery-prompts` crate**——prompt 装配的唯一消费者是 daemon（前端经 `prompt/render` 协议查看），按 ADR-0009 的反预拆分刹车，第二个消费者出现前不拆。

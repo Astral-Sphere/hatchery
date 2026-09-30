@@ -1,0 +1,33 @@
+# Test groups (docs/design/testing.md §1). Rust cannot filter by attribute, so group
+# membership is a test-name convention enforced by these filtersets:
+#   invariant_*  core-invariant suite, always runs (testing.md §5)
+#   slow_*       >5s, nightly only        gui_*   needs a display, nightly only
+#   live_*       real provider network, also gated behind the `live-tests` cargo feature
+[store]
+dir = "target/nextest"
+
+[profile.default]
+default-filter = "not (test(live_) or test(slow_) or test(gui_))"
+fail-fast = false
+
+[profile.ci]
+inherits = "default"
+retries = 0
+
+[profile.ci.junit]
+path = "junit.xml"
+
+[profile.invariants]
+inherits = "default"
+default-filter = "test(invariant_)"
+
+[profile.slow]
+inherits = "default"
+default-filter = "test(slow_)"
+
+[profile.gui]
+inherits = "default"
+default-filter = "test(gui_)"
+
+[profile.live]
+default-filter = "test(live_)"
