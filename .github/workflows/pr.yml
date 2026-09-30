@@ -69,7 +69,7 @@ jobs:
       - name: Install cargo-nextest
         run: |
           if ! cargo nextest --version >/dev/null 2>&1; then
-            cargo install cargo-nextest --version "${NEXTEST_VERSION}" --locked
+            cargo install cargo-nextest --version "${NEXTEST_VERSION}" --locked --force
           fi
           cargo nextest --version
 
@@ -186,7 +186,7 @@ jobs:
           set -euo pipefail
           export PATH="$CARGO_BIN_POSIX:$PATH"
           if ! cargo nextest --version >/dev/null 2>&1; then
-            cargo install cargo-nextest --version "${NEXTEST_VERSION}" --locked
+            cargo install cargo-nextest --version "${NEXTEST_VERSION}" --locked --force
           fi
           cargo nextest --version
 
