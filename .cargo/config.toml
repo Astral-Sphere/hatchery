@@ -6,4 +6,4 @@ xtask = "run --package xtask --"
 # packaging must override it; and cross-compiling out of this workspace needs `RUSTFLAGS=""`, since
 # the environment variable overrides this table rather than adding to it.
 [build]
-rustflags = ["-C", "target-cpu=native"]
+# rustflags = ["-C", "target-cpu=native"]
