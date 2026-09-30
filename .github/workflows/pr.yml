@@ -67,8 +67,6 @@ jobs:
       # one fewer platform-compatibility surface, and the same on all three runners. The cache
       # above keeps ~/.cargo/bin, so this is a no-op on a warm run.
       - name: Install cargo-nextest
-        env:
-          RUSTFLAGS: -C target-cpu=x86-64-v3
         run: |
           if ! cargo nextest --version >/dev/null 2>&1; then
             cargo install cargo-nextest --version "${NEXTEST_VERSION}" --locked
@@ -76,8 +74,6 @@ jobs:
           cargo nextest --version
 
       - name: Gate
-        env:
-          RUSTFLAGS: -C target-cpu=x86-64-v3
         run: bash scripts/ci.sh
 
       - name: Upload test report
@@ -186,8 +182,6 @@ jobs:
       # binary appears after the cache step, so it is part of the cache and a warm run skips the
       # build.
       - name: Install cargo-nextest
-        env:
-          RUSTFLAGS: -C target-cpu=x86-64-v3
         run: |
           set -euo pipefail
           export PATH="$CARGO_BIN_POSIX:$PATH"
@@ -197,8 +191,6 @@ jobs:
           cargo nextest --version
 
       - name: Gate
-        env:
-          RUSTFLAGS: -C target-cpu=x86-64-v3
         run: |
           set -euo pipefail
           export PATH="$CARGO_BIN_POSIX:$PATH"
