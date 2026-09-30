@@ -74,7 +74,9 @@ jobs:
           cargo nextest --version
 
       - name: Gate
-        run: bash scripts/ci.sh
+        run: |
+            cargo clean
+            bash scripts/ci.sh
 
       - name: Upload test report
         if: always()
