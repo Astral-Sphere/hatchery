@@ -6,13 +6,13 @@
 
 ## 当前状态
 
-设计稿完成 + **影子 Git spike 实测两轮**：M0a 先按 CLI `git` 测了一版并写下结论，随后用户裁决改用 **git2（vendored libgit2）**（理由：很多用户机器上没有 git，不能把它变成运行时硬依赖），同一组门槛在 git2 上重测、11 项全绿，常驻 `crates/hatchery-capabilities/tests/spike_shadow_git.rs`。裁决与数据见 **ADR-0012**。trait 与工具实现未开工（M1/M2）。
+设计稿完成 + **影子 Git spike 实测两轮**（结论见 ADR-0012）+ **M1 只读层落地（2026-10-01）**：接缝 trait、LocalFs 只读路径、Chat 三工具与 ToolRegistry 全部可用，`./scripts/ci.sh` 全绿。写路径 / PTY / 审批后端 / CheckpointStore 是 M2。
 
 ## 待办
 
 - [x] (M0) **git spike（实测）**：两轮——CLI git 2.55 与 git2 0.21（vendored libgit2 1.9.7）；最终选 git2，结论落 ADR-0012 + design/capabilities.md §2
-- [ ] (M1) trait 定型（FsBackend/TerminalBackend/ApprovalGate/TerminalHandle 取消与流语义）+ 实现 kernel 的 `ToolHost`（`snapshot`/`summarize`/`approval_for`/`invoke`，见 worklog/kernel.md）——M0b 只定了**值类型的归属与审批往返的分工**（见下「M0b 记录」），trait 与实现推迟到 M1/M2
-- [ ] (M1) LocalFs 只读路径 + read_file/glob/grep 工具（Chat 模式用）
+- [x] (M1) trait 定型（M1 只读子集；见 2026-10-01 变更日志的三处有意收窄）+ `ToolRegistry` 实现 kernel 的 `ToolHost`（`snapshot` 排序快照 / `summarize` 委托工具 / `approval_for` 委托 / `invoke` 经 ToolCtx）
+- [x] (M1) LocalFs 只读路径 + read_file/glob/grep 工具（Chat 模式用；`chat_tools()` 装配清单随工具走）
 - [ ] (M2) **CheckpointStore**：把测试里的 `Sandbox` 提炼成正式实现——open 配方（init_opts + 手写 `core.worktree`/`core.bare` + `set_workdir(.., false)`）、`harden()` 的配置钉扎、每次打开重放 ignore 规则、purge 走 `checkout_index(remove_untracked)`、restore 前自动 snapshot
 - [ ] (M2) LocalFs 写路径 + write/edit 工具（写前打检查点）
 - [ ] (M2) 预算熔断与 GC：`revwalk` 计数 + 影子 git-dir 体积求和（实测 5 次快照 = 3457 B，阈值逻辑与 GC 策略待定）
@@ -82,6 +82,22 @@ capabilities 的**代码**在 M0b 没有动（trait 与工具实现是 M1/M2 的
 - 2026-09-28 影子 Git 后端：git2 vendored（用户裁决 + 第二轮实测），ADR-0012。若将来要摆脱 C 依赖，替代候选是 `gix`（纯 Rust，**未实测**），前提是把这 11 项门槛在 gix 上重跑全绿。
 
 ## 变更日志
+
+### 2026-10-01 · M1 只读层（评审②）
+
+**trait 定型（M1 子集）**：`FsBackend`（read_text_file / read_dir / metadata）、`TerminalBackend` + `TerminalHandle` + `TerminalOutcome`、`ApprovalGate`、`Tool`（def / needs_approval / summarize / execute）、`ToolCtx { fs, terminal, cancel, emit }`。三处**有意收窄**，都记录在案：
+
+1. `FsBackend` 没有 `write_text_file`：写路径的真实形状包含「写前打影子 Git 检查点」，M2 与 CheckpointStore 一起定型，先放一个 NotImplemented 占位只会撒谎。
+2. `read_dir` 提前进 M1（设计稿写「M2 加 list/glob 支持」）：glob/grep 必须有目录原语才能在接缝内行走，这是它的只读子集；设计稿说的模式过滤下推（把 glob 语义交给 backend）仍留 M2。
+3. `Tool` 比设计稿多一个 `summarize`：摘要需要工具语义（`read_file a.txt` vs `grep todo`），注册表的通用回退只兜底未知工具。
+
+**D6（glob/grep 选型）定案**：`globset` + `regex`（ripgrep 家族的纯匹配引擎）；**行走本身过 `FsBackend::read_dir` 接缝**（`hatchery-tools/src/walk.rs`，`.git` 不深入，MAX_VISITED 上限 10 万）。考虑过 `ignore`+`grep-searcher` 全家桶：它们自带 fs 行走，会绕开接缝（MemoryFs 测不了、ACP 委派换不了），否决。工具保持「纯逻辑 + 接缝调用」，deny lint 全绿。
+
+**LocalFs 的安全设计**（读路径）：路径两段校验——先词法（拒绝绝对路径与 `..`，`./` 归一化），后 `canonicalize` 对根前缀（**符号链接逃逸在这里被抓住**，词法检查看不见它）；二进制文件（首 KB 含 NUL）拒绝而非转码。工作区外的读取：设计稿说「Executes 级审批」，那是 Code 模式（M2，配合 DaemonApproval）；**M1 Chat 按 ADR-0005 无审批**，越界读取直接以错误结果返回（模型能看到原因），否则会挂在无人应答的审批等待上。测试钉住：绝对路径/`..`/符号链接逃逸三类拒绝 + 二进制拒绝。
+
+**ToolRegistry 的装配模型**：每会话一个、装配后不可变（kernel 每 turn 冻结快照，「换工具」= 下一 turn 换注册表）。设计稿的 `register() → Handle{dispose, replace}` 句柄模式**暂不实现**——它是给跨会话存活、需要原地换 MCP 工具的注册表用的（M5）；现在没有消费者，反预拆分刹车。`snapshot()` 按 BTreeMap 名字序输出：模型看到的目录表在两次装配间稳定，provider 侧 prompt 缓存不失效。
+
+**MemoryFs 与 LocalFs 对齐**：`..`/绝对路径拒绝、NUL 嗅探拒绝二进制，行为一致——工具不能长出只在某个 backend 上成立的习惯（grep 的二进制跳过路径就是靠 MemoryFs 的 Binary 错误测出来的）。
 
 ### 2026-09-28 · M0b
 

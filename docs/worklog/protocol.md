@@ -16,7 +16,8 @@
 - [x] (M0b) 方法名常量表（daemon 路由表的单一真相）+ `PROTOCOL_VERSION` 常量与支持区间
 - [x] (M0b) 错误码枚举定型（14 个：5 个 JSON-RPC 标准 + 9 个应用码），数值 golden 锁定
 - [x] (M0b) serde 往返测试 + golden JSON（`tests/fixtures/protocol-v1/`）+ 字段序确定性 + 公共 API 的可运行 doctest —— **golden 用纯 JSON 而非 insta**，理由见设计文档 §6
-- [ ] (M1) client helper：attach_or_spawn、重连 + replay_from 补差、generation 过滤
+- [x] (M1) client helper（2026-10-01）：`DaemonClient`（call_raw/call/hello，id 路由 + 超时）+ `EventStream`（`session/event` notification 解包）；attach_or_spawn 的 spawn 半边随 CLI Phase 4，重连补差随 e2e Phase 5
+- [x] (M1) `HelloParams.boot_token`（加性字段，fixture 已更新）
 - [ ] (M1) 事件 coalescing 策略实测调参（与 daemon hub 联动）；`ServerEvent::is_coalescable` 已就位
 - [ ] (M2) edit_item/branch/rewind 方法的参数细节随 store 实现定稿（rewind 要带 `purge_untracked`，见 worklog/capabilities.md）
 

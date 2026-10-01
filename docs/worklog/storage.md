@@ -80,6 +80,12 @@ API 怪癖（写 store 实现时一定会踩）：
 
 ## 变更日志
 
+### 2026-10-01 · `bump_generation`（M1 Phase 3）
+
+manager 组装 runtime 需要把 generation 落库（不变量 1），而 `SessionPatch` 有意不含它。新增加性 trait 方法 `SessionStore::bump_generation(session)`（`UPDATE ... SET generation = generation + 1` + 读回），payload JSON 列不受影响、无迁移。deepseek 录制期间顺手核实：`rebuild_chain` 的父链行走对同一父多子（分叉）的行为已由 M0 属性测试覆盖，daemon 的链上重建直接受益。
+
+### （此前为 M0b 条目）
+
 ### 2026-09-30 · 评审后的两轮修复（2026-09-29 与 2026-09-30）
 
 **「会话不存在」必须是 `SessionNotFound`，不能让外键代答。** append（单条与批量）、`start_turn`、`finish_turn` 原本都把这件事交给 `items.session_id`/`turns.session_id` 的外键：引擎的约束消息被裹成 `StoreError::Database`，而按 design/storage.md §1 的映射，「调用方指了一个不存在的会话」是 `SessionNotFound`（调用方错误），「引擎拒绝了一条合法写入」才是 `StoreError`（存储故障）——两者到前端是两个错误码。turso 0.7.2 的错误类型只有 `Constraint(String)`，**不区分是哪条约束**（外键、非空、`items_no_update` 触发器全走它），所以按错误变体分类不可靠；改成写前一次 `SELECT id FROM sessions` 显式确认（在正要写的路径上，一次主键查询的代价可忽略）。`finish_turn` 尤其要说清楚：删会话会 cascade 掉它的 `turns` 行，那条 `UPDATE ... WHERE id AND session_id` 于是什么都匹配不到，原本报 `UnknownTurn`——把「会话没了」说成「你从没起过这个 turn」。

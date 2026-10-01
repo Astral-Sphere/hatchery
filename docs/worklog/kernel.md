@@ -28,6 +28,10 @@
 
 ## 变更日志
 
+### 2026-09-30 · RateLimited 透传通道（M1 Phase 1）
+
+llm adapter 的重试退避需要一个能让前端倒计时的通知，但 `LlmProvider` 没有 sink 可发。定案：`StreamEvent` 与 `KernelEvent` 各加一个 `RateLimited { retry_after_ms }` 变体，kernel 收到后**只转发不解释**（round 状态不动）——它是一条信息，不是一个迁移。`is_control` 语义自动正确（不在 delta 白名单里），serde 形状 `rate_limited` 与 protocol 的 `ServerEvent::RateLimited` 对齐。这是 M1 计划中唯一预期的 kernel 改动。
+
 ### 2026-09-30 · 评审后的两轮修复（2026-09-29 与 2026-09-30）
 
 **启动期的 await 必须在取消的 select 里面。** `history.view()` 与 `provider.chat_stream()` 原本是裸 await：连接期挂住的 provider 会让 agent 只剩 `abort()` 一条出路，而 abort 跳过终止事件——前端于是永远等不到 `TurnEnded`。两处现在都走 `guarded_startup`（取消令牌 + 命令通道 + future 同一个 biased select，future 被 pin 住、跨命令续跑）。**教训**：接缝上任何可能阻塞的 await 都要能被取消，包括「流还没开始」的那一段。

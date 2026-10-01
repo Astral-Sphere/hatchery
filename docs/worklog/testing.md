@@ -17,10 +17,10 @@
 - [x] (M0) `cargo-llvm-cov` 未装时 `xtask coverage` fail-loud 报安装命令（不静默跳过）
 - [x] (M0) 三平台 CI 首跑通过（第 2 次尝试；windows MSYS2 ucrt64 那条也过了）
 - [x] (M0b) store 属性测试参考模型（testkit 里独立写的 `ReferenceTree`）+ kill -9 崩溃测试框架（测试二进制自重入，无需专用二进制）
-- [ ] (M1) testkit 余下部分：MockWire(sse fixture)/Memory 后端三件套/TempWorkspace/TestDaemon/ClientProbe（kernel 四接缝的 fake 与 `ReferenceTree` 已于 M0b 交付）
+- [ ] (M1) testkit 余下部分：MockWire(sse fixture)/Memory 后端三件套/TempWorkspace/TestDaemon/ClientProbe（kernel 四接缝的 fake 与 `ReferenceTree` 已于 M0b 交付）——**MockWire + fixture 加载（09-30）、MemoryFs + TempWorkspace 与 TestDaemon + ClientProbe（10-01）已交付；MemoryTerminal 随 M2 的 PTY**
 - [ ] (M1) 建 `hatchery-tests` 成员 crate（跨 crate e2e 与不变量套件的家）
 - [ ] (M1) MSRV job 进 nightly（`cargo +1.90.0 check`），防依赖升级悄悄抬高下限
-- [ ] (M1) fixture 录制 xtask + 脱敏（API key 扫描）+ provenance 元数据格式
+- [x] (M1) fixture 录制 xtask + 脱敏（API key 扫描）+ provenance 元数据格式（2026-09-30：`cargo xtask record-fixtures`，sidecar `*.meta.json`，扫描命中即拒写）
 - [ ] (M1) 不变量套件 `invariants` 分组填满（现在 4 条：store 的 3 条 + 影子 Git 的 1 条；4 编译期已保；1/2/5 随 M1-M2；6 已有引擎级实测，M2 补 store/tool 层）
 - [ ] (M1) e2e 场景 1-2 落地（最小对话、双前端扇出）
 - [ ] (M2) 影子 Git 安全测试补全（硬门、PTY 孤儿进程）；fuzz targets 上线 nightly
@@ -75,6 +75,39 @@
 - 2026-09-28 辅助二进制形态：M0 不需要（`dummy-acp-agent` 是 M3 的事），推迟到 M3 与 ACP client 一起定；倾向 workspace member + `required-features`。
 
 ## 变更日志
+
+### 2026-10-01 · M1 Phase 3（daemon 的测试面）
+
+**TestDaemon 起真 socket**：TestDaemon = 真 turso 库（tempdir）+ 真 LayeredConfig + 真 UDS 监听；ClientProbe = hello（带 boot token）+ 类型化调用 + `EventStream` 订阅。design/testing.md 开放问题 4（e2e 形态）**就此定默认：进程内但走真 socket**——一个 tempdir 的代价，换来 UDS/分帧/路由/扇出全链路覆盖。真子进程形态（覆盖 daemon.json 生命周期与进程崩溃）留给需要它的场景再对比。
+
+**二分测试的用法被验证了一次**：双前端扇出测试超时，先直订 hub（过）再断 socket 半段（断）→ 定位到 server 的会话提取把整个 Session 对象当 id 反序列化。失败面大的时候，「在链路上逐段放探针」比读代码猜快得多。
+
+**determinism 步骤与有意修改的摩擦**：门禁的 determinism 检查把「工作树里有未提交的 fixture 改动」一律当测试改写 golden。本批有两个**有意**的 protocol fixture 更新（provider_call_id、boot_token），在提交前该步骤会保持红——这是步骤设计与「分阶段交付未提交」的已知摩擦，不是回归；提交即恢复。
+
+### 2026-10-01 · M1 Phase 2（capabilities/tools 的测试面）
+
+### 2026-10-01 · M1 Phase 2（capabilities/tools 的测试面）
+
+**MemoryFs 与 LocalFs 行为对齐是这条测试线的地基**：`..`/绝对路径拒绝、NUL 嗅探拒绝二进制——grep 的「跳过二进制并计数」路径就是靠 MemoryFs 的 `Binary` 错误测出来的；两个 backend 行为不一致时，工具会长出只在其中一个上成立的习惯，而测试看不见。
+
+**`TempWorkspace` 补上真磁盘那半边**：symlink 逃逸只有真盘测得了（LocalFs 的 `canonicalize` 前缀检查），MemoryFs 造不出符号链接。两条路径各有归属。
+
+**工具测试走 `ToolCtx` 直连而不是绕道 kernel**：单元层（每个工具 happy/越界/截断/取消）用 `ToolCtx` 直连；装配层（`tests/assembly.rs`）走 `ToolHost` 三方法验证「广告目录 = 分发表」、Chat 无审批、未知工具报错。两层各测各的合同。
+
+**walker 形态实测**：回调式（`AsyncFnMut` 闭包）与借用检查打了三轮（AsyncFnOnce 逃逸、Send 不成立、higher-ranked lifetime），换成「walk 返回路径 Vec、调用方自己 for 循环」后一次通过——取消与 result cap 都住在调用方的循环里，反而更诚实。教训：异步遍历的接缝宁收 `Vec` 不收闭包。
+
+### 2026-09-30 · M1 Phase 1（llm 的测试面）
+
+**MockWire 与 fixture 加载进 testkit。** `MockWire::replay_sse`/`refuse_then_sse`/`refuse_always` 覆盖流回放与「先拒后服务」两种 wire；`requests()` 返回展平的 `RecordedWireRequest`（小写 header 名 + body），请求体 golden 断言直接对它做。fixture 约定：`tests/fixtures/<name>.sse`（原始字节）+ `<name>.meta.json`（provenance：recorded/synthetic、provider、model、shape、时间）——**sidecar 缺失即拒载**，无出处的录算是负债。合成 fixture 六个先顶位（deepseek 文本/推理、qwen 工具调用、401/402/429 错误体），真实录制后同名替换。
+
+**两个实测结论，都写进了测试注释：**
+
+1. **wiremock + 连接池会吞一个请求**：keep-alive 连接被服务端关掉恰逢重试复用时，reqwest 报 `SendError`（按网络错误分类、判可重试——行为正确），但「恰好 N 个请求」的断言会差一。llm 测试统一用 `pool_max_idle_per_host(0)` 的客户端（`provider()` helper）。
+2. **`start_paused` 可以测真实的退避时间**：429 两次 + SSE 一次的测试在暂停时钟下断言 `elapsed == 1500ms`——`RateLimited` 事件里的毫秒数不是装饰，adapter 真的等了。要求 `jitter_percent = 0`（否则时间带内随机）。
+
+**脱敏扫描是门不是擦除器**：录制器扫到录制 key 本身或任何 `sk-` 形长串就拒写——改写会背叛「字节精确」这条录制存在的理由，泄漏意味着重录。xtask 的单元测试只测参数校验路径（`--provider bogus`），**绝不在测试里裸调 record-fixtures**：机器上有真 key 时那会真的花钱打 API。
+
+**TLS provider 的测试面**：`reqwest::Client` 在无 crypto provider 的进程里构造即 panic；llm 测试与 registry 单测都先 `install_tls_provider()`（先装者胜、幂等，可并行调用）。
 
 ### 2026-09-30 · M0b 评审后的两轮修复（测试面）
 

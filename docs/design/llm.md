@@ -21,7 +21,7 @@ env_key = "DEEPSEEK_API_KEY"          # 密钥只从环境读取，不落盘
 wire = "chat-completions"              # 或 "responses"
 reasoning_effort = "high"              # Off|Low|Medium|High|Max
 show_reasoning = true                  # UI 展示开关（不影响回传）
-models = ["deepseek-chat", "deepseek-reasoner"]
+models = ["deepseek-flash"]
 
 [providers.my-gateway]
 base_url = "https://gw.example.com/v1"
@@ -51,8 +51,8 @@ canonical：`Off | Low | Medium | High | Max`。内置默认表（借鉴 qwen-co
 | provider 族 | wire 表达 |
 |---|---|
 | OpenAI / Responses | `reasoning.effort: minimal\|low\|medium\|high`（Max→high） |
-| DeepSeek | 无 effort 参数；Off→`deepseek-chat`，其余→`deepseek-reasoner`（模型切换即 effort） |
-| Qwen (DashScope 兼容) | `enable_thinking: bool` + `thinking_budget`（Low..Max 映射预算档） |
+| DeepSeek | `thinking: { type: "enabled"/"disabled" }`；当前世代（2026-09-30 校准）为混合推理模型，**默认开**，该开关关掉推理，模型不再切换 |
+| Qwen (DashScope 兼容) | `enable_thinking: bool` + `thinking_budget`（Low..Max 映射预算档）；当前世代混合模型**默认开**，显式传参保证确定性 |
 | 智谱 GLM | `thinking: { type: "enabled"/"disabled" }` |
 | 通用 OpenAI 兼容 | `reasoning_effort` 透传；不支持则忽略并记录一次 warning |
 

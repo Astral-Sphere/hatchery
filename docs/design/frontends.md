@@ -95,7 +95,7 @@ GTK 主循环: 收事件 → 更新 gio::ListStore / AdwExpanderRow 等模型 �
 
 ## 开放问题
 
-1. TUI 的 markdown/diff 渲染库选型（termimad? syntect 自绘?）——M1 spike。
+1. ~~TUI 的 markdown/diff 渲染库选型（termimad? syntect 自绘?）~~ **已裁决（2026-09-30，D5）**：ratatui + minimad 自绘。实证记录见 `docs/worklog/cli.md`；syntect（代码块/diff 高亮）推迟 M2。
 2. GTK 消息列表在超长会话（10k items）下的虚拟化与增量渲染性能——M4 用 fixture 压测。
 3. 图片附件的输入路径（粘贴/拖拽/文件引用）CLI 与 GUI 的一致性——M2。
 4. CLI 是否需要 REPL 极简模式（无 TUI 依赖，SSH 友好）——倾向 M1 顺手做（exec 已覆盖大半）。
