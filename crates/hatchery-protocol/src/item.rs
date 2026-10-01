@@ -343,6 +343,27 @@ pub struct ToolCall {
     pub args: Value,
     /// Where the call is in its lifecycle.
     pub status: ToolStatus,
+    /// The provider's correlation id for this call, verbatim (M1, additive).
+    ///
+    /// History rebuild needs it: the next request must pair each tool result with the id the
+    /// provider originally issued, byte for byte, or the rebuilt conversation diverges from the
+    /// one that produced these turns (invariant 2). Absent on items committed before the field
+    /// existed; the assembler synthesizes a stable stand-in for those rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_call_id: Option<String>,
+}
+
+impl ToolCall {
+    /// A call with no provider id recorded (legacy rows, tests).
+    #[must_use]
+    pub fn new(name: impl Into<String>, args: Value, status: ToolStatus) -> Self {
+        Self {
+            name: name.into(),
+            args,
+            status,
+            provider_call_id: None,
+        }
+    }
 }
 
 /// Payload of [`ItemKind::ToolResult`].
@@ -412,6 +433,7 @@ mod tests {
                 name: "read_file".to_owned(),
                 args: serde_json::json!({"path": "src/main.rs"}),
                 status: ToolStatus::Completed,
+                provider_call_id: Some("call_probe_0".to_owned()),
             }),
             ItemKind::ToolResult(ToolResult {
                 call: ItemId::from_uuid(uuid::Uuid::nil()),

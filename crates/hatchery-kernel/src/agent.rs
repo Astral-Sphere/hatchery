@@ -512,6 +512,11 @@ impl Agent {
                     }
                     StreamEvent::ToolCall { delta } => merge_call(&mut round.calls, delta),
                     StreamEvent::Usage { usage: reported } => usage.merge(&reported),
+                    StreamEvent::RateLimited { retry_after_ms } => {
+                        // Informational only: the adapter is still working through its backoff,
+                        // and the round's state does not change while it waits.
+                        self.emit(KernelEvent::RateLimited { retry_after_ms }).await;
+                    }
                     StreamEvent::Done { finish_reason } => {
                         round.finish = Some(finish_reason);
                         break;
@@ -861,6 +866,10 @@ impl Agent {
                 name: request.name.clone(),
                 args: request.args.clone(),
                 status,
+                // The correlation id the next rebuild must pair the result with (invariant 2):
+                // without it, a resumed session's tool messages carry ids the provider never
+                // issued.
+                provider_call_id: Some(request.id.clone()),
             }),
         )
         .await;

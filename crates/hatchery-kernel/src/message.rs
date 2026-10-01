@@ -227,6 +227,15 @@ pub enum StreamEvent {
         /// What the provider reported.
         usage: Usage,
     },
+    /// The provider refused the request for now; the adapter will retry after this long.
+    ///
+    /// Emitted while the adapter backs off, so a frontend can show a countdown instead of
+    /// silence. Informational: the round's outcome does not depend on it, and a stream that
+    /// only ever emits these never finishes the turn by itself.
+    RateLimited {
+        /// How long until the adapter retries, in milliseconds.
+        retry_after_ms: u64,
+    },
     /// The request finished normally.
     Done {
         /// Why it stopped.
@@ -388,6 +397,9 @@ mod tests {
             StreamEvent::Usage {
                 usage: Usage::default(),
             },
+            StreamEvent::RateLimited {
+                retry_after_ms: 500,
+            },
             StreamEvent::Done {
                 finish_reason: FinishReason::Stop,
             },
@@ -412,6 +424,7 @@ mod tests {
                 "reasoning_done",
                 "tool_call",
                 "usage",
+                "rate_limited",
                 "done",
                 "error"
             ]

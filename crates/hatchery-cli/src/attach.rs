@@ -1,0 +1,162 @@
+//! Attach-or-spawn: reach the user's daemon, starting it if it is not there (ADR-0001).
+//!
+//! The spawn half implements the D1 decision (2026-09-30): no double fork, no sd_notify — the
+//! CLI simply launches `hatchery daemon run` as a detached process (`process_group(0)`, stdio
+//! to the void) and polls the state directory until the daemon publishes `daemon.json`. The
+//! boot token in that file is the handshake, and its mtime-plus-log the user's trail.
+
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use hatchery_daemon::discover::{DaemonInfo, StateDir};
+use hatchery_protocol::ClientError;
+
+/// How long attach-or-spawn waits for a freshly spawned daemon to publish and bind.
+const SPAWN_READY_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// How often a spawned daemon's publication is polled.
+const SPAWN_POLL_PERIOD: Duration = Duration::from_millis(100);
+
+/// Why reaching the daemon failed. Every variant is the user's business.
+#[derive(Debug, thiserror::Error)]
+pub enum AttachError {
+    /// The spawn happened but the daemon never announced itself.
+    #[error(
+        "the daemon did not become ready within {timeout_secs}s; its log is at {}",
+        .log_hint.display()
+    )]
+    NotReady {
+        /// Seconds waited; kept for the message.
+        timeout_secs: u64,
+        /// Where the daemon's own words would be.
+        log_hint: std::path::PathBuf,
+    },
+    /// The handshake or a call failed.
+    #[error(transparent)]
+    Client(#[from] ClientError),
+    /// The process could not be started.
+    #[error("spawning the daemon failed: {0}")]
+    Spawn(std::io::Error),
+}
+
+/// A working client plus the daemon that answered.
+pub struct Attached {
+    /// The client, handshaken.
+    pub client: hatchery_protocol::DaemonClient,
+    /// The daemon's published coordinates.
+    pub info: DaemonInfo,
+    /// True when this call spawned the daemon.
+    pub spawned: bool,
+}
+
+/// Attaches to the daemon under `state`, spawning one when nobody is there.
+///
+/// `daemon_exe` overrides the binary the child runs (tests point it at the real
+/// `hatchery` binary); absent, this process's own executable is used.
+///
+/// # Errors
+///
+/// [`AttachError`] when the daemon never became reachable.
+pub async fn attach_or_spawn(
+    state: StateDir,
+    daemon_exe: Option<PathBuf>,
+    workspace: Option<&Path>,
+) -> Result<Attached, AttachError> {
+    if let Some(info) = state.discover_alive() {
+        match attach_info(&info).await {
+            Ok(client) => {
+                return Ok(Attached {
+                    client,
+                    info,
+                    spawned: false,
+                });
+            }
+            Err(error) => {
+                // A published-but-unreachable daemon is stale by definition; fall through to
+                // the spawn path rather than bounce the user.
+                tracing::warn!("a published daemon did not answer ({error}); trying to spawn");
+            }
+        }
+    }
+    spawn_and_attach(state, daemon_exe, workspace).await
+}
+
+/// Attaches to a *known* daemon: connect, handshake, go. No liveness discovery — the caller
+/// vouches for the info (production discovers first; tests build the info directly).
+///
+/// # Errors
+///
+/// [`AttachError::Client`] when the connect or the handshake fails.
+pub async fn attach_to(info: &DaemonInfo) -> Result<Attached, AttachError> {
+    let client = hatchery_protocol::DaemonClient::connect(&info.uds_path).await?;
+    client.hello(Some(info.boot_token.clone())).await?;
+    Ok(Attached {
+        client,
+        info: info.clone(),
+        spawned: false,
+    })
+}
+
+async fn attach_info(info: &DaemonInfo) -> Result<hatchery_protocol::DaemonClient, AttachError> {
+    Ok(attach_to(info).await?.client)
+}
+
+async fn spawn_and_attach(
+    state: StateDir,
+    daemon_exe: Option<PathBuf>,
+    workspace: Option<&Path>,
+) -> Result<Attached, AttachError> {
+    let exe = daemon_exe.unwrap_or(std::env::current_exe().map_err(AttachError::Spawn)?);
+    let state_root = state
+        .lock_path()
+        .parent()
+        .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
+    let mut command = std::process::Command::new(&exe);
+    command
+        .arg("daemon")
+        .arg("run")
+        .arg("--state-dir")
+        .arg(&state_root);
+    if let Some(workspace) = workspace {
+        command.current_dir(workspace);
+    }
+    command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    #[cfg(unix)]
+    {
+        // Detached: own process group, so closing the terminal's foreground group does not
+        // SIGHUP the daemon (the process_group call performs setsid in the child).
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let mut child = command.spawn().map_err(AttachError::Spawn)?;
+    tracing::info!(pid = child.id(), "spawned a daemon process");
+
+    let deadline = tokio::time::Instant::now() + SPAWN_READY_TIMEOUT;
+    loop {
+        if let Some(info) = state.discover_alive() {
+            let client = attach_info(&info).await?;
+            return Ok(Attached {
+                client,
+                info,
+                spawned: true,
+            });
+        }
+        // A child that already exited is a failed start: no point polling out the clock.
+        if child.try_wait().map_err(AttachError::Spawn)?.is_some() {
+            return Err(AttachError::NotReady {
+                timeout_secs: SPAWN_READY_TIMEOUT.as_secs(),
+                log_hint: state.logs_dir(),
+            });
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(AttachError::NotReady {
+                timeout_secs: SPAWN_READY_TIMEOUT.as_secs(),
+                log_hint: state.logs_dir(),
+            });
+        }
+        tokio::time::sleep(SPAWN_POLL_PERIOD).await;
+    }
+}

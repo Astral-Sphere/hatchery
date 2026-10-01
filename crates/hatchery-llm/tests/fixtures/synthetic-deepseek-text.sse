@@ -1,0 +1,12 @@
+data: {"id":"1","choices":[{"index":0,"delta":{"content":"","role":"assistant"},"finish_reason":null}],"created":1718345013,"model":"deepseek-chat","object":"chat.completion.chunk","usage":null}
+
+data: {"choices":[{"delta":{"content":"Hel"},"finish_reason":null,"index":0}],"created":1718345013,"id":"1","model":"deepseek-chat","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"content":"lo!"},"finish_reason":null,"index":0}],"created":1718345013,"id":"1","model":"deepseek-chat","object":"chat.completion.chunk"}
+
+data: {"choices":[{"delta":{"content":""},"finish_reason":"stop","index":0}],"created":1718345013,"id":"1","model":"deepseek-chat","object":"chat.completion.chunk"}
+
+data: {"choices":[],"created":1718345013,"id":"1","model":"deepseek-chat","object":"chat.completion.chunk","usage":{"completion_tokens":9,"prompt_tokens":17,"total_tokens":26}}
+
+data: [DONE]
+

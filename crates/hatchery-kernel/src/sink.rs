@@ -70,6 +70,14 @@ pub enum KernelEvent {
         /// The increment.
         chunk: String,
     },
+    /// The provider rate-limited a request; the adapter is retrying after the delay shown.
+    ///
+    /// Notifies the frontend so it can render a countdown (docs/design/llm.md §6). Carried by the
+    /// adapter's `RateLimited` stream event, which the kernel forwards without interpreting it.
+    RateLimited {
+        /// How long until the adapter retries, in milliseconds.
+        retry_after_ms: u64,
+    },
     /// The turn is paused until somebody answers.
     ApprovalNeeded {
         /// Echo this back with the decision.
@@ -111,6 +119,7 @@ impl KernelEvent {
             Self::ItemFinished { .. } => "item_finished",
             Self::ToolCallStarted { .. } => "tool_call_started",
             Self::ToolCallProgress { .. } => "tool_call_progress",
+            Self::RateLimited { .. } => "rate_limited",
             Self::ApprovalNeeded { .. } => "approval_needed",
             Self::TurnEnded { .. } => "turn_ended",
         }

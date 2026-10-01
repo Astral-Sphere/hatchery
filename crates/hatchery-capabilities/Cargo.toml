@@ -20,7 +20,9 @@ hatchery-protocol.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-tokio.workspace = true
+# `fs` drives the LocalFs read path; the workspace tokio default features cover it.
+tokio = { workspace = true, features = ["fs"] }
+tokio-util.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]

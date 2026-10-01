@@ -1,0 +1,14 @@
+data: {"id":"3","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}],"created":1735113344,"model":"qwen-plus","object":"chat.completion.chunk"}
+
+data: {"id":"3","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call-abc","type":"function","function":{"name":"grep","arguments":""}}]},"finish_reason":null}],"created":1735113344,"model":"qwen-plus","object":"chat.completion.chunk"}
+
+data: {"id":"3","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"query\":"}}]},"finish_reason":null}],"created":1735113344,"model":"qwen-plus","object":"chat.completion.chunk"}
+
+data: {"id":"3","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"TODO\"}"}}]},"finish_reason":null}],"created":1735113344,"model":"qwen-plus","object":"chat.completion.chunk"}
+
+data: {"id":"3","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"created":1735113344,"model":"qwen-plus","object":"chat.completion.chunk"}
+
+data: {"id":"3","choices":[],"created":1735113344,"model":"qwen-plus","object":"chat.completion.chunk","usage":{"completion_tokens":14,"prompt_tokens":33,"total_tokens":47}}
+
+data: [DONE]
+

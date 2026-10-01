@@ -9,6 +9,7 @@
       "path": "crates/hatchery-store/src/tree.rs"
     },
     "name": "read_file",
+    "provider_call_id": "call_00_probe",
     "status": "completed"
   },
   "session": "01890f47-0000-7000-8000-000000000001",

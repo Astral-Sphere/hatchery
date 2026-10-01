@@ -3,11 +3,12 @@
 //! Only checks that are awkward to express in bash live here; the gate sequence itself belongs
 //! to `scripts/ci.sh`, which CI and local runs share verbatim.
 //!
-//! Status: M0 skeleton — `layering` and `coverage` work, `i18n-extract` (M4) and
-//! `record-fixtures` (M1) fail loudly until implemented.
+//! Status: `layering`, `coverage` and `record-fixtures` work; `i18n-extract` fails loudly until
+//! M4. `record-fixtures` hits real providers, costs money and never runs in CI.
 
 pub mod coverage;
 pub mod layering;
+pub mod record;
 
 use anyhow::{Result, anyhow};
 
@@ -21,7 +22,8 @@ SUBCOMMANDS:
     layering         Check the crate dependency DAG against docs/architecture.md §3
     coverage         Run the test suite under cargo-llvm-cov [--html]
     i18n-extract     Extract translatable strings (not implemented until M4)
-    record-fixtures  Record provider SSE fixtures (not implemented until M1)
+    record-fixtures  Record provider SSE fixtures from real endpoints
+                     [--provider deepseek|qwen|all] [--out DIR] [--force]
     help             Print this help
 ";
 
@@ -35,9 +37,7 @@ pub fn run(args: impl Iterator<Item = String>) -> Result<String> {
         Some("i18n-extract") => Err(anyhow!(
             "i18n-extract is not implemented until M4; see docs/worklog/platform.md"
         )),
-        Some("record-fixtures") => Err(anyhow!(
-            "record-fixtures is not implemented until M1; see docs/design/llm.md"
-        )),
+        Some("record-fixtures") => record::run(&args[1..]),
         Some(other) => Err(anyhow!("unknown subcommand {other:?}\n\n{USAGE}")),
     }
 }
@@ -52,13 +52,24 @@ mod tests {
 
     #[test]
     fn unimplemented_subcommands_fail_loudly() {
-        for (name, milestone) in [("i18n-extract", "M4"), ("record-fixtures", "M1")] {
-            let err = run_args(&[name]).expect_err("unimplemented subcommand must not succeed");
-            assert!(
-                err.to_string().contains(milestone),
-                "{name} should point at {milestone}: {err}"
-            );
-        }
+        let err = run_args(&["i18n-extract"]).expect_err("unimplemented subcommand");
+        assert!(
+            err.to_string().contains("M4"),
+            "i18n-extract should point at M4: {err}"
+        );
+    }
+
+    #[test]
+    fn recording_rejects_unknown_providers_before_touching_the_network() {
+        // Never invoke the bare subcommand in tests: with real credentials present it would
+        // record for real, so this validates the argument gate only — it fails before any key
+        // is read or any socket is opened.
+        let err = run_args(&["record-fixtures", "--provider", "bogus"])
+            .expect_err("an unknown provider must be refused");
+        assert!(
+            err.to_string().contains("unknown provider"),
+            "the refusal should say what was wrong: {err}"
+        );
     }
 
     #[test]

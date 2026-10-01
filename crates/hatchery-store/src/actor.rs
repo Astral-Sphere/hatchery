@@ -87,6 +87,13 @@ pub enum StoreCmd {
         /// The session as it is now.
         reply: Reply<Session>,
     },
+    /// Increment the runtime generation (invariant 1).
+    BumpGeneration {
+        /// Which session.
+        session: SessionId,
+        /// The session as it is now.
+        reply: Reply<Session>,
+    },
     /// List sessions, newest first.
     ListSessions {
         /// Paging and filtering.
@@ -245,6 +252,9 @@ impl Writer {
                 } => {
                     reply_send(reply, self.update_session(session, patch).await);
                 }
+                StoreCmd::BumpGeneration { session, reply } => {
+                    reply_send(reply, self.bump_generation(session).await);
+                }
                 StoreCmd::ListSessions { params, reply } => {
                     reply_send(reply, self.list_sessions(params).await);
                 }
@@ -379,6 +389,17 @@ impl Writer {
         found
             .transpose()?
             .ok_or(StoreError::SessionNotFound(session))
+    }
+
+    async fn bump_generation(&self, session: SessionId) -> Result<Session, StoreError> {
+        self.conn
+            .execute(
+                "UPDATE sessions SET generation = generation + 1, updated_at = ?2 WHERE id = ?1",
+                (session.to_string(), Timestamp::now().as_unix_millis()),
+            )
+            .await
+            .map_err(StoreError::database)?;
+        self.session(session).await
     }
 
     async fn update_session(

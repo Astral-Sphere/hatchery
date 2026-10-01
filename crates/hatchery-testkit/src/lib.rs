@@ -15,21 +15,27 @@
 //! * [`Gate`] — releases a gated fake step by step, so interrupt tests have a window to act in;
 //! * the [`events`] helpers — read a recorded turn's outcome, items and states back out.
 //!
-//! `MemoryFs`, `MemoryTerminal`, `TempWorkspace`, `TestDaemon` and `ClientProbe` land with their
-//! consumers in M1–M2, and fixture loading arrives with the llm crate's recorded SSE streams.
+//! `MemoryTerminal`, `TempWorkspace`, `TestDaemon` and `ClientProbe` land with their consumers in
+//! M1–M2; `MemoryFs` and the wire double ([`MockWire`]) arrived with the llm crate's SSE replay.
 
+pub mod daemon;
 pub mod events;
+pub mod fs;
 pub mod gate;
 pub mod history;
 pub mod model;
 pub mod provider;
 pub mod sink;
 pub mod tools;
+pub mod wire;
 
+pub use daemon::{ClientProbe, TestDaemon};
 pub use events::{completion, error, finished_items, kinds, reason, states, tool_result_texts};
+pub use fs::{MemoryFs, TempWorkspace};
 pub use gate::Gate;
 pub use history::MemoryHistory;
 pub use model::{ChainShape, ReferenceTree};
 pub use provider::{RecordedRequest, ScriptedProvider};
 pub use sink::RecordingSink;
 pub use tools::{RecordedCall, ScriptedApproval, ScriptedToolHost, answer_approvals};
+pub use wire::{MockWire, RecordedWireRequest, json_fixture, sse_fixture};

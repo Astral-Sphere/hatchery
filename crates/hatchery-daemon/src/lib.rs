@@ -14,5 +14,19 @@
 //! configuration through `config/get` and `config/set`, so no second consumer exists
 //! (docs/design/platform.md).
 //!
-//! Design: `docs/design/daemon.md`. Status: M0 skeleton; listeners, session manager and hub land
-//! in M1.
+//! Design: `docs/design/daemon.md`. Status: M1 — configuration layering, the prompt pipeline,
+//! transport, session manager, hub and the production entry (`entry`) are in.
+
+pub mod clock;
+pub mod config;
+pub mod core;
+pub mod discover;
+pub mod doctor;
+pub mod entry;
+pub mod hub;
+pub mod logging;
+pub mod manager;
+pub mod prompt;
+pub mod runtime;
+pub mod server;
+pub mod template;

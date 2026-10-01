@@ -1,47 +1,48 @@
 use std::process::ExitCode;
 
-const USAGE: &str = "\
-hatchery — an open source AI agent harness
+use hatchery_cli::args::{self, Command};
 
-USAGE:
-    hatchery [OPTIONS]
+const VERSION: &str = concat!("hatchery ", env!("CARGO_PKG_VERSION"));
 
-OPTIONS:
-    -h, --help       Print this help
-    -V, --version    Print version information
-
-Subcommands (chat, exec, acp, daemon, doctor, config) land in M1 and later;
-see docs/roadmap.md.
-";
-
-fn main() -> ExitCode {
-    let first = std::env::args().nth(1);
-    match first.as_deref() {
-        Some("-h") | Some("--help") => {
-            print!("{USAGE}");
-            ExitCode::SUCCESS
+#[tokio::main]
+async fn main() -> ExitCode {
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    let command = match args::parse(&argv) {
+        Ok(command) => command,
+        Err(message) => {
+            eprintln!("hatchery: {message}");
+            return ExitCode::from(2);
         }
-        Some("-V") | Some("--version") => {
-            println!("hatchery {}", env!("CARGO_PKG_VERSION"));
-            ExitCode::SUCCESS
+    };
+    let code = match command {
+        Command::Help => {
+            print!("{}", args::usage());
+            0
         }
-        other => {
-            match other {
-                Some(arg) => eprintln!("hatchery: unexpected argument {arg:?}"),
-                None => eprintln!("hatchery: no subcommand implemented yet"),
-            }
-            eprint!("{USAGE}");
-            ExitCode::FAILURE
+        Command::Version => {
+            println!("{VERSION}");
+            0
         }
-    }
+        Command::Chat(chat_args) => {
+            let state = state_dir(chat_args.state_dir.clone());
+            hatchery_cli::chat::run(state, chat_args).await
+        }
+        Command::Exec(exec_args) => {
+            let state = state_dir(exec_args.state_dir.clone());
+            let mut out = hatchery_cli::exec::StdoutOut;
+            hatchery_cli::exec::run(state, &exec_args, &mut out)
+                .await
+                .exit_code()
+        }
+        Command::Daemon(action) => hatchery_cli::daemon_cmd::run(&action).await,
+        Command::Doctor(doctor_args) => hatchery_cli::doctor_cmd::run(&doctor_args).await,
+    };
+    ExitCode::from(code.clamp(0, 255) as u8)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::USAGE;
-
-    #[test]
-    fn usage_names_the_roadmap() {
-        assert!(USAGE.contains("docs/roadmap.md"));
-    }
+fn state_dir(override_path: Option<std::path::PathBuf>) -> hatchery_daemon::discover::StateDir {
+    override_path.map_or_else(
+        hatchery_daemon::discover::StateDir::standard,
+        hatchery_daemon::discover::StateDir::at,
+    )
 }

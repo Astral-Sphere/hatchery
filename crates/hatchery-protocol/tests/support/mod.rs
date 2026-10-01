@@ -171,6 +171,7 @@ pub fn items() -> Vec<(&'static str, Item)> {
                 name: "read_file".to_owned(),
                 args: serde_json::json!({"path": "crates/hatchery-store/src/tree.rs", "limit": 40}),
                 status: ToolStatus::Completed,
+                provider_call_id: Some("call_00_probe".to_owned()),
             }),
             TIMESTAMP.as_unix_millis() + 3,
         ),
@@ -372,6 +373,7 @@ pub fn method_params() -> Vec<(&'static str, Value)> {
                     name: "hatchery-cli".to_owned(),
                     version: "0.1.0".to_owned(),
                 }),
+                boot_token: Some("boot-1234".to_owned()),
             }),
         ),
         (

@@ -105,6 +105,11 @@ pub struct HelloParams {
     /// Identifying the caller, for logs and for frontend-specific behaviour.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client: Option<ClientInfo>,
+    /// The daemon's boot token, from `daemon.json` (0600): proof the caller could read the
+    /// user's own state directory. Additive field; a peer that does not send one simply sends
+    /// none, and the daemon decides whether that is acceptable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boot_token: Option<String>,
 }
 
 /// What a daemon can do, for a frontend that wants to degrade gracefully.
@@ -715,6 +720,7 @@ mod tests {
                 name: "hatchery-cli".to_owned(),
                 version: "0.1.0".to_owned(),
             }),
+            boot_token: Some("boot-1234".to_owned()),
         };
         let json = serde_json::to_string(&params).expect("serialize");
         assert_eq!(
@@ -725,6 +731,7 @@ mod tests {
         let anonymous = HelloParams {
             protocol_version: crate::PROTOCOL_VERSION.to_owned(),
             client: None,
+            boot_token: None,
         };
         assert!(
             !serde_json::to_string(&anonymous)

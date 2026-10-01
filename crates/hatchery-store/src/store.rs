@@ -42,6 +42,13 @@ pub trait SessionStore: Send + Sync {
         patch: SessionPatch,
     ) -> Result<Session, StoreError>;
 
+    /// Bumps the runtime generation and returns the session as it is now.
+    ///
+    /// Generation is deliberately outside `SessionPatch` (invariant 1): it moves only when a
+    /// new runtime takes the session over, which is exactly this operation and nothing else.
+    /// Clients compare what they last saw against the returned row.
+    async fn bump_generation(&self, session: SessionId) -> Result<Session, StoreError>;
+
     /// Lists sessions, most recently updated first.
     async fn list_sessions(
         &self,
@@ -211,6 +218,11 @@ impl SessionStore for TursoStore {
 
     async fn session(&self, session: SessionId) -> Result<Session, StoreError> {
         self.ask(|reply| StoreCmd::Session { session, reply }).await
+    }
+
+    async fn bump_generation(&self, session: SessionId) -> Result<Session, StoreError> {
+        self.ask(|reply| StoreCmd::BumpGeneration { session, reply })
+            .await
     }
 
     async fn update_session(

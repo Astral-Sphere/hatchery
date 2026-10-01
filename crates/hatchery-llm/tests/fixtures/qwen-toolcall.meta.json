@@ -1,0 +1,12 @@
+{
+  "http_status": 200,
+  "model": "qwen3.8-flash",
+  "provenance": "recorded",
+  "provider": "qwen",
+  "recorded_at_unix": 1790843646,
+  "recorded_at_utc": "2026-10-01T08:34:06Z",
+  "recorder": "cargo xtask record-fixtures",
+  "sanitizer": "exact-key and sk-pattern scan passed",
+  "shape": "a function call streamed in fragments, finish_reason tool_calls",
+  "wire": "chat-completions"
+}

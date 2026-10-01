@@ -70,6 +70,7 @@
 //! ```
 
 mod approval;
+pub mod client;
 mod content;
 mod error;
 mod event;
@@ -84,6 +85,7 @@ mod usage;
 mod version;
 
 pub use approval::{ApprovalOption, ApprovalRequest, RiskLevel};
+pub use client::{ClientError, DaemonClient, EventStream};
 pub use content::{Content, ContentPart, SignatureBlock};
 pub use error::{ErrorCode, ErrorObject, EventError, UnknownErrorCode};
 pub use event::{DaemonEvent, ServerEvent, SessionEvent};
