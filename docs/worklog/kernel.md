@@ -28,6 +28,10 @@
 
 ## 变更日志
 
+### 2026-10-01 · turn_running 句柄信号（M1 Phase 5）
+
+`AgentHandle` 增加只读的 turn 在跑信号：agent 持 `watch::Sender<bool>`，`transition()` 里以 `send_if_modified` 镜像 `TurnState::is_active`，handle 侧 `turn_running()` 直接 `borrow()` 读。选 watch 而非事件回推，是因为读者（manager 的忙拒、空闲 sweep）是**轮询语义**——在两个 prompt 之间问一嘴，不跟着 turn 走。这打破了「Phase 1 的 RateLimited 是唯一 kernel 改动」的记录：is_busy 原实现（`!is_closed()`）测的是「agent 活着」，daemon 拿它当「turn 在跑」用，两处调用方都被误导（忙拒缺失、空闲卸载永不触发）——信号必须来自状态机本身，而不是从通道状态反推。回归测试 `turn_running_tracks_the_state_machine` 用 gated provider 钉住开/关两个时刻。
+
 ### 2026-09-30 · RateLimited 透传通道（M1 Phase 1）
 
 llm adapter 的重试退避需要一个能让前端倒计时的通知，但 `LlmProvider` 没有 sink 可发。定案：`StreamEvent` 与 `KernelEvent` 各加一个 `RateLimited { retry_after_ms }` 变体，kernel 收到后**只转发不解释**（round 状态不动）——它是一条信息，不是一个迁移。`is_control` 语义自动正确（不在 delta 白名单里），serde 形状 `rate_limited` 与 protocol 的 `ServerEvent::RateLimited` 对齐。这是 M1 计划中唯一预期的 kernel 改动。

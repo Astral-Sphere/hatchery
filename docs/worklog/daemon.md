@@ -10,6 +10,8 @@
 
 **M1 Phase 4 补齐（2026-09-30，评审④）**：生产入口 `entry`（audit → 锁 → store → serve → 信号驱动的逆序 teardown）、stdio 监听（连接循环泛化出传输）、tracing 落盘轮转（日轮转 + 14 天保留）、空闲 sweep 调度、`doctor` 探测模块。CLI 半边见 `worklog/cli.md`。
 
+**M1 Phase 5 收口（2026-10-01，评审⑤）**：四处行为修正（见变更日志）+ e2e 场景与不变量组落地（hatchery-tests，测试面记录见 `worklog/testing.md`）。
+
 ## 待办
 
 - [x] (M1) 单实例：daemon.lock（fs2 独占）+ daemon.json（0600、write-then-rename）+ boot token；锁独占与死 pid 判定已测（attach-or-spawn 的 CLI 半边随 Phase 4）
@@ -35,6 +37,15 @@
 - **Phase 4 实测备注（2026-09-30）**：单进程内的两次 `acquire_instance`：fs2 走 flock(LOCK_EX|LOCK_NB)，同进程异 fd 同样冲突（`a_second_start` 集成测试钉住）。
 
 ## 变更日志
+
+### 2026-10-01 · M1 Phase 5 收口（评审⑤）
+
+四处修正，全部先有测试再改（e2e 的失败暴露了前三处）：
+
+1. **turn 在跑的判定换成状态机自己的话**（kernel 加 `AgentHandle::turn_running()`，watch 镜像 `TurnState::is_active`）：`SessionRuntime::is_busy` 原来的 `!handle.is_closed()` 测的是「agent 活着」——manager 的忙拒因此缺失（kernel 静默丢弃 mid-turn prompt，调用方却拿到 Ok），`sweep_idle` 的 `!is_busy` 谓词永远为假，**空闲卸载从未触发过**（D2 形同虚设）。
+2. **`session/prompt` 忙拒**：turn 在途时返回 `TurnInProgress`（`core::turn_in_progress()` 终于有了调用方）；e2e 用 MockWire 延迟 5s 制造确定性在途 turn，第二 prompt 拒绝 + cancel 后原 turn 以 `Interrupted`（`TurnFinished`，不是 `TurnFailed`——中断是一种正常收束）收束。
+3. **`session/load` 的 `replay_from` 语义修正**：协议文档说「该 item 之后」，实现却把它当 `rebuild_chain` 的 head（「到 head 为止」）直透——重连补差会拿到整段旧历史装作成功。现在在 manager 解析：活动分支上定位游标、只返回其后 item；游标不在活动分支上按 `InvalidRequest` 拒绝（宁可报错也不整段重放）。
+4. **echo 判定与 adapter 同源**：manager 原来用 `CapabilityTable::builtin()` 决定推理是否回填历史，provider 却用 config 覆盖后的表决定请求——config 的 `echo_reasoning` 覆盖只对一半生效。`ProviderConfig::capability_table()` 成为唯一折算点，`provider_for` 一并返回 echo。
 
 ### 2026-10-01 · M1 Phase 4 补齐（评审④）
 

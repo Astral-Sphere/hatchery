@@ -82,7 +82,7 @@ sections（有序）:
 
 ## 开放问题
 
-1. 项目级 prompt 文件是否兼容识别 `HATCHERY.md`（自有品牌）与 `AGENTS.md`（生态）双文件名——倾向都认，AGENTS.md 优先，M1 定。
+1. ~~项目级 prompt 文件是否兼容识别 `HATCHERY.md`（自有品牌）与 `AGENTS.md`（生态）双文件名~~ → **决策记录（2026-10-01，M1 收口）**：**`AGENTS.md` 为主文件名，`HATCHERY.md` 兼容认读**——两处同名并存时 AGENTS.md 优先、发出一次 warning。理由：AGENTS.md 已是多家 agent 工具的事实惯例，用户的同一个文件应能同时喂给 hatchery 与其他工具；自有双文件名只增加「该写哪个」的犹豫，不增加表达力。实现（工作区层级向上发现 + project_context section 注入 + 来源标注 + 发现 golden 测试）排 M2，M1 只落此决策。
 2. ~~配置 schema 校验失败的降级策略~~ → **已定（2026-09-28）**：**逐 key 忽略 + warning**，不整文件拒绝。理由：一个坏 key 不该让整个 daemon 起不来（与 ADR-0009 的 fail-loud 不冲突——fail-loud 指「必需组件缺失要拒绝服务」，配置里的可选 key 缺失只需报告）；每条 warning 带 key 路径、来源层级与原因，`config/get` 能查到「此 key 被忽略」。安全相关 key 解析失败时**取最严格默认值**并升级为 error 级日志。
 3. ~~gettext vs fluent~~ → **已定（2026-09-28，ADR-0011）**：fluent。实测依据见 §3 开头与 worklog/platform.md。
 4. prompt 文件存放：~~独立 crate vs 各 crate prompts/ 目录~~ → **已定（2026-09-28）**：各 crate 自己的 `prompts/` 目录 + `include_str!` 嵌入，**不新建 `hatchery-prompts` crate**——prompt 装配的唯一消费者是 daemon（前端经 `prompt/render` 协议查看），按 ADR-0009 的反预拆分刹车，第二个消费者出现前不拆。

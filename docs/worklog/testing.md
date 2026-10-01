@@ -18,11 +18,11 @@
 - [x] (M0) 三平台 CI 首跑通过（第 2 次尝试；windows MSYS2 ucrt64 那条也过了）
 - [x] (M0b) store 属性测试参考模型（testkit 里独立写的 `ReferenceTree`）+ kill -9 崩溃测试框架（测试二进制自重入，无需专用二进制）
 - [ ] (M1) testkit 余下部分：MockWire(sse fixture)/Memory 后端三件套/TempWorkspace/TestDaemon/ClientProbe（kernel 四接缝的 fake 与 `ReferenceTree` 已于 M0b 交付）——**MockWire + fixture 加载（09-30）、MemoryFs + TempWorkspace 与 TestDaemon + ClientProbe（10-01）已交付；MemoryTerminal 随 M2 的 PTY**
-- [ ] (M1) 建 `hatchery-tests` 成员 crate（跨 crate e2e 与不变量套件的家）
-- [ ] (M1) MSRV job 进 nightly（`cargo +1.90.0 check`），防依赖升级悄悄抬高下限
+- [x] (M1) 建 `hatchery-tests` 成员 crate（跨 crate e2e 与不变量套件的家；2026-10-01 落地，13th member + layering 表同步）
+- [x] (M1) MSRV job 进 nightly（`cargo +1.90.0 check --workspace --all-targets --locked`；本地 1.90.0 工具链实测通过），防依赖升级悄悄抬高下限
 - [x] (M1) fixture 录制 xtask + 脱敏（API key 扫描）+ provenance 元数据格式（2026-09-30：`cargo xtask record-fixtures`，sidecar `*.meta.json`，扫描命中即拒写）
-- [ ] (M1) 不变量套件 `invariants` 分组填满（现在 4 条：store 的 3 条 + 影子 Git 的 1 条；4 编译期已保；1/2/5 随 M1-M2；6 已有引擎级实测，M2 补 store/tool 层）
-- [ ] (M1) e2e 场景 1-2 落地（最小对话、双前端扇出）
+- [x] (M1) 不变量 1/2 落地（2026-10-01）：`invariants` 分组从 4 条涨到 8 条——新增客户端代际过滤、会话租约拒绝、20 线程单实例竞态、逐字节 reasoning 回放；5（硬门）与 3/6 的 store/tool 层补充随 M2
+- [x] (M1) e2e 场景 1-2 落地（2026-10-01，hatchery-tests）：最小对话 + resume + 逐字节回放、双前端扇出 + 重连补差；D7 子进程对比一并交付
 - [ ] (M2) 影子 Git 安全测试补全（硬门、PTY 孤儿进程）；fuzz targets 上线 nightly
 - [ ] (M2) e2e 场景 3-6；契约测试套件（LlmProvider/SessionStore/FsBackend/TerminalBackend/ApprovalGate）
 - [ ] (M2) `disallowed_methods` 的 compile-fail 测试（trybuild 类）——M0a 只做了人工实测，未自动化
@@ -76,6 +76,36 @@
 
 ## 变更日志
 
+### 2026-10-01 · M1 Phase 5（e2e + 门禁收口）
+
+**`hatchery-tests` 落地（第 13 member，Dev 层）**：场景 1/2、invariants 组、D7 子进程对比共用一个 lib target（SSE fixture 常量、provider 配置层、事件收集助手）。共享 fixture 走 lib 而不是 `tests/support/mod.rs`，是为了不让 clippy 的 dead_code 规则跟「这个测试二进制只用了一半助手」较劲。
+
+**e2e 场景 1（最小对话 + 不变量 2）**：`invariant_minimal_chat_replays_reasoning_byte_exact`——prompt → 流式（事件序与 kernel 文档化序列的 wire 投影逐项比对）→ 落库（session/load 三类 item）→ 第二 turn 请求体**整表逐字节**命中：`messages` 数组与手写期望做 `Value` 相等（serde 字符串相等即字节相等，fixture 的 reasoning 含首尾空格/中文/换行/制表符）。配套 `a_reconnecting_frontend_gap_fills_from_the_store` 钉 `replay_from` 的补差语义。
+
+**e2e 场景 2（双前端 + 重连）**：两 probe 全序列相等；断线后 `session/load(replay_from)` 补差 + 重订阅续流。
+
+**invariants 组 4 → 8**：客户端代际过滤（假 UDS 服务端推 5/3/7，前端只见 5/7）、会话租约（MockWire 延迟 5s 制造在途 turn，第二 prompt 拒绝 + cancel 后原 turn 以 Interrupted 收束）、20 线程单实例竞态（恰一胜者）、逐字节回放（场景 1 兼任）。
+
+**D7 定案（design/testing.md 开放问题 4）**：同一场景两种形态对比后，e2e 默认维持进程内过真 socket；真子进程形态保留一条常驻对比测试（`e2e_daemon` bin + 真实 daemon.json 发现）。详见设计文档条目。
+
+**四个行为修正（e2e 落地前先补齐语义，均有 crate 内测试）**：
+1. kernel `AgentHandle::turn_running()`（watch 镜像状态机）——此前 `is_busy` 用 `!is_closed()` 把「agent 活着」当「turn 在跑」，manager 的忙拒缺失、空闲 sweep 谓词永远为假（D2 形同虚设）。
+2. `session/prompt` 忙拒：第二 prompt 返回 `TurnInProgress`（此前 kernel 静默丢弃、调用方却拿到 Ok）。
+3. `session/load` 的 `replay_from` 从 store 直透改为「活动分支上该 item 之后」——协议语义与 `rebuild_chain` 的「到 head 为止」不一致是潜伏 bug；游标不在活动分支上返回 `InvalidRequest`。
+4. manager 的 echo 判定改读 resolved provider config 的折叠能力表（`ProviderConfig::capability_table`，与 adapter 同源）——此前只读 built-in 表，config 的 `echo_reasoning` 覆盖只对 wire 生效、对历史回填无效。
+
+**门禁**：`cargo xtask coverage` 升级为按 crate 折算 + 阈值 enforce（`--report-only` 逃生），执行位在 nightly；nightly 新增 `msrv` job。折算规则（`crates/<name>/src` 前缀、tests 目录不计）与表结构由 xtask 单元测试钉住；llvm-cov 未装时照旧 fail-loud。
+
+**本轮实测计数**（`cargo nextest run --workspace`，2026-10-01）：默认组 **458** 项全绿（另有 1 项崩溃重入入口 skipped）——protocol 109、store 73、daemon 60、llm 50、kernel 47、tools 30、cli 24、capabilities 22、xtask 24、testkit 11、tests 8；invariants 组 8 项。`cargo xtask layering`：13 members、32 build edges + 8 dev edges。
+
+**M1 手动 live 验收清单（评审⑤前由用户执行，结果记本文件）**：
+- [ ] `hatchery doctor --provider deepseek` / `--provider qwen`：两轮探测（默认出推理 / 关掉推理）均 ok；
+- [ ] `hatchery exec "你好，介绍一下你自己"`（真实模型）：流式纯文本、退出码 0；`--json` 每行 item 级事件、含 reasoning；
+- [ ] TUI：`hatchery chat` 发起对话，reasoning 默认折叠、Ctrl+R 展开；`/effort off` 后下一条不再出现推理；
+- [ ] resume：`hatchery exec --session <id> "继续"`（关掉先前终端重开），第二 turn 正常续上历史；
+- [ ] 双前端扇出：两个终端同时 attach 同一会话，一边 prompt，两边消息流一致；
+- [ ] 真实 provider 的回放命中：TUI 中对同一会话追问一轮，观察无上下文丢失（逐字节断言的 mock 已覆盖，live 侧以对话连贯性佐证）。
+
 ### 2026-10-01 · M1 Phase 3（daemon 的测试面）
 
 **TestDaemon 起真 socket**：TestDaemon = 真 turso 库（tempdir）+ 真 LayeredConfig + 真 UDS 监听；ClientProbe = hello（带 boot token）+ 类型化调用 + `EventStream` 订阅。design/testing.md 开放问题 4（e2e 形态）**就此定默认：进程内但走真 socket**——一个 tempdir 的代价，换来 UDS/分帧/路由/扇出全链路覆盖。真子进程形态（覆盖 daemon.json 生命周期与进程崩溃）留给需要它的场景再对比。
@@ -83,8 +113,6 @@
 **二分测试的用法被验证了一次**：双前端扇出测试超时，先直订 hub（过）再断 socket 半段（断）→ 定位到 server 的会话提取把整个 Session 对象当 id 反序列化。失败面大的时候，「在链路上逐段放探针」比读代码猜快得多。
 
 **determinism 步骤与有意修改的摩擦**：门禁的 determinism 检查把「工作树里有未提交的 fixture 改动」一律当测试改写 golden。本批有两个**有意**的 protocol fixture 更新（provider_call_id、boot_token），在提交前该步骤会保持红——这是步骤设计与「分阶段交付未提交」的已知摩擦，不是回归；提交即恢复。
-
-### 2026-10-01 · M1 Phase 2（capabilities/tools 的测试面）
 
 ### 2026-10-01 · M1 Phase 2（capabilities/tools 的测试面）
 

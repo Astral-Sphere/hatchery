@@ -1,6 +1,6 @@
 # 路线图（M0–M5）
 
-> 每个里程碑的完成定义（DoD）都包含：`cargo test`/`clippy` 全绿 + 列出的端到端验证 + worklog 更新。测试分层、CI 门禁与「不变量 → 测试」映射见 [design/testing.md](design/testing.md)；各里程碑的测试交付物已列入其范围与 [worklog/testing.md](worklog/testing.md)。当前进度：**M0 完成**（脚手架 + 门禁 + 三平台 CI 跑通 + 三个 spike + protocol/kernel/store 实现，`./scripts/ci.sh` 本地全绿），M1（最小对话闭环）未开工。
+> 每个里程碑的完成定义（DoD）都包含：`cargo test`/`clippy` 全绿 + 列出的端到端验证 + worklog 更新。测试分层、CI 门禁与「不变量 → 测试」映射见 [design/testing.md](design/testing.md)；各里程碑的测试交付物已列入其范围与 [worklog/testing.md](worklog/testing.md)。当前进度：**M0 完成**；**M1 代码完成**（2026-10-01，Phase 1–5 全部落地：llm adapter + 能力表、capabilities/tools、daemon 全栈、cli TUI/exec、e2e 与不变量收口，`./scripts/ci.sh` 本地全绿），待评审⑤与手动 live 验收后收口。
 
 ## M0 — 地基（scaffold + 核心类型）
 
@@ -25,6 +25,7 @@
 - `hatchery doctor`。
 
 **DoD**：真实 provider 端到端对话（流式 + reasoning 展示与回放命中验证）；关终端重开会话 resume；两前端同时 attach 扇出一致。
+→ **代码侧全绿**（2026-10-01）：mock wire 的 e2e 场景 1/2 与不变量组在 `hatchery-tests`；第二 turn 请求体对已存 reasoning 做了逐字节断言（不变量 2）。**真实 provider 的手动验收清单**见 worklog/testing.md（M1 条目），通过后 M1 收口。
 
 ## M2 — Code 模式（工具、审批、回滚、编辑分叉）
 

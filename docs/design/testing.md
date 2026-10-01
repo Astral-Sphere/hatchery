@@ -25,7 +25,7 @@
 组织与命名约定：
 
 - 单元测试：crate 内 `#[cfg(test)]`，文件名 `测试对象::行为::预期`（如 `edit_fork_on_tool_result_starts_new_turn`）。
-- 集成测试：各 crate `tests/`。跨 crate 的 e2e 与不变量套件放独立成员 crate `hatchery-tests`（dev-depend 全家）——workspace 根是虚拟 manifest，不能有顶层 `tests/`；该 crate 在 M1 第一条 e2e 落地时才建（反预拆分刹车：M0 的不变量测试都能待在 store/capabilities 自己的 `tests/` 里）。
+- 集成测试：各 crate `tests/`。跨 crate 的 e2e 与不变量套件放独立成员 crate `hatchery-tests`（依赖全家）——workspace 根是虚拟 manifest，不能有顶层 `tests/`。**已落地（M1 Phase 5）**：场景 1/2、invariants 组与 D7 的子进程对比都住在里面；共享 fixture（SSE 字节、provider 层、收集助手）经它的 lib target 提供。
 - runner：**cargo-nextest**（分组、重试标记、JUnit 输出）；快照断言：**insta**（golden file，`INSTA_UPDATE=always` 审阅流）；属性测试：**proptest**。
 - 分组：Rust 无法按属性过滤测试，所以用**命名前缀** + `.config/nextest.toml` 的 `default-filter` 实现（原设计的 `#[live]` 属性标记不可行）：
   - `live_*` 真实网络/需 secrets，另外再用 `live-tests` cargo feature 双保险（默认不编译）；
@@ -193,8 +193,8 @@ GUI 是测试最薄弱层，策略 = 「逻辑出 GTK，GTK 只做投影」+ 分
 
 | 场景 | 里程碑 | 断言要点 |
 |---|---|---|
-| 最小对话：prompt → 流式响应 → 落库 → resume | M1 | 事件序、DB items、reasoning 回放（第二 turn 请求体逐字节） |
-| 双前端扇出一致性 | M1 | 两 probe 事件序列相同；断线重连 replay 补齐 |
+| 最小对话：prompt → 流式响应 → 落库 → resume | M1 | 事件序、DB items、reasoning 回放（第二 turn 请求体逐字节）。**已落地**：`invariant_minimal_chat_replays_reasoning_byte_exact` + `a_reconnecting_frontend_gap_fills_from_the_store`（hatchery-tests） |
+| 双前端扇出一致性 | M1 | 两 probe 事件序列相同；断线重连 replay 补齐。**已落地**：`two_frontends_see_identical_sequences_and_a_reconnect_gap_fills`（hatchery-tests） |
 | Chat→Code 切模式 | M2 | 工具表变化在 turn 边界生效 |
 | 编辑分叉重演 + 分支删除 | M2 | 新旧分支 rebuild、级联删除、active_head 校验 |
 | 写坏文件 → rewind 三 scope | M2 | 工作区文件恢复、对话回退、检查点联动 |
@@ -209,8 +209,8 @@ GUI 是测试最薄弱层，策略 = 「逻辑出 GTK，GTK 只做投影」+ 分
 
 | 不变量（architecture.md §5） | 专属测试 |
 |---|---|
-| 1 单一 runtime 所有者 | `invariant_stale_runtime_events_are_dropped`、`invariant_session_lease_blocks_second_runtime`、单实例竞态 |
-| 2 模型可见=已记录 | e2e 每场景收尾断言「重建上下文 == MockWire 实际收到的请求体」（逐 turn） |
+| 1 单一 runtime 所有者 | `invariant_stale_runtime_events_are_dropped`（客户端代际过滤，hatchery-tests）、`invariant_session_lease_blocks_second_runtime`（第二 prompt 拒绝，hatchery-tests）、`invariant_single_instance_race_admits_exactly_one_winner`（20 线程竞态，hatchery-tests）。**三条均已落地** |
+| 2 模型可见=已记录 | e2e 每场景收尾断言「重建上下文 == MockWire 实际收到的请求体」（逐 turn）。**已落地**：场景 1 对第二 turn 请求体的 messages 数组做整表比对（serde 字符串相等即字节相等，含首尾空白/unicode/换行） |
 | 3 items append-only | `invariant_items_are_never_rewritten`、`invariant_the_database_refuses_to_update_an_item`（**均已落地**：前者断言编辑后原 item 逐字段不变，后者直接用第二条连接 `UPDATE items` 被触发器拒绝，错误带我们的消息；引擎级 `invariant_items_update_trigger_aborts` 于 M0a 实测）、store 属性测试 |
 | 4 工具只经接缝 | clippy `disallowed_methods`（编译期；**实测**：workspace 级 allow + `hatchery-tools` crate 属性 deny，违规确实报错）+ 工具单测只注入 Memory 后端（运行期证明） |
 | 5 安全门不可覆盖 | `invariant_project_config_cannot_disable_hard_gates` + prompts 覆盖正反用例 |
@@ -235,7 +235,7 @@ GUI 是测试最薄弱层，策略 = 「逻辑出 GTK，GTK 只做投影」+ 分
 
 **live 组（不进 CI，手动/自托管）**：需要真实 provider 密钥；`cargo nextest run -E 'test(live_)'`；触发时机 = 新 provider 接入、上游 openai-interface 升级、能力表改动。结果记 worklog/llm.md。
 
-**覆盖率**：cargo-llvm-cov，PR 报告不 block；阈值（line）：kernel/store/llm/capabilities ≥ 85%，protocol/daemon ≥ 80%，cli ≥ 60%，gui 豁免（view-model 部分 ≥ 80%）。覆盖率是指标不是目标——不变量套件与属性测试的通过优先于数字。
+**覆盖率**：cargo-llvm-cov，PR 报告不 block；阈值（line）：kernel/store/llm/capabilities ≥ 85%，protocol/daemon ≥ 80%，cli ≥ 60%，gui 豁免（view-model 部分 ≥ 80%）。**阈值已 enforce（M1 Phase 5）**：`cargo xtask coverage` 把 llvm-cov 的逐文件报告按 `crates/<name>/src` 前缀折算成 crate 线覆盖（tests 目录不计），低于下限即失败；`--report-only` 只出表。执行位在 nightly（不是 PR 门禁）——挡百分比易诱发凑数，nightly 失败则点名漂移的 crate。**MSRV**：nightly 另有 `msrv` job，`cargo +1.90.0 check --workspace --all-targets --locked`。覆盖率是指标不是目标——不变量套件与属性测试的通过优先于数字。
 
 ## 9. 手动实测清单（模板）
 
@@ -251,4 +251,4 @@ GUI 是测试最薄弱层，策略 = 「逻辑出 GTK，GTK 只做投影」+ 分
 1. ~~testkit 的 `dummy-acp-agent`、`dummy-provider` 等辅助二进制以 workspace member（`[[bin]]` + `required-features = ["testkit"]`）还是独立小 crate 存在~~ → **已定（2026-09-28，M0b）**：需要「真实子进程」的测试用**测试二进制自重入**——`std::env::current_exe()` + 环境变量 + 一个 `#[ignore]` 的入口测试。崩溃恢复测试（`crash_recovery.rs`）就是这么做的：不新增 target、不发布任何二进制、三平台同一份代码，子进程拿到的是真正的 `TursoStore` 而不是副本。M3 的 `dummy-acp-agent` 仍是另一回事（它需要被 ACP client 当作**外部程序**拉起），继续倾向 workspace member + `required-features`。
 2. cargo-mutants 的投入产出（跑一次全 workspace 很慢）——先 nightly 只对 store/kernel，M2 评估。
 3. GUI 快照测试（截图 diff）是否引入（GTK 渲染跨环境像素不稳定，倾向只做 RTL/i18n 人工存档）——M4 评估。
-4. e2e 是否需要「真实 daemon 子进程」形态（当前 TestDaemon 是进程内；进程形态额外覆盖 UDS/序列化层，代价是测试变慢）——M1 各做一条对比后定默认形态。
+4. **已定（2026-10-01，M1 D7）**：e2e 默认形态维持**进程内过真 socket**（TestDaemon），另有一条真子进程对比测试常驻 `hatchery-tests`（`a_real_subprocess_daemon_serves_the_same_scenario` + `e2e_daemon` bin）。对比实测：同一最小场景，进程内 ~0.15s，子进程 ~0.2s（多 fork/exec + daemon.json 轮询），两者断言集合相同；子进程额外覆盖的只有 entry 壳（fork/exec、published pid、跨进程 UDS）——而 entry 生命周期已由 daemon 的 entry 集成测试专测。结论：e2e 场景不默认起子进程；「进程形态」的覆盖由 entry 测试 + 这一条对比测试供给，M3 的 ACP 委派场景复跑时再评估是否扩子进程形态。

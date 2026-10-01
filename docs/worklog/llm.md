@@ -32,6 +32,10 @@ M1 Phase 1 代码完成：ChatCompletions adapter、能力表 v1、重试/退避
 
 ## 变更日志
 
+### 2026-10-01 · capability_table 单点折算（M1 Phase 5）
+
+`ProviderConfig::capability_table()` 成为「built-in 表 + config 覆盖」的唯一折算点：adapter（`with_client`）与 daemon（`provider_for` 的 echo 判定）都从它取表。动机：manager 原来自行 `CapabilityTable::builtin()` 取 `echo_reasoning`，而 provider 用覆盖后的表决定请求是否携带 reasoning——config 的 echo 覆盖只对 wire 生效、对历史回填无效，两边各自为政。现在的约束是结构性成立的：想拿这张表，只有这一个入口。
+
 ### 2026-09-30 · 模型世代校准（用户实测驱动的重校准）
 
 用户指出内置目录过时：两家当前都是**混合推理单模型**，默认带推理，请求参数可关——DeepSeek 当前模型 **`deepseek-flash`**（初报为 `deepseek-chat`，随后更正；此前的真实录制早已旁证：请求发 `deepseek-chat`，响应 `model` 字段实际解析为 `deepseek-flash`，见 2026-10-01 条目第 4 条）与 Qwen **`qwen3.8-flash`**。openai-interface 0.14 的 wire 类型对得上：DeepSeek `thinking: {type: enabled|disabled}`（默认 enabled）、Qwen `enable_thinking: bool` + `thinking_budget`。改动：
