@@ -6,8 +6,8 @@ fn workspace_layering_contract_holds() {
     let report =
         xtask::layering::check().expect("layering contract violated; see docs/architecture.md §3");
     assert_eq!(
-        report.members, 12,
-        "expected 12 workspace members (11 crates + xtask); update docs/architecture.md §3, \
+        report.members, 13,
+        "expected 13 workspace members (12 crates + xtask); update docs/architecture.md §3, \
          docs/roadmap.md M0 and xtask::layering::LAYERS together"
     );
     assert!(

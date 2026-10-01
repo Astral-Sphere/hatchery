@@ -346,10 +346,11 @@ impl SessionRuntime {
         })
     }
 
-    /// True while a turn is running (the kernel's own view, not the session row's).
+    /// True while a turn is running: the kernel state machine's own view, read by the
+    /// second-prompt refusal and the idle sweep alike.
     #[must_use]
     pub fn is_busy(&self) -> bool {
-        !self.handle.is_closed()
+        self.handle.turn_running()
     }
 
     /// Stops the agent. The command channel closes with the task, so a frontend holding the

@@ -360,6 +360,11 @@ impl Drop for EventStream {
 
 /// Reads the events connection forever: replies resolve the pending call, everything else is
 /// parsed as a session event.
+///
+/// Events carrying a generation *below* the highest one already seen are dropped (invariant 1,
+/// the client half): an assembly bumps the generation before its first event goes out, so a
+/// lower one can only be an older runtime's straggler — replaying it would overwrite newer
+/// state with stale deltas.
 fn spawn_event_router(
     pending: Arc<Mutex<Option<PendingReply>>>,
     read: tokio::net::unix::OwnedReadHalf,
@@ -367,6 +372,7 @@ fn spawn_event_router(
 ) {
     tokio::spawn(async move {
         let mut lines = BufReader::new(read).lines();
+        let mut highest_generation = 0_u64;
         loop {
             match lines.next_line().await {
                 Ok(Some(line)) => match rpc::decode_frame(&line) {
@@ -394,6 +400,15 @@ fn spawn_event_router(
                         let value = notification.params.unwrap_or(serde_json::Value::Null);
                         match serde_json::from_value::<SessionEvent>(value) {
                             Ok(event) => {
+                                if event.generation < highest_generation {
+                                    tracing::debug!(
+                                        event_generation = event.generation,
+                                        seen = highest_generation,
+                                        "dropped an event from a superseded runtime"
+                                    );
+                                    continue;
+                                }
+                                highest_generation = event.generation;
                                 if events.send(event).await.is_err() {
                                     return;
                                 }

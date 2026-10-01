@@ -1368,3 +1368,38 @@ fn control_events_are_distinguishable_from_deltas() {
         .ends_turn()
     );
 }
+
+// ------------------------------------------------------------- turn-busy signal
+
+#[tokio::test]
+async fn turn_running_tracks_the_state_machine() {
+    // The daemon's second-prompt refusal and the idle sweep both read this flag, so it must be
+    // the state machine's own view: false before, true the moment the turn opens, false again
+    // once it ends.
+    let (provider, gate) =
+        ScriptedProvider::new(vec![ScriptedProvider::text_round("slow")]).gated();
+    let harness = Harness::new(
+        provider,
+        ScriptedToolHost::new(),
+        MemoryHistory::empty(),
+        TurnLimits::default(),
+    );
+    assert!(!harness.handle.turn_running(), "idle at birth");
+
+    harness.prompt("hello").await;
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while !harness.handle.turn_running() {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the turn opened");
+
+    // One permit per scripted event: the delta and the Done.
+    gate.release(2);
+    harness.finish().await;
+    assert!(
+        !harness.handle.turn_running(),
+        "a finished turn is not running"
+    );
+}

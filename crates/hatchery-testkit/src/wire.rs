@@ -40,6 +40,25 @@ impl MockWire {
         Self { server }
     }
 
+    /// [`Self::replay_sse`], but the answer takes `delay` to arrive.
+    ///
+    /// This is how a test holds a turn in flight deterministically: the request is real and the
+    /// turn is genuinely waiting on the provider, so a second prompt must be refused while the
+    /// clock runs — no sleeping on the test's side required.
+    pub async fn replay_sse_after(body: impl Into<String>, delay: std::time::Duration) -> Self {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(body.into())
+                    .set_delay(delay),
+            )
+            .mount(&server)
+            .await;
+        Self { server }
+    }
+
     /// A wire that answers the first `n` POSTs with `status` and `body`, then streams `then_sse`.
     ///
     /// This is the shape of a rate-limited start: refusals, then service.

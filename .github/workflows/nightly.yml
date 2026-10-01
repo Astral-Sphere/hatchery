@@ -70,6 +70,9 @@ jobs:
       - name: Dependency audit
         run: cargo audit
 
+      # The thresholds of docs/design/testing.md §8 are enforced here, not in the PR gate: a
+      # report that blocks on a percentage invites gaming the number, while a nightly failure
+      # names the crate that quietly drifted.
       - name: Coverage report
         run: cargo xtask coverage
 
@@ -80,6 +83,22 @@ jobs:
           name: coverage
           path: target/llvm-cov/html
           if-no-files-found: warn
+
+  msrv:
+    name: msrv (1.90)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # rust-toolchain.toml names `stable` for the gate; this job pins the declared
+      # rust-version explicitly. The resolver-3 lock is MSRV-aware (workspace Cargo.toml), so
+      # the committed Cargo.lock is what gets checked — a locked dependency needing newer rustc
+      # than 1.90 is exactly what this job exists to catch.
+      - name: Install the pinned MSRV toolchain
+        run: rustup toolchain install 1.90.0 --profile minimal
+
+      - name: Check the workspace on the MSRV
+        run: cargo +1.90.0 check --workspace --all-targets --locked
 
       # TODO(M1): cargo-fuzz short runs, 10min per target (docs/design/testing.md §6)
       # TODO(M2+): criterion baseline comparison, flag >20% regressions (§7)

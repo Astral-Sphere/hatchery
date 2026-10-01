@@ -47,6 +47,7 @@ pub const LAYERS: &[(&str, Layer)] = &[
     ("hatchery-cli", Layer::Frontend),
     ("hatchery-gui", Layer::Frontend),
     ("hatchery-testkit", Layer::Dev),
+    ("hatchery-tests", Layer::Dev),
     ("xtask", Layer::Dev),
 ];
 

@@ -1355,6 +1355,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "hatchery-tests"
+version = "0.0.0"
+dependencies = [
+ "hatchery-daemon",
+ "hatchery-protocol",
+ "hatchery-store",
+ "hatchery-testkit",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "toml",
+]
+
+[[package]]
 name = "hatchery-tools"
 version = "0.0.0"
 dependencies = [

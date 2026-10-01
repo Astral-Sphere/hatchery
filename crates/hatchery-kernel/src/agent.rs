@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use futures::StreamExt;
 use serde_json::Value;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
 use hatchery_protocol::{
@@ -36,6 +36,7 @@ pub struct AgentGone;
 #[derive(Clone, Debug)]
 pub struct AgentHandle {
     commands: mpsc::Sender<AgentCommand>,
+    phase: watch::Receiver<bool>,
 }
 
 impl AgentHandle {
@@ -57,6 +58,16 @@ impl AgentHandle {
     #[must_use]
     pub fn is_closed(&self) -> bool {
         self.commands.is_closed()
+    }
+
+    /// True while a turn is in flight, as the state machine itself sees it.
+    ///
+    /// This is the daemon's refusal signal for a second `session/prompt` (invariant 1) and the
+    /// idle sweep's "is anyone working" — both must read the same truth the turn loop acts on,
+    /// not an approximation derived from the command channel.
+    #[must_use]
+    pub fn turn_running(&self) -> bool {
+        *self.phase.borrow()
     }
 
     /// Asks the running turn to stop.
@@ -103,6 +114,7 @@ impl AgentBuilder {
     #[must_use]
     pub fn build(self) -> (Agent, AgentHandle) {
         let (commands_tx, commands_rx) = mpsc::channel(COMMAND_CAPACITY);
+        let (phase_tx, phase_rx) = watch::channel(false);
         let agent = Agent {
             session: self.session,
             options: self.options,
@@ -113,9 +125,11 @@ impl AgentBuilder {
             turn: TurnId::new(),
             tail: None,
             cancel: CancellationToken::new(),
+            phase: phase_tx,
         };
         let handle = AgentHandle {
             commands: commands_tx,
+            phase: phase_rx,
         };
         (agent, handle)
     }
@@ -141,6 +155,9 @@ pub struct Agent {
     /// foreign key on the next insert.
     tail: Option<ItemId>,
     cancel: CancellationToken,
+    /// Whether a turn is in flight, mirrored out of [`Self::transition`] for the handle. A
+    /// `watch` because readers poll: the daemon checks between prompts, it does not follow along.
+    phase: watch::Sender<bool>,
 }
 
 /// An item that is still being streamed into.
@@ -890,6 +907,15 @@ impl Agent {
     async fn transition(&mut self, to: TurnState) {
         let from = std::mem::replace(&mut self.state, to);
         if from != to {
+            self.phase.send_if_modified(|active| {
+                let next = self.state.is_active();
+                if *active == next {
+                    false
+                } else {
+                    *active = next;
+                    true
+                }
+            });
             self.emit(KernelEvent::StateChanged { from, to }).await;
         }
     }

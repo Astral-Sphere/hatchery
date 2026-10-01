@@ -47,12 +47,7 @@ impl ChatCompletionsProvider {
     /// Builds a provider on a caller-supplied client, for proxies and test doubles alike.
     #[must_use]
     pub fn with_client(config: ProviderConfig, client: reqwest::Client) -> Self {
-        let table = config
-            .capabilities
-            .iter()
-            .fold(CapabilityTable::builtin(), |table, (prefix, caps)| {
-                table.with_override(prefix.clone(), caps.clone())
-            });
+        let table = config.capability_table();
         Self {
             config,
             table,

@@ -16,14 +16,14 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use hatchery_kernel::AgentCommand;
-use hatchery_llm::{CapabilityTable, ChatCompletionsProvider, ProviderRegistry};
+use hatchery_llm::{ChatCompletionsProvider, ProviderRegistry};
 use hatchery_protocol::method::{
     SessionListParams, SessionListResult, SessionLoadParams, SessionLoadResult, SessionNewParams,
     SessionNewResult, SessionPromptParams, SessionPromptResult, SetConfigParams, SetConfigResult,
 };
 use hatchery_protocol::{
-    ErrorCode, EventError, Item, ServerEvent, Session, SessionEvent, SessionId, SessionPatch,
-    SessionStatus, TurnId,
+    ErrorCode, EventError, Item, ItemId, ServerEvent, Session, SessionEvent, SessionId,
+    SessionPatch, SessionStatus, TurnId,
 };
 use hatchery_store::SessionStore;
 
@@ -194,16 +194,49 @@ impl SessionManager {
                 ),
             ));
         }
-        let items: Vec<Item> = self
-            .store
-            .rebuild_chain(params.session_id, params.replay_from)
-            .await
-            .map_err(store_error)?;
+        let items = self
+            .chain_for(params.replay_from, params.session_id)
+            .await?;
         Ok(SessionLoadResult {
             session,
             items,
             next_cursor: None,
         })
+    }
+
+    /// The active branch, honouring the replay cursor.
+    ///
+    /// The protocol's `replay_from` means "items strictly after this one" (a reconnecting
+    /// frontend's gap-fill); the store's `rebuild_chain` head means "the branch ending here", so
+    /// the cursor is resolved against the active branch here, where session semantics live. A
+    /// cursor that is not on the active branch is refused rather than silently ignored — a
+    /// gap-fill that returns the whole branch would look like success while duplicating items.
+    async fn chain_for(
+        &self,
+        replay_from: Option<ItemId>,
+        session_id: SessionId,
+    ) -> Result<Vec<Item>, ManagerError> {
+        let chain = self
+            .store
+            .rebuild_chain(session_id, None)
+            .await
+            .map_err(store_error)?;
+        match replay_from {
+            None => Ok(chain),
+            Some(cursor) => {
+                let position =
+                    chain
+                        .iter()
+                        .position(|item| item.id == cursor)
+                        .ok_or_else(|| {
+                            ManagerError::new(
+                                ErrorCode::InvalidRequest,
+                                "the replay cursor is not on this session's active branch",
+                            )
+                        })?;
+                Ok(chain.into_iter().skip(position + 1).collect())
+            }
+        }
     }
 
     /// `session/prompt`: accept a turn, assembling the runtime first if it is not live.
@@ -234,6 +267,11 @@ impl SessionManager {
             ));
         }
         let runtime = self.ensure_runtime(&session).await?;
+        // The runtime slot is the session's lease (invariant 1): one turn at a time, and the
+        // refusal is the protocol's own error, not a silently dropped command.
+        if runtime.handle.turn_running() {
+            return Err(ManagerError(crate::core::turn_in_progress()));
+        }
         let turn = TurnId::new();
         runtime
             .handle
@@ -416,11 +454,8 @@ impl SessionManager {
     /// Builds a fresh runtime: provider from config, tools from the Chat set, generation bumped
     /// in the store *before* the first event can carry it (invariant 1).
     async fn assemble(&self, session: &Session) -> Result<Arc<SessionRuntime>, ManagerError> {
-        let provider = self.provider_for(&session.model.model)?;
+        let (provider, echo) = self.provider_for(&session.model.model)?;
         let tools = self.chat_tools(session)?;
-        let echo = CapabilityTable::builtin()
-            .capabilities(&session.model.model)
-            .echo_reasoning;
 
         let updated = self
             .store
@@ -473,21 +508,30 @@ impl SessionManager {
     }
 
     /// Resolves a model to a configured provider, caching the adapter in the registry.
-    fn provider_for(&self, model: &str) -> Result<ChatCompletionsProvider, ManagerError> {
+    ///
+    /// Returns the provider's echo decision with it: the same config's capability table the
+    /// adapter folds, so history passback and the wire's requests can never disagree about
+    /// whether reasoning rides back.
+    fn provider_for(&self, model: &str) -> Result<(ChatCompletionsProvider, bool), ManagerError> {
         let (id, provider_config) = self.config.resolve_model(model).ok_or_else(|| {
             ManagerError::new(
                 ErrorCode::ConfigError,
                 format!("no provider serves model `{model}`"),
             )
         })?;
+        let echo = provider_config
+            .capability_table()
+            .capabilities(model)
+            .echo_reasoning;
         let registry = self.providers.lock().expect("providers is not poisoned");
-        match registry.get(&id) {
-            Some(cached) => Ok((*cached).clone()),
+        let provider = match registry.get(&id) {
+            Some(cached) => (*cached).clone(),
             None => {
                 registry.register(id.clone(), provider_config.clone());
-                Ok(ChatCompletionsProvider::new(provider_config))
+                ChatCompletionsProvider::new(provider_config)
             }
-        }
+        };
+        Ok((provider, echo))
     }
 
     /// The Chat toolset over the session's workspace (or the daemon's cwd).
@@ -642,6 +686,74 @@ mod tests {
             .await
             .expect_err("unknown");
         assert_eq!(error.into_event().code, ErrorCode::StoreError);
+    }
+
+    async fn chain_of_three(manager: &SessionManager, session: SessionId) -> Vec<Item> {
+        use hatchery_protocol::{Content, ItemKind};
+        let mut parent = None;
+        let mut items = Vec::new();
+        for text in ["first", "second", "third"] {
+            let mut item = Item::new(session, ItemKind::UserMessage(Content::text(text)));
+            item.parent = parent;
+            parent = Some(item.id);
+            items.push(item);
+        }
+        manager
+            .store
+            .append_items(items.clone())
+            .await
+            .expect("append");
+        items
+    }
+
+    #[tokio::test]
+    async fn a_replay_cursor_returns_only_items_after_it() {
+        let (_dir, manager, _hub) = manager().await;
+        let created = manager.new_session(new_params()).await.expect("created");
+        let items = chain_of_three(&manager, created.session.id).await;
+
+        let gap: Vec<String> = manager
+            .load(SessionLoadParams {
+                session_id: created.session.id,
+                replay_from: Some(items[0].id),
+                generation: None,
+            })
+            .await
+            .expect("gap-fill")
+            .items
+            .iter()
+            .map(|item| match &item.kind {
+                hatchery_protocol::ItemKind::UserMessage(content) => content.text.clone(),
+                other => panic!("unexpected item: {other:?}"),
+            })
+            .collect();
+        assert_eq!(gap, vec!["second".to_owned(), "third".to_owned()]);
+
+        let whole = manager
+            .load(SessionLoadParams {
+                session_id: created.session.id,
+                replay_from: None,
+                generation: None,
+            })
+            .await
+            .expect("whole branch");
+        assert_eq!(whole.items.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn a_replay_cursor_off_the_active_branch_is_refused() {
+        let (_dir, manager, _hub) = manager().await;
+        let created = manager.new_session(new_params()).await.expect("created");
+        chain_of_three(&manager, created.session.id).await;
+        let error = manager
+            .load(SessionLoadParams {
+                session_id: created.session.id,
+                replay_from: Some(ItemId::new()),
+                generation: None,
+            })
+            .await
+            .expect_err("unknown cursor");
+        assert_eq!(error.into_event().code, ErrorCode::InvalidRequest);
     }
 
     #[tokio::test]

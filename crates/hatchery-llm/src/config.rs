@@ -136,6 +136,20 @@ impl ProviderConfig {
         }
     }
 
+    /// The capability table this provider serves: the built-ins with this config's overrides
+    /// folded on top.
+    ///
+    /// One builder for the table, used by the adapter and exposed to the daemon, so the request
+    /// side and the history side read one row set — an `echo_reasoning` override that only half
+    /// applied would store reasoning the requests never carry.
+    #[must_use]
+    pub fn capability_table(&self) -> crate::capability::CapabilityTable {
+        self.capabilities.iter().fold(
+            crate::capability::CapabilityTable::builtin(),
+            |table, (prefix, caps)| table.with_override(prefix.clone(), caps.clone()),
+        )
+    }
+
     /// The built-in defaults a config file may omit.
     #[must_use]
     pub fn builtin(id: &str) -> Self {
