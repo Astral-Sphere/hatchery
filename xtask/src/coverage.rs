@@ -79,6 +79,21 @@ pub fn run(args: &[String]) -> Result<()> {
         "{:<24}{:>8}{:>10}{:>8}",
         "crate", "lines", "percent", "floor"
     );
+    if !report_only {
+        // A gated crate absent from the totals is a broken mapping, not a pass: failing to find
+        // a deficit must mean the crate was measured, not that it was never looked for.
+        let missing: Vec<&str> = THRESHOLDS
+            .iter()
+            .map(|(name, _)| *name)
+            .filter(|name| !totals.contains_key(*name))
+            .collect();
+        if !missing.is_empty() {
+            return Err(anyhow!(
+                "the coverage report has no files for: {}; the path mapping or the build is broken",
+                missing.join(", ")
+            ));
+        }
+    }
     for (name, lines) in &totals {
         let floor = THRESHOLDS
             .iter()
@@ -88,6 +103,7 @@ pub fn run(args: &[String]) -> Result<()> {
         println!("{name:<24}{:>8}{percent:>9.1}%", lines.total,);
         if let Some(floor) = floor {
             print!("{floor:>7}%");
+            // The epsilon keeps a 84.97% report from flipping a gate on rounding noise.
             if percent + 0.05 < f64::from(floor) {
                 deficits.push(format!(
                     "{name} at {percent:.1}% is below its {floor}% floor",
@@ -143,12 +159,16 @@ pub fn crate_totals(json: &str) -> Result<BTreeMap<String, LineTotals>> {
         .map(|data| data.files.as_slice())
         .unwrap_or(&[]);
     for file in files {
-        let Some((_, crate_name)) = file.filename.split_once("crates/") else {
+        // Anchored on `crates/hatchery-` and taken from the RIGHT: a checkout living under a
+        // path that itself contains `crates/` must not remap every file to a bogus crate whose
+        // name matches no threshold — that failure mode passed silently before.
+        let Some((_, crate_name)) = file.filename.rsplit_once("crates/hatchery-") else {
             continue;
         };
         let Some((crate_name, rest)) = crate_name.split_once('/') else {
             continue;
         };
+        let crate_name = format!("hatchery-{crate_name}");
         if rest.starts_with("tests/") {
             continue;
         }
@@ -240,6 +260,17 @@ mod tests {
         assert!(crate_totals("{}").is_err());
         let empty = crate_totals(r#"{"data":[{"files":[]}]}"#).expect("parses");
         assert!(empty.is_empty(), "the caller refuses an empty mapping");
+    }
+
+    #[test]
+    fn a_checkout_path_containing_crates_still_folds_correctly() {
+        let json = r#"{"data":[{"files":[
+            {"filename":"/home/dev/crates/fork/hatchery/crates/hatchery-llm/src/lib.rs","summary":{"lines":{"count":100,"covered":90}}},
+            {"filename":"/home/dev/crates/fork/hatchery/crates/hatchery-llm/tests/x.rs","summary":{"lines":{"count":5,"covered":5}}}
+        ]}]}"#;
+        let totals = crate_totals(json).expect("parses");
+        assert_eq!(totals.len(), 1, "one crate, not a bogus outer one");
+        assert_eq!(totals["hatchery-llm"].total, 100, "tests do not count");
     }
 
     #[test]
