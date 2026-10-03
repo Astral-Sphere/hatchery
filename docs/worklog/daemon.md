@@ -38,6 +38,10 @@
 
 ## 变更日志
 
+### 2026-10-01 · 评审⑤自查轮（并发正确性与传输层）
+
+本轮自查在 daemon 里挖出的全是「单连接顺序测试看不见」的问题：并发 prompt 竞窗（turn 闸门 + runtime 在途 CAS 标记）、订阅计数活不过重组装（watchers 表移出 slots）、清扫的 check-then-act（卸载前锁内复核）、provider 缓存永不替换（注册表每次装配整表替换）、`store_error` 压平 SessionNotFound（改直通 `to_event_error()`）、恢复不关 turn 行（store 新增 `open_turns` 只读命令，恢复以失败形态关闭）、hub 不滤旧代且从不发 `GenerationBumped`（都补上）、commit 失败仍发布 ItemFinished（改为扣发）。传输层：读循环整块喂 decoder、decoder 错误路径携带完好帧（`Scan`）、每条回复后的双换行修掉、bind 失败也走逆序拆锁、spawn 轮询容忍 connect-before-bind、daemon.json 以 0600 直接创建。设计文档 daemon.md 已同步实际形态（惰性装配、无 SessionLease、coalescing/replay window 标注未实现）。计数见 worklog/testing.md 本日条目（daemon 75 项）。
+
 ### 2026-10-01 · M1 Phase 5 收口（评审⑤）
 
 四处修正，全部先有测试再改（e2e 的失败暴露了前三处）：

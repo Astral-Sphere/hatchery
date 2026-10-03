@@ -18,7 +18,7 @@
 - [x] (M0b) serde 往返测试 + golden JSON（`tests/fixtures/protocol-v1/`）+ 字段序确定性 + 公共 API 的可运行 doctest —— **golden 用纯 JSON 而非 insta**，理由见设计文档 §6
 - [x] (M1) client helper（2026-10-01）：`DaemonClient`（call_raw/call/hello，id 路由 + 超时）+ `EventStream`（`session/event` notification 解包）；attach_or_spawn 的 spawn 半边随 CLI Phase 4，重连补差随 e2e Phase 5
 - [x] (M1) `HelloParams.boot_token`（加性字段，fixture 已更新）
-- [ ] (M1) 事件 coalescing 策略实测调参（与 daemon hub 联动）；`ServerEvent::is_coalescable` 已就位
+- [ ] (M2) 事件 coalescing 策略实测调参（与 daemon hub 联动）；`ServerEvent::is_coalescable` 已就位（2026-10-03 由 M1 改标 M2：M1 定案 hub 不做 coalescing、留接缝，与 worklog/daemon.md 待办对齐）
 - [ ] (M2) edit_item/branch/rewind 方法的参数细节随 store 实现定稿（rewind 要带 `purge_untracked`，见 worklog/capabilities.md）
 
 ## 开放问题

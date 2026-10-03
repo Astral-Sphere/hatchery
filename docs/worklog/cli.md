@@ -19,9 +19,6 @@ M1 Phase 4 交付:TUI/exec/daemon 子命令/doctor 全部接线,attach-or-spawn(
 - [ ] (M2) 审批内联弹层(diff/命令预览 + 快捷键)、/rewind /branch /edit、/export
 - [ ] (M2) sessions 子命令族(list/resume/export/delete)
 - [ ] (M4) 文案全部进 gettext catalog
-- [ ] (M2) 审批内联弹层（diff/命令预览 + 快捷键）、/rewind /branch /edit、/export
-- [ ] (M2) sessions 子命令族（list/resume/export/delete）
-- [ ] (M4) 文案全部进 gettext catalog
 
 ## 开放问题
 
@@ -35,6 +32,10 @@ M1 Phase 4 交付:TUI/exec/daemon 子命令/doctor 全部接线,attach-or-spawn(
   裁决：**自绘 = minimad 解析 + 手写 ratatui 映射**；termimad 在该集成形态下只剩解析价值而拖全套渲染栈。代码块 M1 以暗色渲染，syntect 高亮（含 M2 diff 视图）推迟。
 
 ## 变更日志
+
+### 2026-10-01 · 评审⑤自查轮（cli）
+
+交互正确性四处：turn 进行中打字不再整窗退出（submit 错误降级为 notes，连接断开仍由事件流收尾；被拒 prompt 文本退回输入框可改再发）；多行输入落地（Alt/Shift+Enter 换行、bracketed paste 启停与整块粘贴、输入区随行数 1..8 行增高）；resume 播种改读 `session/load` 回复里的真 session（exec.rs 曾伪造最小回复，导致 model 空白、effort 写死 medium）；状态栏从 `SessionUpdated.status` 投影 thinking/awaiting approval（此前整个 turn 期间显示 idle）。解析层：`//` 转义、命令名大小写不敏感、Unknown 回显去尾随空格、空输入不发送；`actions` 的序列化失败从静默空表改为 expect。attach 轮询容忍发布先于 bind 的连接失败（与预检路径同一裁决）。计数见 worklog/testing.md 本日条目（cli 31 项）。
 
 ### 2026-09-30(M1 Phase 4 交付)
 

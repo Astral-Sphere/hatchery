@@ -14,7 +14,7 @@
 - [x] (M0b) trait 全家定义（LlmProvider/ToolHost/HistorySource/EventSink）+ StreamEvent/ChatOptions/Message 类型
 - [x] (M0b) Turn 状态机实现 + fake provider 脚本化单测（含 Interrupt 在各状态的行为矩阵）
 - [x] (M0b) Turn Tool Snapshot 最小版：turn 开始时 `snapshot()` 冻结一次（完整语义 M2）
-- [ ] (M1) 上下文组装 v1（token 预算最简版：估算 + 最旧 round 裁剪）——`HistorySource::view` 已给出接缝
+- [ ] (M2) 上下文组装 v1（token 预算最简版：估算 + 最旧 round 裁剪）——`HistorySource::view` 已给出接缝（2026-10-03 由 M1 改标 M2：M1 装配是纯机械映射、不做预算，见 daemon 的 `StoreHistory`；工具大输出进树后才是刚需）
 - [ ] (M1) max_rounds 熔断与 TurnCompletion 语义在真实对话下验证（脚本化验证已做）
 - [ ] (M2) ToolOutput::Spilled 路径（形状已就位，阈值与落盘未定）
 - [ ] (M5) compaction 钩子
@@ -27,6 +27,10 @@
 - 2026-09-28 M0b 落地时又定了几处（设计文档 §5/§7 有完整理由）：`ToolHost::summarize`（摘要需要工具语义，kernel 不该解析参数）、`ToolInvocation { output, is_error }`（「跑失败」与「没跑成」是两件事）、进度改走 **mpsc 通道**（同步回调和「await 工具的同时转发进度」不可兼得，同一 select 循环也让中断能取消工具）、审批改由 **kernel 发起 / daemon 应答**的 id 往返（capabilities.md 的 `ApprovalOutcome` 并入 `ApprovalOption`）。
 
 ## 变更日志
+
+### 2026-10-01 · TurnInput 携带调用方 TurnId（评审⑤自查轮）
+
+`session/prompt` 的回复此前返回一个 manager 自造、永不复现的 TurnId——kernel 在 `run_turn` 里另造一个，回复与任何事件都对不上。改为 `AgentCommand::TurnInput { turn, content }`：daemon 铸币、kernel 沿用，回复、每个 item、终止事件同名（e2e `the_wire_orders_housekeeping_around_item_events_and_names_the_turn` 钉住）。`AgentCommand::prompt` 构造器保留（自己铸币），新增 `prompt_with_turn`。同轮补测：RateLimited 直通到 sink、`max_rounds = 0` 引信（不开 provider、正常收尾）、全部句柄中途 drop 仍以 Interrupted 收尾。计数见 worklog/testing.md 本日条目。
 
 ### 2026-10-01 · turn_running 句柄信号（M1 Phase 5）
 

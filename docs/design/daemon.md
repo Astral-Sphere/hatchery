@@ -37,18 +37,22 @@ pub struct DaemonCore {
 }
 
 struct SessionSlot {
-    thread: Thread,
-    runtime: AgentHandle,        // kernel Agent 的命令端
-    lease: SessionLease,         // 文件锁：同 session 单活跃 runtime（跨 daemon 重启也安全）
-    generation: u64,
-    backends: Backends,          // { fs, terminal, approval } 按来源绑定
-    subscribers: Vec<ClientId>,
+    runtime: Arc<SessionRuntime>, // kernel Agent 句柄 + 任务 + 在途标记
+    generation: u64,              // 装配即 +1 并落库（不变量 1）
+    last_activity: Instant,       // 空闲清扫的比较基准
 }
+
+// 订阅计数在 slots 之外单独记账：订阅先于首个 prompt 到达（先 session/new 后 prompt），
+// 计数必须活过它挂靠的那个 runtime（否则空闲清扫会掐掉正被观看的会话）。
+// 规划中的 per-session 文件锁（SessionLease）在 M1 不存在：单 daemon 内由
+// turn 闸门 + 在途标记 + TurnInProgress 拒绝承担，跨 daemon 由单实例锁承担 —— 文件锁随
+// 多 daemon 形态（M2+）再引入。
 ```
 
-- **runtime 生命周期**：`session/new|load` 时装配 Agent（builder 注入 provider/tools/history/sink）；turn 之间 runtime 常驻内存；空闲超时（默认 30min 无订阅者且无进行中 turn）落盘卸载。**卸载/关闭走 disposer 逆序**（ADR-0009 纪律 1）：订阅者 → runtime → 检查点句柄 → store writer → 监听器，每步的 disposer 由装配时注册。
-- **代际号**：runtime 每次（重）建 generation+1 并落库；所有事件带 generation，hub 丢弃旧代事件；`GenerationBumped` 通知前端重置视图。
-- **崩溃恢复**：daemon 重启后 sessions 表 status=running 的会话标记为 interrupted（发 TurnFailed 存档），不自动续跑（v1）。
+- **runtime 生命周期**：runtime 在**首个 prompt 时惰性装配**（M1 实现与规划不同点：`session/new|load` 只建会话行），builder 注入 provider/tools/history/sink；turn 之间 runtime 常驻内存；空闲超时（默认 30min 无订阅者且无进行中 turn）落盘卸载；清扫在卸载前于锁内复核 busy/watched，清扫对象也包括 agent 已死的 slot。
+- **代际号**：runtime 每次（重）建 generation+1 并落库；所有事件带 generation，hub 与前端各自丢弃旧代事件；装配以 `GenerationBumped` 开场通知前端重置视图。
+- **并发接受**：同一会话的 prompt 路径（装配→busy 检查→提交）走 per-session turn 闸门串行化，接受即在 runtime 上打在途标记（kernel TurnEnded 投影时清除）——第二条 prompt 无论落在装配期还是提交与开闸之间的窗口，都得到 `TurnInProgress` 拒绝，绝不静默丢弃或排队。
+- **崩溃恢复**：daemon 重启后先以 `open_turns` 找出所有未结 turn 行、以失败形态关闭（`ended_at` 置位、`stop_reason` 保持 NULL —— "仍在跑"与"失败"可区分，不造假原因），再把 status=running/waiting_approval 的会话标记回 idle。不自动续跑（v1）。
 
 ### 3.1 Profile 化装配与启动审计（ADR-0009）
 
@@ -67,8 +71,8 @@ daemon 启动按命名 **profile** 装配组件捆绑，装配表是显式数据
 ## 4. Live Hub（事件扇出）
 
 - per-session broadcast channel（tokio::sync::broadcast，容量如 4096）；订阅者 = 协议连接。
-- **coalescing**：TextDelta/ReasoningDelta 在 hub 入口按时间窗（~16ms）合并成批量事件，避免高频小包打爆慢前端；ItemFinished 等控制事件立即发。
-- **replay window**：hub 保留最近 N 事件（如 512）供瞬时断线重连补发；更早的历史靠 `session/load` 全量重建。
+- **coalescing**（规划，M1 未实现）：TextDelta/ReasoningDelta 在 hub 入口按时间窗（~16ms）合并成批量事件；ItemFinished 等控制事件立即发。M1 有意不做（roadmap），实测数据决定 M2 策略；`ServerEvent::is_coalescable` 已预留分类。
+- **replay window**（规划，M1 未实现）：hub 保留最近 N 事件供瞬时断线重连补发；M1 的重连前端走 `session/load` 全量重建（replay_from 补差在 manager 层）。
 - 慢消费者：broadcast lag 时断开该订阅者并让其走 load 重建（不阻塞其他前端）。
 
 ## 5. 与其他 crate 的接线

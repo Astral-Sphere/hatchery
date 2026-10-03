@@ -17,7 +17,7 @@
 - [x] (M0b) EditFork / SwitchBranch / DeleteBranch（内存 BFS 收子树 + active_head 校验 + 级联删 + **数量交叉校验**）
 - [x] (M0b) kill -9 崩溃测试（**测试二进制自重入**，不新增 target；五种 StoreCmd 各一次 + 恢复后仍可用）
 - [x] (M0b) ExportJsonl（从 M2 提前：逃生通道成本低、测试便宜）
-- [ ] (M1) 只读连接池与 spawn_blocking 读路径接线
+- [ ] (M3) 只读连接池与 spawn_blocking 读路径接线（2026-10-03 由 M1 改标 M3：M1 未排期此项，读一直走单写者 actor；等读吞吐成为实测瓶颈再做）
 - [ ] (M2) checkpoints 表与 CheckpointStore 联动（级联删除时 GC；checkpoint 的级联已由引擎门槛测试锁定）
 - [ ] (M5) compaction 的 span 解析：`ItemIdRange` 是**位置**语义，要在树遍历里按链定位两端点（protocol 侧不提供 `contains`，理由见 worklog/protocol.md 2026-09-30 条）
 - [ ] (M5) 导入

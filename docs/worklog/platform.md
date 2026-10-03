@@ -6,7 +6,7 @@
 
 ## 当前状态
 
-设计稿完成 + **i18n 方案已实测定型（fluent，ADR-0011）**。配置加载与 prompt 管线未实现（M1）；i18n 落地在 M4。
+**M1 交付（2026-10-01）**：分层配置加载与 prompt 管线 v1 已落地（代码在 `hatchery-daemon`，细节与测试见 worklog/daemon.md）；AGENTS.md 发现与注入随决策记录排 M2（见待办）。**i18n 方案已实测定型（fluent，ADR-0011）**，落地在 M4。
 
 代码归属已定：配置加载与 prompt 装配都落在 `hatchery-daemon`（唯一消费者——前端一律经 `config/get|set`、`prompt/render` 协议访问），**不新建 `hatchery-platform` 或 `hatchery-prompts` crate**（ADR-0009 反预拆分刹车）。
 
@@ -15,12 +15,12 @@
 - [x] (M0) **i18n spike**：gettext-rs vs fluent（复数、上下文标注、GTK 集成度、构建代价）→ 结论 fluent，见下「实测记录」，已落 ADR-0011 + platform.md §3
 - [x] (M0) prompts 存放位置定案：各 crate 自己的 `prompts/` 目录 + `include_str!`，不新建 crate
 - [x] (M0) 配置 schema 校验失败降级策略定案：逐 key 忽略 + warning（安全 key 取最严格默认值并升 error 日志）
-- [ ] (M1) 分层配置加载 + per-key origins + 项目级安全边界（覆盖硬门时忽略 + warning）
-- [ ] (M1) prompt 管线 v1：identity/mode_variant/environment/safety_gate 四 section + `{{var}}` 插值 + PRECEDENCE 声明
-- [ ] (M1) `prompt/render` + CLI `/prompt`
-- [ ] (M1) AGENTS.md 发现与注入（层级向上 + 与 HATCHERY.md 的兼容策略定案）
-- [ ] (M1) **environment 节只准用 git plumbing 命令**：实测 `git status` 会重写用户的 `.git/index`（worklog/capabilities.md），prompt 装配属于后台行为，绝不能有这种副作用
-- [ ] (M1) docs/glossary.md 术语表初版
+- [x] (M1) 分层配置加载 + per-key origins + 项目级安全边界（覆盖硬门时忽略 + warning）（2026-10-01 落地，见 worklog/daemon.md）
+- [x] (M1) prompt 管线 v1：identity/mode_variant/environment/safety_gate 四 section + `{{var}}` 插值 + PRECEDENCE 声明（2026-10-01 落地，见 worklog/daemon.md）
+- [x] (M1) `prompt/render` + CLI `/prompt`（随 daemon Phase 3 / cli Phase 4）
+- [ ] (M2) AGENTS.md 发现与注入（层级向上发现 + project_context section + 来源标注 + 发现 golden 测试）——决策已定（2026-10-01）：**AGENTS.md 为主文件名、HATCHERY.md 兼容认读**，并存时 AGENTS.md 优先并 warning 一次（design/platform.md 开放问题 1 的决策记录）
+- [x] (M1) **environment 节只准用 git plumbing 命令**：实测 `git status` 会重写用户的 `.git/index`（worklog/capabilities.md），prompt 装配属于后台行为，绝不能有这种副作用（git2 `statuses()` 落地，不碰用户 index）
+- [x] (M1) docs/glossary.md 术语表初版（2026-10-01）
 - [ ] (M2) user_override section（`~/.config/hatchery/prompts/`）+ 覆盖不可越权测试
 - [ ] (M2) `hatchery config schema` 导出 JSON Schema
 - [ ] (M4) fluent catalog 落地（FTL 嵌入 + 用户级覆盖）+ `xtask i18n-extract`（id 对账 + 未包裹字符串 lint）+ zh/en 两语 + RTL 冒烟

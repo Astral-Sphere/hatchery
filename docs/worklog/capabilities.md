@@ -83,6 +83,10 @@ capabilities 的**代码**在 M0b 没有动（trait 与工具实现是 M1/M2 的
 
 ## 变更日志
 
+### 2026-10-01 · 评审⑤自查轮（capabilities/tools）
+
+不变量 4 的真相与修复：09-28 记录的「crate 属性优先于命令行 lint level」实测不成立——workspace `[lints]` 的 allow 一直在压着它，禁令自 M0a 起实际未生效（用探针在 tools 里放 `std::fs::read_to_string` 复测，零告警）。修复：hatchery-tools 自带完整本地 `[lints]` 表（`workspace = true` 与本地表混用会被 cargo 拒载，报错还会指向无关 crate——这是本轮最贵的发现），两项 `disallowed_* = "deny"`；探针复测报错、干净树通过。tools 行为：read_file 的 `limit:0` 判 InvalidArgs、offset 越界与首行超帽各自具名（不再都读成 `[empty file]`/`lines 1–0`）；grep 超限文件跳过计数入摘要；walk 对不可读子目录跳过并计数（根目录失败仍致命）。capabilities：LocalFs 读目录判 WrongKind（与 MemoryFs 一致，此前是裸 EISDIR 字符串）、空路径拒读。新增 TempWorkspace 真盘集成三条（符号链接逃逸经工具层拒绝、自环不致命、glob/grep 走真磁盘）。计数见 worklog/testing.md 本日条目（capabilities 25、tools 38 项）。
+
 ### 2026-10-01 · M1 只读层（评审②）
 
 **trait 定型（M1 子集）**：`FsBackend`（read_text_file / read_dir / metadata）、`TerminalBackend` + `TerminalHandle` + `TerminalOutcome`、`ApprovalGate`、`Tool`（def / needs_approval / summarize / execute）、`ToolCtx { fs, terminal, cancel, emit }`。三处**有意收窄**，都记录在案：

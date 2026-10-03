@@ -148,8 +148,8 @@ M0b 已实现的是 kernel 四接缝的 fake 与 `ReferenceTree`（`ScriptedProv
 风险：竞态（双实例/双 runtime）、事件错序、代际污染。
 
 - 单实例：两进程并发 attach-or-spawn → 恰一胜者（重复 20 次抓竞态）；陈旧 daemon.json（pid 已死）自愈。
-- 租约与代际（不变量 1 专属）：`stale_runtime_events_are_dropped`——旧 generation 事件注入 hub，断言订阅者收不到；`session_lease_blocks_second_runtime`。
-- hub：两订阅者收到同序事件；迟加入者 replay 完整；慢消费者被踢且不阻塞他人；coalescing 合并 delta 但控制事件不合并、不乱序。
+- 租约与代际（不变量 1 专属）：`stale_runtime_events_are_dropped`——旧 generation 事件注入 hub，断言订阅者收不到；`session_lease_blocks_second_runtime`（第二 prompt 拒绝）。此外 hub 侧代际过滤（`events_below_the_session_generation_are_dropped`，daemon）、manager 级并发接受（`two_concurrent_prompts_yield_exactly_one_turn`，hatchery-tests）、空闲清扫双守卫（busy 不扫、被看的不扫，manager 测试）均已落地。
+- hub：两订阅者收到同序事件；迟加入者 replay 完整（M1 未建 replay window，重连走 session/load 重建，见 daemon.md §4 状态注记）；慢消费者被踢且不阻塞他人；coalescing 合并 delta 但控制事件不合并、不乱序（M1 未实现 coalescing，`is_coalescable` 分类有测试）。
 - 崩溃恢复：status=running 的会话重启后标记 interrupted 且发过 TurnFailed 存档事件。
 - **fail-loud 装配审计**（ADR-0009）：`startup_audit_missing_provider_refuses_service`——profile 必需组件缺失（如密钥环境变量不存在）时 daemon 拒绝服务、输出缺失清单、非零退出；逐个必需组件各一条。
 - **teardown 逆序**（ADR-0009）：装配时注册带序号的 disposer，关闭后断言执行序严格为注册逆序（订阅者→runtime→检查点→store→监听器）。
@@ -209,7 +209,7 @@ GUI 是测试最薄弱层，策略 = 「逻辑出 GTK，GTK 只做投影」+ 分
 
 | 不变量（architecture.md §5） | 专属测试 |
 |---|---|
-| 1 单一 runtime 所有者 | `invariant_stale_runtime_events_are_dropped`（客户端代际过滤，hatchery-tests）、`invariant_session_lease_blocks_second_runtime`（第二 prompt 拒绝，hatchery-tests）、`invariant_single_instance_race_admits_exactly_one_winner`（20 线程竞态，hatchery-tests）。**三条均已落地** |
+| 1 单一 runtime 所有者 | `invariant_stale_runtime_events_are_dropped`（客户端代际过滤，hatchery-tests）、`invariant_session_lease_blocks_second_runtime`（第二 prompt 拒绝，hatchery-tests）+ `two_concurrent_prompts_yield_exactly_one_turn`（竞窗，hatchery-tests）、`invariant_single_instance_race_admits_exactly_one_winner`（20 线程竞态，hatchery-tests）。**均已落地** |
 | 2 模型可见=已记录 | e2e 每场景收尾断言「重建上下文 == MockWire 实际收到的请求体」（逐 turn）。**已落地**：场景 1 对第二 turn 请求体的 messages 数组做整表比对（serde 字符串相等即字节相等，含首尾空白/unicode/换行） |
 | 3 items append-only | `invariant_items_are_never_rewritten`、`invariant_the_database_refuses_to_update_an_item`（**均已落地**：前者断言编辑后原 item 逐字段不变，后者直接用第二条连接 `UPDATE items` 被触发器拒绝，错误带我们的消息；引擎级 `invariant_items_update_trigger_aborts` 于 M0a 实测）、store 属性测试 |
 | 4 工具只经接缝 | clippy `disallowed_methods`（编译期；**实测**：workspace 级 allow + `hatchery-tools` crate 属性 deny，违规确实报错）+ 工具单测只注入 Memory 后端（运行期证明） |

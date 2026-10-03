@@ -6,7 +6,7 @@
 
 ## 当前状态
 
-**M0b 完成（2026-09-28），评审后的两轮修复已入库（2026-09-29 / 2026-09-30）**：`hatchery-protocol`/`hatchery-kernel`/`hatchery-store` 三个 crate 实现落地，`hatchery-testkit` 交付 M0b 子集；M0b 代码经一轮按 crate 分块的评审后，契约缺口、测试可信度问题与可修的实现缺陷都已修完（细节见下面 2026-09-30 那条变更日志与各 crate 的 worklog）。本地 `./scripts/ci.sh` 全绿；三平台 CI 上一轮已跑通（M0a 收尾），M0b 及其后的代码尚未 push。**M0 里程碑达成**（roadmap.md 的 M0 DoD：门禁三平台绿 + store 的 kill -9 崩溃恢复测试通过 + 三个 spike 结论落档）。
+**M1 代码完成（2026-10-01）**：Phase 1–5 全部落地（llm adapter + 能力表、capabilities/tools、daemon 全栈、cli TUI/exec、e2e 与不变量收口），评审⑤自查轮的加固已入库；本地 `./scripts/ci.sh` 全绿、覆盖率门槛全过（数字见 worklog/testing.md 日期化条目）。待评审⑤与手动 live 验收后收口；三平台 CI 自 M0 收口后尚未见过新代码（push 由用户执行）。M0 历史结论：M0b 三 crate + testkit 于 2026-09-28 落地、评审后两轮修复（09-29/09-30）入库，M0 DoD 达成（门禁三平台绿 + kill -9 崩溃恢复 + 三 spike 落档），细节见下文变更日志。
 
 仓库现状：`crates/`（11 crate，其中 3 个已实现）+ `xtask/` + `scripts/ci.sh` + `.github/workflows/{pr,nightly}.yml` + `docs/`。
 
@@ -18,14 +18,14 @@
 - [x] (M0) 三个 spike：存储引擎（→ ADR-0010 turso）、影子 Git 后端（→ **ADR-0012 git2 vendored**；第一轮曾选 CLI，用户裁决后改 git2 并重测）、i18n gettext vs fluent（→ ADR-0011 fluent）
 - [x] (M0) MSRV 实测：`rust-version = "1.90"`（1.85/1.88 均失败，1.90.0 编译通过）
 - [x] (M0) CI 工具链改为**源码编译**（`cargo install cargo-nextest --version 0.9.146 --locked`，三平台一致；nightly 的 audit/llvm-cov 同）——用户裁决，避免预构建二进制在 MSYS2 下的不确定性
-- [x] (M0) 编译 flags：`.cargo/config.toml` 加 `[build] rustflags = ["-C", "target-cpu=native"]`（用户偏好；已实测进入 rustc 调用）。**纪律**：发布产物与交叉编译必须覆盖（`RUSTFLAGS=""`），否则二进制不可跨 CPU 移植
+- [x] (M0) 编译 flags：`.cargo/config.toml` 加 `[build] rustflags = ["-C", "target-cpu=native"]`（用户偏好；已实测进入 rustc 调用）。**纪律**：发布产物与交叉编译必须覆盖（`RUSTFLAGS=""`），否则二进制不可跨 CPU 移植（2026-10-03 更正：该 flags 已于 10-01 停用、CI 与仓库配置归零——缓存污染事故，见同日变更日志）
 - [x] (M0) 三平台 CI 跑通（第 1 次失败于 windows 的 `rustup-init --component` 参数 arity，已在 5b953fb 修复并补 windows-gnu 的 ABI 断言；细节见 worklog/testing.md「实测记录 · CI 首跑」）
 - [x] (M0) 顶层 README 扩写：项目定位、快速开始、文档链接、MSYS2 ucrt64 环境清单、仓库布局；docs/README.md 加「代码布局」节
 - [x] (M0b) 分层修正：protocol 沉为唯一最底层，kernel 升 L1（见下「M0b 修正」）
 - [x] (M0b) protocol/kernel/store 三个 crate 实现 + testkit M0b 子集 + 各自的测试套件
-- [ ] (M1) 建立 docs/glossary.md 术语表
-- [ ] (M1) MSRV CI job（`cargo +1.90.0 check`）加进 nightly，防止依赖升级悄悄抬高 MSRV
-- [ ] (M1) `hatchery-tests` 成员 crate（跨 crate e2e 与不变量套件的家；虚拟 manifest 不能有顶层 `tests/`，见 design/testing.md §1）
+- [x] (M1) 建立 docs/glossary.md 术语表（2026-10-01，M1 收口时建立）
+- [x] (M1) MSRV CI job（`cargo +1.90.0 check`）加进 nightly，防止依赖升级悄悄抬高 MSRV（2026-10-01 随 Phase 5 门禁收口落地）
+- [x] (M1) `hatchery-tests` 成员 crate（跨 crate e2e 与不变量套件的家；虚拟 manifest 不能有顶层 `tests/`，见 design/testing.md §1）（2026-10-01 落地，xtask layering LAYERS 表同步）
 
 ## 开放问题
 
@@ -34,6 +34,12 @@
 3. ~~references/ 目录的 license 与体积~~ → **已由用户自行解决**：`.gitignore` 里的 `/references` 使其不入库，只保留 `references.md` 的分析结论。
 
 ## 变更日志
+
+### 2026-10-03 · CI 编译 flags 裁决收口 + worklog 对账
+
+**CI 缓存污染的完整定案（用户裁决补齐根因）**。时间线：2026-09-30 在 pr.yml 设 `RUSTFLAGS=x86-64-v3`（提速实验，88f2561）→ 同日移除（6c4e005）；2026-10-01 注释掉 `.cargo/config.toml` 的 `-C target-cpu=native`（1c75e69）并给 Gate 加 `cargo clean`（4ae1042）。机制：仓库配置对 CI 同样生效，native/baseline+ 的缓存产物只对构建它的那颗 CPU 合法，rust-cache 把它们恢复到不同世代的 runner 上就出非法指令。`cargo clean` 是当时有效的应急，但让 rust-cache 整套缓存白干。**最终形态**：仓库与 CI 一律零 flags（可移植为默认）；本地想提速把 flag 写进**用户级** `~/.cargo/config.toml`（CI 永远读不到它，而 runner 缓存只由 CI 自己的构建写入，故不可能再污染）；加固轮删掉的 `cargo clean` 维持删除，缓存价值恢复。无需手工失效缓存：`add-rust-environment-hash-key: "true"` 把 `.cargo/config.toml` 内容与 RUST*/CARGO*/CC_* 环境都算进 key，任何 flags 变更即换 key。`.cargo/config.toml` 与 pr.yml 的注释已按此改写；上面 M0 那条「已实测进入 rustc 调用」的记录保留为历史。
+
+**worklog 对账**（M1 代码完成后的全表核对）：勾掉已完成但仍开着的框——本文件（glossary/MSRV job/hatchery-tests）、platform 的（配置分层/prompt 管线/prompt-render/git plumbing/glossary）、llm 的 doctor 子命令；改里程碑标注（附日期与理由）——AGENTS.md 注入、上下文组装 v1、hub coalescing 调参 → (M2)，store 只读连接池 → (M3)；修正 platform.md 过期的「未实现」现状句、cli.md 重复的两组待办框、nightly.yml 的 TODO(M1) fuzz 注释（worklog 中 fuzz 本就标 M2）。kernel 的「max_rounds 在真实对话下验证」框留待 live 验收后勾。
 
 ### 2026-09-30 · M0b 评审后的两轮修复
 

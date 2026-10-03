@@ -25,7 +25,7 @@
 - [x] (M1) e2e 场景 1-2 落地（2026-10-01，hatchery-tests）：最小对话 + resume + 逐字节回放、双前端扇出 + 重连补差；D7 子进程对比一并交付
 - [ ] (M2) 影子 Git 安全测试补全（硬门、PTY 孤儿进程）；fuzz targets 上线 nightly
 - [ ] (M2) e2e 场景 3-6；契约测试套件（LlmProvider/SessionStore/FsBackend/TerminalBackend/ApprovalGate）
-- [ ] (M2) `disallowed_methods` 的 compile-fail 测试（trybuild 类）——M0a 只做了人工实测，未自动化
+- [ ] (M2) `disallowed_methods` 的 compile-fail 测试（trybuild 类）——人工探针复测过（10-01），且禁令已由 hatchery-tools 本地 `[lints]` 表真实生效（crate 属性压不过 Cargo lint 表，09-28 的记录写反了，见 10-01 条目）
 - [ ] (M3) fake 宿主集成 + dummy-acp-agent；e2e 场景 7-8；Zed 真机清单执行并记录
 - [ ] (M4) gui 组进 CI（GNOME SDK 容器 + xvfb）；10k 性能 fixture；e2e 场景 9
 - [ ] (M2+) criterion 基线入库 + nightly 对比；cargo-mutants 试点（store/kernel）
@@ -75,6 +75,32 @@
 - 2026-09-28 辅助二进制形态：M0 不需要（`dummy-acp-agent` 是 M3 的事），推迟到 M3 与 ACP client 一起定；倾向 workspace member + `required-features`。
 
 ## 变更日志
+
+### 2026-10-01 · 评审⑤前的全面自查（对抗性审计 → 修复 + 补测）
+
+评审⑤等待期间做了一轮全面自查：五路并行审计（llm / daemon 核心 / daemon 基建+协议客户端 / cli+tools+capabilities / kernel+e2e+门禁），逐条核实后修缺陷、补测试。**最重要的三个发现都不在任何既有测试的视野里**：
+
+1. **并发 prompt 竞窗（不变量 1 的第四条腿）**：manager 的 busy 检查与 submit 之间无串行化，且 `turn_running()` 要等 kernel 真正开闸才翻真——两条连接的 prompt 可以双双通过检查，第二条被 kernel 静默丢弃（返回 Ok）。修法是两层：同一会话的 prompt 路径走 per-session turn 闸门串行化；接受即以 CAS 在 runtime 上打在途标记（sink 投影 `TurnEnded` 时清除，submit 失败回滚）。`two_concurrent_prompts_yield_exactly_one_turn` 钉住；同一闸门顺带消灭了「并发冷启动双重组装」（两代 generation、两条分叉链）。
+2. **订阅计数活不过 runtime 重组装**：`attach` 在无 slot 时是空操作，而正常流程是先 `session/new` 后首个 prompt（此时才装配，subscribers=0）——30 分钟后空闲清扫会卸掉一个正被观看的会话。计数挪到 slots 之外的 `watchers` 表；清扫在卸载前于锁内复核 busy/watched（清扫自身的 check-then-act 竞态一并关掉），agent 已死的 slot 也纳入清扫。manager 测试：busy 不扫、被看的不扫、看过再松手才扫。
+3. **不变量 4 的编译期禁令实际处于关闭状态**：workspace `[lints]` 里 `disallowed_methods/types = "allow"`，tools 的 crate 属性从未写上；更糟的是实测证明 **crate 属性根本压不过 Cargo lint 表**（命令行 flag 优先）——09-28 那条「已实测：探针报错」的记录是在 allow 落位前做的，结论写反了。真正的修法：hatchery-tools 自带一份**完整的本地 `[lints]` 表**（workspace 继承与本地表不能混用，cargo 直接拒载 manifest——报错信息极具误导性，会指向别的 crate），其中两项 deny。探针复测：违规即 error，干净树零报错。trybuild 自动化探针仍是 M2。
+
+**行为修复**（每条都有测试钉住）：daemon 崩溃恢复现在先用新的 `open_turns` 把未结 turn 行以失败形态关闭（此前永远停在"running"）；`store_error` 直通 `StoreError::to_event_error()`，`session_not_found` 不再被压成通用 StoreError（原测试名与断言互相矛盾，测试随行为修正）；cancel 空闲会话如实报 `cancelled:false`；`SessionPromptResult.turn` 不再是永远对不上的占位 id——TurnInput 携带调用方 TurnId 贯穿 kernel，回复与事件同一名；hub 侧代际过滤落地且装配以 `GenerationBumped` 开场（协议里一直有、daemon 从未发过）；commit 失败不再向 hub 发布 ItemFinished（invariant 2 的"先提交后发布"在失败半边也成立）；provider 注册表每次装配都整表替换（config/set 后端点/密钥变更能到达下一个 runtime）；bind 失败也走逆序拆锁（否则留下指向未服务 socket 的 daemon.json）；spawn 轮询容忍"发布先于 bind"的连接失败。
+
+**传输层三处**：连接读循环改为整块喂 decoder（`read_line` 会先把超限行整个缓冲进内存，4MiB 上限形同虚设）；decoder 的错误路径改为 `Scan{frames, error}`——一条坏线不再吞掉同块到达的完好帧（旧语义下这正是新读循环的死锁源）；**发现并修掉每条回复后的双换行**（`encode_frame` 自带换行、server 又补了一个，所有严格逐行读者都得靠 decoder 跳空行活着）。
+
+**cli**：turn 进行中打字不再整窗退出（调用错误降级为 notes，被拒的 prompt 文本退回输入框）；多行输入落地（Alt/Shift+Enter 换行 + bracketed paste，输入区随行数增高）；resume 用 load 回复里的真 session 播种状态栏（此前 model 空白、effort 写死 medium）；`//` 转义命令区、命令名大小写不敏感、空输入不发送；状态栏随 `SessionUpdated` 显示 thinking/awaiting approval；attach 轮询容忍 connect-before-bind。
+
+**config**：provider 子树按 key 降级（此前一个坏子键把整个 provider 重置成内置默认）；已知 key 的类型不符在过滤层丢弃并告警、`config/set` 拒绝类型不符（此前 `ui.show_reasoning = "banana"` 被接受且 typed 视图静默取默认）；`insert_dotted` 穿过叶子时拒绝而非静默空操作；审计把"设置但为空"的 env 视同缺失；doctor 的目录检查做真实写探针；daemon.json 的 tmp 文件以 0600 创建（原为写后 chmod，崩溃窗口内可读）。
+
+**llm**：`resolve_key` 去除粘贴进来的首尾空白；`resolve_model` 平局改判 None（HashMap 迭代序随机，平局选择=同一配置不同 run 打不同 provider）；第二个 Done 不再覆盖被延迟的第一个；`wire = "responses"` fatal 拒绝（此前配置被静默无视）；重试耗尽的报错改为真实尝试次数。
+
+**门禁/工具**：xtask 覆盖率折叠锚定 `crates/hatchery-` 右侧（外层路径含 `crates/` 的 checkout 此前会折叠出不存在的 crate 并静默全过）+ 门禁 crate 缺报告即报错；pr.yml 删掉 `cargo clean`（它让上面的整套 rust-cache 白干）——2026-10-03 用户补齐根因后正式定案：`cargo clean` 当初（4ae1042）是对缓存被非可移植 flags 产物污染（跨代 runner 非法指令）的应急，正式修法 = 仓库与 CI 的 flags 归零、本地提速走用户级 `~/.cargo/config.toml`，细节见 worklog/architecture.md 同日条目。
+
+**测试面**（本轮 +63）：`two_concurrent_prompts_yield_exactly_one_turn`、`a_turn_with_no_subscriber_runs_to_completion_and_persists`（D2 全链路）、信封全序 + turn id 贯穿（scenario1）、kernel 三条（RateLimited 直通、max_rounds=0 引信、句柄全掉仍收尾）、daemon 侧 sweep 双守卫 + 恢复关闭 turn + 幂等 + waiting_approval、server 三条（超限行拒绝且连接存活、坏 UTF-8 跳行、二次订阅停旧流）、entry 的 bind 失败拆锁、protocol client 七条（乱序回包按 id 路由、孤儿回包不偷包、错误对象、**最后一个 client 掉线即断连**——router 强持有 Arc 的泄漏一并修掉、陈旧代际丢弃、订阅回复与事件共连接）、llm 五条（qwen 空 id 续传钉进真录制、畸形块跳过、流末冲刷 Done、5xx 退避、responses wire 拒绝）+ registry 平局 + ModelSwitch + 温度/上限落体 + key 修剪、config 三条、tools 三条（read_file 边界、grep 超限计数、walk 跳过计数）+ TempWorkspace 真盘三条（含符号链接逃逸与自环）、capabilities 两条（目录读两后端一致、空路径）、store 的 `open_turns` 往返、覆盖率路径加固两条。
+
+**覆盖率地板首次真实过线**（用户跑 `cargo xtask coverage` 的实测数字）：首轮 **capabilities 83.0% / cli 57.8% 低于 85/60 的地板**，其余七闸全过。空洞不在测试盲区就在真实功能上：daemon_cmd（start/status/stop，114 行 0 覆盖）与 doctor_cmd 全裸，chat.rs 的 TUI 主循环是仅剩的诚实空白（需要真终端）。补测后（本机已装 cargo-llvm-cov，enforcement 实跑）：**capabilities 86.9%、cli 65.4%，门禁全过**——cli 的新测试是 daemon_cmd 的发布真相对照表（存活 pid 绿、死 pid 标 stale、stop 发 SIGTERM 等进程消失，发现两件事：`discover_alive` 刻意把自己的 pid 读成 stale；SIGTERM 后的僵尸在 reap 前仍会被读成存活）、优雅停机下的 exec 行为钉住（daemon 先取消 turn → TurnFinished(Interrupted) → exec 计 Completed，退出码矩阵以客户端动作为中心，M2 可再议）、--json 透传 generation_bumped、args 解析边缘；capabilities 是 LocalFs 的构造/查找边缘（文件根、缺失根、目录读的 NotFound/WrongKind）。仍未覆盖且如实记录：chat.rs 主循环（TTY）、main.rs 派发（bin 入口，子进程测试随 M2）。
+
+**本轮实测计数**（`cargo test -p <crate>` 汇总，2026-10-01，覆盖率补测后）：全 workspace **531** 项全绿（protocol 119、daemon 75、store 75、llm 59、kernel 52、tools 38、cli 37、capabilities 27、xtask 25、tests 11、testkit 11），另有 1 项 `#[ignore]` 照旧 skipped；覆盖率 ci 组实跑 519 项全绿。`./scripts/ci.sh` 八闸门全绿；clippy 零告警、fmt 干净。手动 live 验收清单不变（见 Phase 5 节）。
 
 ### 2026-10-01 · M1 Phase 5（e2e + 门禁收口）
 

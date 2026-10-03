@@ -41,7 +41,7 @@ pub enum AgentCommand {
 pub struct TurnLimits { pub max_rounds: u32 }             // 默认 100
 pub enum TurnCompletion {
     Completed { reason: StopReason, usage: Usage },
-    Failed { error: KernelError },
+    Failed { error: KernelError, usage: Usage },  // 失败前的 rounds 也花了钱，usage 照报
 }
 ```
 
@@ -103,6 +103,7 @@ pub enum StreamEvent {             // 变体用命名字段而非 newtype：
     ReasoningDelta { text: String },
     ReasoningDone { signature: Option<SignatureBlock> },
     ToolCall { delta: ToolCallDelta },
+    RateLimited { retry_after_ms: u64 },  // adapter 退避期间的信息通告，kernel 原样转发
     Usage { usage: Usage },
     Done { finish_reason: FinishReason },
     Error { error: LlmError },
@@ -185,6 +186,7 @@ pub enum KernelEvent {
     ItemFinished { item: Item },
     ToolCallStarted { item, summary },
     ToolCallProgress { item, chunk },
+    RateLimited { retry_after_ms },          // StreamEvent::RateLimited 的直通投影
     ApprovalNeeded { request_id, request },
     TurnEnded { turn, completion },          // 唯一的终止事件（成功与失败都在这里）
 }

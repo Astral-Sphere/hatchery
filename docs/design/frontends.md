@@ -41,7 +41,7 @@ impl DaemonClient {
 - 渲染原则：TUI 是事件流的投影（view projection），无本地状态机复制；所有动作发协议方法。
 - 斜杠命令：`/mode /effort /model /prompt(查看导出) /rewind /branch(list|switch|delete) /edit(选择历史消息编辑) /approval(规则管理) /export /clear /quit`。
 - 审批 UI：内联弹层展示 ApprovalRequest（含 diff/命令预览），快捷键 1-4 对应四个 option。
-- reasoning 展示：默认折叠为「Thinking…(n tokens)」，`Ctrl+R` 展开；尊重配置 `show_reasoning`。
+- reasoning 展示：默认折叠为「Thinking…(n chars)」（M1 决策：按字符计数，逐字节纪律优先于估算），`Ctrl+R` 展开；尊重配置 `show_reasoning`。
 - 键位与交互细节在 M1 实现中定稿；TUI 文案全部走 gettext catalog（platform.md）。
 
 ### 2.3 headless exec

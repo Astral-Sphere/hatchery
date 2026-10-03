@@ -28,17 +28,19 @@ base_url = "https://gw.example.com/v1"
 env_key = "GW_KEY"
 wire = "chat-completions"
 http_headers = { "X-Custom" = "1" }
-retry = { max = 4, backoff_ms = 500 }
+retry = { max_attempts = 4, backoff_ms = 500 }
 ```
 
 ```rust
 pub struct ProviderConfig {
-    pub base_url: Url,
+    pub base_url: String,                    // 纯文本 URL；不含 /chat/completions 后缀
     pub env_key: String,
-    pub wire: WireApi,                       // ChatCompletions | Responses
-    pub headers: HeaderMap,
-    pub retry: RetryPolicy,
+    pub wire: WireApi,                       // ChatCompletions | Responses（M1 只实现前者，配置成后者 fatal 拒绝）
+    pub http_headers: BTreeMap<String, String>,
+    pub retry: RetryPolicy,                  // { max_attempts, backoff_ms, max_backoff_ms, jitter_percent }
     pub reasoning: ReasoningConfig,          // 默认 effort + 展示开关
+    pub models: Vec<String>,
+    pub capabilities: Vec<(String, ModelCapabilities)>,
 }
 ```
 
@@ -60,11 +62,10 @@ canonical：`Off | Low | Medium | High | Max`。内置默认表（借鉴 qwen-co
 
 ```rust
 pub struct ModelCapabilities {
-    pub reasoning_field: ReasoningField,   // ReasoningEffort | EnableThinking | ThinkingBudget | ModelSwitch | None
+    pub reasoning: ReasoningWire,          // Effort | QwenThinking | ThinkingSwitch | ModelSwitch | None
     pub echo_reasoning: bool,              // 是否支持/要求历史回传 reasoning_content
     pub signature_blocks: bool,            // 是否有不透明签名块（Responses encrypted_content 等）
-    pub max_context_tokens: Option<u64>,
-}
+}                                        // （规划期的 max_context_tokens 已裁掉：M1 没有读它的路径）
 ```
 
 ## 4. reasoning 数据通路

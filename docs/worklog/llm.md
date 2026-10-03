@@ -18,7 +18,7 @@ M1 Phase 1 代码完成：ChatCompletions adapter、能力表 v1、重试/退避
 - [x] (M1) 重试/退避/429 + RateLimited 事件（kernel 新增 `StreamEvent::RateLimited` 透传通道；见 kernel.md 2026-09-30 条目）
 - [x] (M1) fixture 录制工具（xtask record-fixtures：原始字节 + provenance sidecar + 脱敏扫描）
 - [x] (M1) deepseek/qwen 真实探测录制（2026-10-01 首轮：两家 text/reasoning/401 共六流 + 双 401 错误体；**toolcall 流待重录**——首轮模型拒绝调用，录制器已改为 `tool_choice` 强制并加 `must_contain` 字节校验，待 `--force` 重跑）
-- [ ] (M1) `hatchery doctor --provider` 实测子命令（随 CLI Phase 4）
+- [x] (M1) `hatchery doctor --provider` 实测子命令（2026-09-30 随 CLI Phase 4 落地；两家双轮实测留痕见 worklog/cli.md 与本文件「模型世代校准」条）
 - [x] (M1) D3：ReasoningDone 是否需缓冲一个事件（**2026-10-01 定案：ChatCompletions 不需要**——实测两家 reasoning 值都严格先于 content 值，且该 wire 无签名块，迟到签名无从发生；adapter 在 reasoning→text 值边界补发 `ReasoningDone`。风险整体移交给 Responses wire 的 M2 adapter。流在 reasoning 中途结束则不发 Done，kernel 的 `close_open` 收尾——无签名可丢，等价）
 - [ ] (M2) Responses adapter
 - [ ] (M2) 多模态 image 输入
@@ -31,6 +31,10 @@ M1 Phase 1 代码完成：ChatCompletions adapter、能力表 v1、重试/退避
 - **wiremock 连接池竞态（2026-09-30 发现）**：keep-alive 连接被服务端关闭恰逢重试复用时，reqwest 报 `SendError`（分类为可重试，行为正确），但会让「恰好 N 个请求」的断言差一。测试一律用 `pool_max_idle_per_host(0)` 的客户端规避（adapter.rs helper 内注释）；真实部署保留连接池。
 
 ## 变更日志
+
+### 2026-10-01 · 评审⑤自查轮（llm）
+
+五处修正，全部带测试：`resolve_key` 修剪粘贴 key 的首尾空白（原测试钉的是原样返回，随行为修正更新）；`resolve_model` 多 provider 同名模型平局改判 None（HashMap 迭代序随机）；第二个 Done 块不再覆盖被延迟的第一个（先冲刷再持有）；`wire = "responses"` 配置 fatal 拒绝（此前字段无人读取，静默按 chat-completions 发）；重试耗尽报错报真实尝试次数而非策略预算（`max_attempts = 0` 不再产生「0 attempt(s)」的谎话）。补测：qwen 空 id 续传终于有真录制钉住（原 worklog 声称的 `real_toolcall_recording_replays_with_complete_fragments` 实际钉的是 deepseek 录制，无该 quirk）、畸形块跳过、流末冲刷 Done、5xx 两退避后放行、ModelSwitch 全臂、温度/上限落体、registry 平局。计数见 worklog/testing.md 本日条目（llm 59 项）。
 
 ### 2026-10-01 · capability_table 单点折算（M1 Phase 5）
 
