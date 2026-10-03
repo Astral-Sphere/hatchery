@@ -33,15 +33,19 @@ async fn invariant_stale_runtime_events_are_dropped() {
         let (read, mut write) = connection.into_split();
         let mut lines = BufReader::new(read).lines();
 
-        // The subscribing call's reply — the client resolves `subscribe` on it.
+        // The subscribing call's reply — the client resolves `subscribe` on it. The id is
+        // echoed from the request rather than assumed: a client that changes its id counter
+        // must not turn this test into a two-minute timeout instead of an assertion.
         let request = lines
             .next_line()
             .await
             .expect("the connection lived")
             .expect("a subscribing request arrived");
         assert!(request.contains(m::SESSION_LOAD), "{request}");
+        let id =
+            serde_json::from_str::<serde_json::Value>(&request).expect("a frame")["id"].clone();
         let reply = format!(
-            "{{\"jsonrpc\":\"2.0\",\"id\":10000,\"result\":{{\"session\":{{\"id\":\"{push_session}\"}}}}}}\n"
+            "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{\"session\":{{\"id\":\"{push_session}\"}}}}}}\n"
         );
         write.write_all(reply.as_bytes()).await.expect("write");
 
@@ -166,16 +170,26 @@ fn invariant_single_instance_race_admits_exactly_one_winner() {
     state.ensure().expect("state dir");
 
     let winners = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    // Two barriers instead of a sleep: `start` fires all twenty at once (a thread the scheduler
+    // delayed must still find the lock held, not released), and `done` keeps the winner's guard
+    // alive until every loser has actually tried — the old fixed 50 ms hold could expire before
+    // a late starter ever raced, letting a second winner through on a loaded runner.
+    let start = std::sync::Arc::new(std::sync::Barrier::new(20));
+    let done = std::sync::Arc::new(std::sync::Barrier::new(20));
     let mut handles = Vec::new();
     for _ in 0..20 {
         let state = std::sync::Arc::clone(&state);
         let winners = std::sync::Arc::clone(&winners);
+        let start = std::sync::Arc::clone(&start);
+        let done = std::sync::Arc::clone(&done);
         handles.push(std::thread::spawn(move || {
+            start.wait();
             if let Ok(_guard) = state.acquire_instance() {
-                // The guard is held for the thread's whole life: releasing early would let a
-                // later racer win twice, which would prove nothing about the race.
                 winners.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                std::thread::sleep(Duration::from_millis(50));
+                done.wait();
+                drop(_guard);
+            } else {
+                done.wait();
             }
         }));
     }
@@ -190,4 +204,159 @@ fn invariant_single_instance_race_admits_exactly_one_winner() {
 
     // And after every contender is gone, the lock is free again.
     drop(state.acquire_instance().expect("released on drop"));
+}
+
+/// The narrow window the slot lease exists for: two prompts racing while the runtime is still
+/// assembling (or the submit has landed but the kernel has not opened the turn yet). Exactly one
+/// is accepted, and the loser's text never reaches the store as a second turn.
+#[tokio::test(flavor = "multi_thread")]
+async fn two_concurrent_prompts_yield_exactly_one_turn() {
+    // Five seconds of provider silence: the winner's turn stays open for the whole race.
+    let wire = MockWire::replay_sse_after(support::SSE_REASONING_OK, Duration::from_secs(5)).await;
+    let daemon = support::daemon_at(&wire).await;
+    let creator = ClientProbe::attach(&daemon).await;
+    let created: m::SessionNewResult = creator.call(m::SESSION_NEW, &support::chat_params()).await;
+    let session = created.session.id;
+    drop(creator);
+
+    let first_probe = ClientProbe::attach(&daemon).await;
+    let second_probe = ClientProbe::attach(&daemon).await;
+    // A watcher, so the test can see the winner's turn actually end instead of guessing from
+    // the store (an early-interrupted turn legitimately commits nothing).
+    let mut events = first_probe.events(&daemon, session).await;
+    let params = support::prompt_params(session, "the racing prompt", created.session.generation);
+    let first = tokio::spawn(async move {
+        first_probe
+            .try_call::<m::SessionPromptParams, m::SessionPromptResult>(m::SESSION_PROMPT, &params)
+            .await
+    });
+    let second = tokio::spawn(async move {
+        second_probe
+            .try_call::<m::SessionPromptParams, m::SessionPromptResult>(
+                m::SESSION_PROMPT,
+                &support::prompt_params(
+                    session,
+                    "the other racing prompt",
+                    created.session.generation,
+                ),
+            )
+            .await
+    });
+    let (first, second) = tokio::join!(first, second);
+    // One `expect` each: what remains is the call's own Result.
+    let first = first.expect("task");
+    let second = second.expect("task");
+
+    let accepted = [first.is_ok(), second.is_ok()];
+    assert_eq!(
+        accepted.iter().filter(|ok| **ok).count(),
+        1,
+        "exactly one racing prompt is accepted: {first:?} / {second:?}"
+    );
+    let refused = first
+        .err()
+        .or_else(|| second.err())
+        .expect("the refused one");
+    assert!(
+        refused.to_string().contains("already running"),
+        "the refusal is TurnInProgress, not a drop: {refused}"
+    );
+
+    // The loser's message never became a turn: end the winner and check the store.
+    let cleaner = ClientProbe::attach(&daemon).await;
+    let _cancelled: m::SessionCancelResult = cleaner
+        .call(
+            m::SESSION_CANCEL,
+            &m::SessionCancelParams {
+                session_id: session,
+            },
+        )
+        .await;
+    support::collect_until_terminal(&mut events).await;
+
+    let loaded: m::SessionLoadResult = cleaner
+        .call(
+            m::SESSION_LOAD,
+            &m::SessionLoadParams {
+                session_id: session,
+                replay_from: None,
+                generation: None,
+            },
+        )
+        .await;
+    assert_eq!(
+        loaded.session.generation, 1,
+        "one assembly, not one per racer"
+    );
+    let texts: Vec<String> = loaded
+        .items
+        .iter()
+        .map(|item| serde_json::to_string(&item.kind).expect("serialisable"))
+        .collect();
+    assert!(
+        !texts
+            .iter()
+            .any(|text| text.contains("the other racing prompt")),
+        "the refused prompt left no trace in the store: {texts:?}"
+    );
+
+    daemon.stop().await;
+}
+
+/// D2's full story at the wire level: a turn with nobody watching runs to completion and the
+/// results are in the store — killing work because the last frontend blinked would throw away a
+/// paid-for turn.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_turn_with_no_subscriber_runs_to_completion_and_persists() {
+    let wire = MockWire::replay_sse(support::SSE_REASONING_OK).await;
+    let daemon = support::daemon_at(&wire).await;
+    let creator = ClientProbe::attach(&daemon).await;
+    let created: m::SessionNewResult = creator.call(m::SESSION_NEW, &support::chat_params()).await;
+    let session = created.session.id;
+    drop(creator); // the subscribing connection closes; the session has no watcher now
+
+    let driver = ClientProbe::attach(&daemon).await;
+    let _accepted: m::SessionPromptResult = driver
+        .call(
+            m::SESSION_PROMPT,
+            &support::prompt_params(session, "for nobody", created.session.generation),
+        )
+        .await;
+
+    // The row starts Idle, so the wait is on the *items* — three commits mean the turn ran to
+    // its end, watcher or no watcher.
+    let loaded: m::SessionLoadResult = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let loaded: m::SessionLoadResult = driver
+                .call(
+                    m::SESSION_LOAD,
+                    &m::SessionLoadParams {
+                        session_id: session,
+                        replay_from: None,
+                        generation: None,
+                    },
+                )
+                .await;
+            if loaded.items.len() >= 3 {
+                break loaded;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the unwatched turn finishes");
+    assert_eq!(loaded.items.len(), 3, "user, reasoning, assistant");
+    match &loaded.items[2].kind {
+        hatchery_protocol::ItemKind::AssistantMessage(content) => {
+            assert_eq!(
+                content.text,
+                support::ANSWER,
+                "the answer a watcher would have seen live is in the store"
+            );
+        }
+        other => panic!("expected the assistant answer: {other:?}"),
+    }
+    assert_eq!(wire.requests().await.len(), 1, "exactly one provider call");
+
+    daemon.stop().await;
 }

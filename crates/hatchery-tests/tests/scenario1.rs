@@ -214,3 +214,55 @@ async fn a_reconnecting_frontend_gap_fills_from_the_store() {
 
     daemon.stop().await;
 }
+
+/// The full envelope order, housekeeping included: `generation_bumped` opens a runtime's stream
+/// and `session_updated` frames the item story. `item_story` strips exactly these two, so a
+/// test that reads the whole stream is what catches an ordering regression between them — and
+/// the prompt reply's turn id must be the one the terminal event carries.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_wire_orders_housekeeping_around_item_events_and_names_the_turn() {
+    let wire = MockWire::replay_sse(support::SSE_REASONING_OK).await;
+    let daemon = support::daemon_at(&wire).await;
+    let probe = ClientProbe::attach(&daemon).await;
+    let created: m::SessionNewResult = probe.call(m::SESSION_NEW, &support::chat_params()).await;
+    let session = created.session.id;
+    let mut events = probe.events(&daemon, session).await;
+
+    let result: m::SessionPromptResult = probe
+        .call(
+            m::SESSION_PROMPT,
+            &support::prompt_params(session, "hi", created.session.generation),
+        )
+        .await;
+    let turn = support::collect_until_terminal(&mut events).await;
+    let kinds: Vec<String> = turn.iter().map(support::event_type).collect();
+
+    assert_eq!(
+        kinds.first().map(String::as_str),
+        Some("generation_bumped"),
+        "a runtime announces itself before anything else: {kinds:?}"
+    );
+    assert!(
+        kinds
+            .iter()
+            .position(|kind| kind == "session_updated")
+            .is_some_and(|update| {
+                kinds
+                    .iter()
+                    .position(|kind| kind.ends_with("_delta"))
+                    .is_none_or(|delta| update < delta)
+            }),
+        "the assembling housekeeping precedes every delta: {kinds:?}"
+    );
+
+    // The daemon minted the turn id, the kernel honoured it: the reply and the terminal event
+    // name the same turn.
+    match &turn.last().expect("nonempty").event {
+        ServerEvent::TurnFinished { turn, .. } => {
+            assert_eq!(*turn, result.turn, "the reply's turn is the finished turn");
+        }
+        other => panic!("expected a turn_finished last: {other:?}"),
+    }
+
+    daemon.stop().await;
+}

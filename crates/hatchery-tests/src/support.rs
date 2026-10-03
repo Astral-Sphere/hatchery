@@ -113,13 +113,15 @@ pub async fn collect_until_terminal(stream: &mut EventStream) -> Vec<SessionEven
     }
 }
 
-/// The item-level projection of one turn's events: `SessionUpdated` housekeeping stripped, the
-/// rest in arrival order. This is the wire-facing half of the kernel's documented sequence.
+/// The item-level projection of one turn's events: housekeeping (`session_updated` and the
+/// assembly's `generation_bumped`) stripped, the rest in arrival order. This is the wire-facing
+/// half of the kernel's documented sequence; the full envelope order including the housekeeping
+/// events is pinned by its own scenario test, not folded in here.
 #[must_use]
 pub fn item_story(events: &[SessionEvent]) -> Vec<String> {
     events
         .iter()
         .map(event_type)
-        .filter(|kind| kind != "session_updated")
+        .filter(|kind| kind != "session_updated" && kind != "generation_bumped")
         .collect()
 }
