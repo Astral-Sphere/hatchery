@@ -917,6 +917,48 @@ async fn a_turn_is_recorded_and_finished() {
 }
 
 #[tokio::test]
+async fn open_turns_lists_only_open_turns_across_sessions() {
+    // Startup recovery's read: one open turn, one finished turn, two sessions — the answer must
+    // name exactly the open one.
+    let fixture = Fixture::new().await;
+    let first = fixture.new_session().await.id;
+    let second = fixture.new_session().await.id;
+    let open_turn = TurnId::new();
+    let closed_turn = TurnId::new();
+    fixture
+        .store
+        .start_turn(first, open_turn, Timestamp::now())
+        .await
+        .expect("start the open one");
+    fixture
+        .store
+        .start_turn(second, closed_turn, Timestamp::now())
+        .await
+        .expect("start the closed one");
+    fixture
+        .store
+        .finish_turn(second, closed_turn, None)
+        .await
+        .expect("close it");
+
+    assert_eq!(
+        fixture.store.open_turns().await.expect("read"),
+        vec![(first, open_turn)],
+        "exactly the open turn, with its session"
+    );
+
+    fixture
+        .store
+        .finish_turn(first, open_turn, None)
+        .await
+        .expect("close the last one");
+    assert!(
+        fixture.store.open_turns().await.expect("read").is_empty(),
+        "closing it removes it from the answer"
+    );
+}
+
+#[tokio::test]
 async fn a_failed_turn_keeps_its_stop_reason_empty() {
     let (fixture, session) = Fixture::with_session().await;
     let turn = TurnId::new();

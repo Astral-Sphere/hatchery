@@ -114,6 +114,14 @@ pub trait SessionStore: Send + Sync {
         completion: Option<TurnCompletion>,
     ) -> Result<(), StoreError>;
 
+    /// Every turn whose row is still open, across all sessions.
+    ///
+    /// Startup bookkeeping: after a daemon restart, an open turn row describes work nothing is
+    /// doing anymore, and the recover path closes each one as a failure. Reading them all in one
+    /// call is deliberate — recovery runs before any runtime exists, so the answer cannot go
+    /// stale under it.
+    async fn open_turns(&self) -> Result<Vec<(SessionId, TurnId)>, StoreError>;
+
     /// Writes a session out as JSONL, refusing to overwrite an existing file.
     async fn export_jsonl(
         &self,
@@ -348,6 +356,10 @@ impl SessionStore for TursoStore {
             reply,
         })
         .await
+    }
+
+    async fn open_turns(&self) -> Result<Vec<(SessionId, TurnId)>, StoreError> {
+        self.ask(|reply| StoreCmd::OpenTurns { reply }).await
     }
 
     async fn export_jsonl(

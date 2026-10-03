@@ -198,6 +198,11 @@ pub enum StoreCmd {
         /// Done.
         reply: Reply<()>,
     },
+    /// Every turn whose row is still open, across all sessions (startup recovery reads this).
+    OpenTurns {
+        /// The open turns, keyed by their session.
+        reply: Reply<Vec<(SessionId, TurnId)>>,
+    },
     /// Everything a whole-tree export needs, read in one pass: every item oldest-first, and
     /// each item's descendant tips.
     ///
@@ -322,6 +327,9 @@ impl Writer {
                     reply,
                 } => {
                     reply_send(reply, self.finish_turn(session, turn, completion).await);
+                }
+                StoreCmd::OpenTurns { reply } => {
+                    reply_send(reply, self.open_turns().await);
                 }
                 StoreCmd::ExportBody { session, reply } => {
                     reply_send(reply, self.export_body(session).await);
@@ -891,6 +899,46 @@ impl Writer {
             return Err(StoreError::UnknownTurn(turn));
         }
         Ok(())
+    }
+
+    /// Reads every open turn, for startup recovery.
+    ///
+    /// A whole-table read on purpose: recovery runs before any runtime exists, so the answer
+    /// cannot go stale under it. A turn row whose session row is gone cannot appear — the delete
+    /// cascades — so no per-row existence check belongs here.
+    async fn open_turns(&self) -> Result<Vec<(SessionId, TurnId)>, StoreError> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT session_id, id FROM turns WHERE ended_at IS NULL",
+                (),
+            )
+            .await
+            .map_err(StoreError::database)?;
+        let mut open = Vec::new();
+        while let Some(row) = rows.next().await.map_err(StoreError::database)? {
+            fn text_of(
+                column: Result<turso::Value, StoreError>,
+                what: &str,
+            ) -> Result<String, StoreError> {
+                let value = column?;
+                as_text(&value).map(str::to_owned).ok_or_else(|| {
+                    StoreError::Database(format!("an open turn's {what} is not text"))
+                })
+            }
+            let session: SessionId =
+                text_of(row.get_value(0).map_err(StoreError::database), "session id")?
+                    .parse()
+                    .map_err(|_| {
+                        StoreError::Database("an open turn's session id does not parse".to_owned())
+                    })?;
+            let turn: TurnId = text_of(row.get_value(1).map_err(StoreError::database), "id")?
+                .parse()
+                .map_err(|_| StoreError::Database("an open turn's id does not parse".to_owned()))?;
+            open.push((session, turn));
+        }
+        sql::drain(rows).await?;
+        Ok(open)
     }
 
     // ------------------------------------------------------------- plumbing
