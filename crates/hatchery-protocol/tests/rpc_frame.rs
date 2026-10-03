@@ -48,20 +48,23 @@ fn a_null_id_is_not_taken_for_a_correlation() {
     // The same frame arriving on the transport: reported, and the stream stays usable.
     let frame = encode_frame(&value).expect("encode");
     let mut decoder = FrameDecoder::default();
-    let lines = decoder.push(frame.as_bytes()).expect("push");
-    assert_eq!(lines.len(), 1);
+    let scan = decoder.push(frame.as_bytes());
     assert_eq!(
-        decode_frame(&lines[0]),
+        scan.error, None,
+        "the frame itself is well-formed transport"
+    );
+    assert_eq!(scan.frames.len(), 1);
+    assert_eq!(
+        decode_frame(&scan.frames[0]),
         Err(FrameError::NullId { method: None })
     );
-    let after = decoder
-        .push(
-            encode_frame(&Request::new(1_i64, method::SESSION_CANCEL))
-                .expect("encode")
-                .as_bytes(),
-        )
-        .expect("the next frame still decodes");
-    assert_eq!(after.len(), 1);
+    let after = decoder.push(
+        encode_frame(&Request::new(1_i64, method::SESSION_CANCEL))
+            .expect("encode")
+            .as_bytes(),
+    );
+    assert_eq!(after.error, None, "the next frame still decodes");
+    assert_eq!(after.frames.len(), 1);
 }
 
 #[test]
@@ -77,11 +80,13 @@ fn every_methods_params_survive_a_real_frame() {
         let mut decoder = FrameDecoder::default();
         let mut lines = Vec::new();
         for byte in frame.as_bytes() {
-            lines.extend(
-                decoder
-                    .push(&[*byte])
-                    .unwrap_or_else(|error| panic!("{name} byte-wise push failed: {error}")),
+            let scan = decoder.push(&[*byte]);
+            assert_eq!(
+                scan.error, None,
+                "{name} byte-wise push failed: {:?}",
+                scan.error
             );
+            lines.extend(scan.frames);
         }
         assert_eq!(lines.len(), 1, "{name} produced {} frames", lines.len());
         assert_eq!(decoder.buffered_bytes(), 0, "{name} left bytes behind");
@@ -183,8 +188,14 @@ fn several_frames_in_one_read_arrive_in_order() {
     stream.push_str(&encode_frame(&response).expect("encode"));
 
     let mut decoder = FrameDecoder::default();
-    let lines = decoder.push(stream.as_bytes()).expect("push");
-    assert_eq!(lines.len(), 5, "one read must yield every complete frame");
+    let scan = decoder.push(stream.as_bytes());
+    assert_eq!(scan.error, None);
+    assert_eq!(
+        scan.frames.len(),
+        5,
+        "one read must yield every complete frame"
+    );
+    let lines = scan.frames;
 
     let methods: Vec<Option<String>> = lines
         .iter()

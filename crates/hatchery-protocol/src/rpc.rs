@@ -418,6 +418,19 @@ where
     deserializer.deserialize_option(IdProbe)
 }
 
+/// What one [`FrameDecoder::push`] produced.
+///
+/// Frames the chunk completed *before* a failure are delivered: one bad line must not take the
+/// good requests that shared its read with it. The failure ends the scan, not the stream — the
+/// offending bytes are dropped and the next `push` starts on what survives.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Scan {
+    /// Every frame the chunk completed, in order, including any parsed before a failure.
+    pub frames: Vec<String>,
+    /// The failure that ended the scan, if any.
+    pub error: Option<FrameError>,
+}
+
 /// Accumulates bytes and yields complete lines.
 ///
 /// The transport is a stream: a read can end mid-frame, or hand over six frames at once. Decoding
@@ -437,21 +450,20 @@ impl FrameDecoder {
     /// runaway writer from exhausting memory.
     pub const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
 
-    /// Feeds a chunk in and returns every line completed by it.
+    /// Feeds a chunk in and returns what it produced.
     ///
     /// Blank lines are skipped: a stray newline from a terminal or a logging middleware is noise,
     /// not a protocol violation.
     ///
-    /// # Errors
-    ///
-    /// [`FrameError::TooLong`] when a frame exceeds the limit, terminated or not, or
-    /// [`FrameError::NotUtf8`] when a completed line is not valid UTF-8. Both drop the offending
-    /// bytes, so the next `push` starts on a clean buffer rather than failing forever.
-    pub fn push(&mut self, chunk: &[u8]) -> Result<Vec<String>, FrameError> {
+    /// Frames the chunk completed *before* a failure are still delivered: one bad line must not
+    /// take the good requests that shared its read with it. The failure ends the scan, not the
+    /// stream — the offending bytes are dropped and the next `push` starts on what survives.
+    pub fn push(&mut self, chunk: &[u8]) -> Scan {
         self.buffer.extend_from_slice(chunk);
-        let mut lines = Vec::new();
+        let mut frames = Vec::new();
         let mut consumed = 0;
         let mut scanned = self.scanned;
+        let mut error = None;
 
         while let Some(offset) = self.buffer[scanned..]
             .iter()
@@ -465,31 +477,49 @@ impl FrameDecoder {
                 continue;
             }
             if raw.len() > Self::MAX_FRAME_BYTES {
-                self.buffer.clear();
+                self.buffer.drain(..consumed);
                 self.scanned = 0;
-                return Err(FrameError::TooLong);
+                error = Some(FrameError::TooLong);
+                break;
             }
             // Draining *before* reporting is what keeps the decoder usable: the alternative
             // leaves the bad line buffered and every later push fails on the same bytes.
             let Ok(line) = std::str::from_utf8(raw) else {
                 self.buffer.drain(..consumed);
                 self.scanned = 0;
-                return Err(FrameError::NotUtf8);
+                error = Some(FrameError::NotUtf8);
+                break;
             };
-            lines.push(line.to_owned());
+            frames.push(line.to_owned());
         }
 
+        if let Some(error) = error {
+            // The offending bytes are already drained; whatever trails them was not scanned and
+            // is left for the next push, which starts from position 0.
+            return Scan {
+                frames,
+                error: Some(error),
+            };
+        }
         if consumed > 0 {
             self.buffer.drain(..consumed);
         }
         if self.buffer.len() > Self::MAX_FRAME_BYTES {
+            // Nothing complete to save here: an unterminated frame past the limit is released
+            // whole, because the alternative is holding it forever.
             self.buffer.clear();
             self.scanned = 0;
-            return Err(FrameError::TooLong);
+            return Scan {
+                frames,
+                error: Some(FrameError::TooLong),
+            };
         }
         // Everything still buffered was scanned to the end without a newline.
         self.scanned = self.buffer.len();
-        Ok(lines)
+        Scan {
+            frames,
+            error: None,
+        }
     }
 
     /// Bytes held for an incomplete frame.
@@ -641,7 +671,9 @@ mod tests {
         let mut decoder = FrameDecoder::default();
         let mut lines = Vec::new();
         for byte in bytes {
-            lines.extend(decoder.push(&[*byte]).expect("byte-wise push"));
+            let scan = decoder.push(&[*byte]);
+            assert!(scan.error.is_none(), "byte-wise push: {scan:?}");
+            lines.extend(scan.frames);
         }
         assert_eq!(lines.len(), 1);
         assert_eq!(
@@ -660,8 +692,8 @@ mod tests {
         let split = bytes.len() / 2;
 
         let mut decoder = FrameDecoder::default();
-        let mut lines = decoder.push(&bytes[..split]).expect("first half");
-        lines.extend(decoder.push(&bytes[split..]).expect("second half"));
+        let mut lines = decoder.push(&bytes[..split]).frames;
+        lines.extend(decoder.push(&bytes[split..]).frames);
         assert_eq!(lines.len(), 1);
         assert_eq!(
             decode_frame(&lines[0]).expect("decode"),
@@ -679,7 +711,7 @@ mod tests {
             .push_str(&encode_frame(&Request::new(2_i64, method::SESSION_CANCEL)).expect("encode"));
 
         let mut decoder = FrameDecoder::default();
-        let lines = decoder.push(payload.as_bytes()).expect("push");
+        let lines = decoder.push(payload.as_bytes()).frames;
         assert_eq!(
             lines.len(),
             3,
@@ -694,10 +726,12 @@ mod tests {
     #[test]
     fn a_runaway_frame_is_rejected_rather_than_buffered_forever() {
         let mut decoder = FrameDecoder::default();
-        let error = decoder
-            .push(&vec![b'a'; FrameDecoder::MAX_FRAME_BYTES + 1])
-            .expect_err("an unterminated frame past the limit must fail");
-        assert_eq!(error, FrameError::TooLong);
+        let scan = decoder.push(&vec![b'a'; FrameDecoder::MAX_FRAME_BYTES + 1]);
+        assert_eq!(scan.error, Some(FrameError::TooLong));
+        assert!(
+            scan.frames.is_empty(),
+            "an unterminated frame past the limit must fail"
+        );
         assert_eq!(decoder.buffered_bytes(), 0, "the buffer is released");
     }
 
@@ -708,17 +742,21 @@ mod tests {
         let mut decoder = FrameDecoder::default();
         let mut chunk = vec![b'a'; FrameDecoder::MAX_FRAME_BYTES + 1];
         chunk.push(b'\n');
-        assert_eq!(decoder.push(&chunk), Err(FrameError::TooLong));
+        let scan = decoder.push(&chunk);
+        assert_eq!(scan.error, Some(FrameError::TooLong));
+        assert_eq!(scan.frames, Vec::<String>::new());
         assert_eq!(decoder.buffered_bytes(), 0, "the buffer is released");
 
-        let lines = decoder
-            .push(
-                encode_frame(&Request::new(1_i64, method::DAEMON_HELLO))
-                    .expect("encode")
-                    .as_bytes(),
-            )
-            .expect("the decoder stays usable after refusing an oversized frame");
-        assert_eq!(lines.len(), 1);
+        let lines = decoder.push(
+            encode_frame(&Request::new(1_i64, method::DAEMON_HELLO))
+                .expect("encode")
+                .as_bytes(),
+        );
+        assert_eq!(
+            lines.error, None,
+            "usable after refusing an oversized frame"
+        );
+        assert_eq!(lines.frames.len(), 1);
     }
 
     #[test]
@@ -726,7 +764,11 @@ mod tests {
         let mut decoder = FrameDecoder::default();
         let mut bytes = vec![0xff, 0xfe];
         bytes.push(b'\n');
-        assert_eq!(decoder.push(&bytes), Err(FrameError::NotUtf8));
+        assert_eq!(
+            decoder.push(&bytes).error,
+            Some(FrameError::NotUtf8),
+            "invalid utf8 in a complete line is reported"
+        );
     }
 
     #[test]
@@ -734,7 +776,10 @@ mod tests {
         // Reporting the error is half of it; the other half is that the bad bytes are gone. A
         // decoder that kept them would fail every later push on the same line, forever.
         let mut decoder = FrameDecoder::default();
-        assert_eq!(decoder.push(&[0xff, 0xfe, b'\n']), Err(FrameError::NotUtf8));
+        assert_eq!(
+            decoder.push(&[0xff, 0xfe, b'\n']).error,
+            Some(FrameError::NotUtf8)
+        );
         assert_eq!(
             decoder.buffered_bytes(),
             0,
@@ -742,12 +787,11 @@ mod tests {
         );
 
         let frame = encode_frame(&Request::new(1_i64, method::DAEMON_HELLO)).expect("encode");
-        let lines = decoder
-            .push(frame.as_bytes())
-            .expect("the next push must work");
-        assert_eq!(lines.len(), 1);
+        let scan = decoder.push(frame.as_bytes());
+        assert_eq!(scan.error, None, "the next push must work");
+        assert_eq!(scan.frames.len(), 1);
         assert!(matches!(
-            decode_frame(&lines[0]).expect("decode"),
+            decode_frame(&scan.frames[0]).expect("decode"),
             Incoming::Request(_)
         ));
     }
@@ -759,11 +803,15 @@ mod tests {
         let mut chunk = vec![0xff, b'\n'];
         chunk.extend_from_slice(good.as_bytes());
 
-        assert_eq!(decoder.push(&chunk), Err(FrameError::NotUtf8));
-        let lines = decoder
-            .push(&[])
-            .expect("only the bad line is discarded, not the whole read");
-        assert_eq!(lines, vec![good.trim_end_matches('\n')]);
+        let refused = decoder.push(&chunk);
+        assert_eq!(refused.error, Some(FrameError::NotUtf8));
+        assert!(refused.frames.is_empty());
+        let scan = decoder.push(&[]);
+        assert_eq!(
+            scan.error, None,
+            "only the bad line is discarded, not the whole read"
+        );
+        assert_eq!(scan.frames, vec![good.trim_end_matches('\n')]);
     }
 
     #[test]
@@ -782,14 +830,14 @@ mod tests {
         );
 
         let mut whole = FrameDecoder::default();
-        let expected = whole.push(stream.as_bytes()).expect("one push");
+        let expected = whole.push(stream.as_bytes()).frames;
         assert_eq!(expected.len(), 3);
 
         for size in [1, 2, 3, 7, 64, 4096] {
             let mut decoder = FrameDecoder::default();
             let mut lines = Vec::new();
             for part in stream.as_bytes().chunks(size) {
-                lines.extend(decoder.push(part).expect("chunked push"));
+                lines.extend(decoder.push(part).frames);
             }
             assert_eq!(
                 lines, expected,
@@ -811,7 +859,7 @@ mod tests {
         let mut decoder = FrameDecoder::default();
         let mut lines = Vec::new();
         for part in stream.chunks(32) {
-            lines.extend(decoder.push(part).expect("push"));
+            lines.extend(decoder.push(part).frames);
         }
         let elapsed = started.elapsed();
 
