@@ -26,9 +26,12 @@ env:
   # log keeps its file:line either way (`debug = 0` is what loses it). Cache size is not
   # cosmetic: the repository cache quota is shared, and going over it evicts by last-access date.
   CARGO_PROFILE_DEV_DEBUG: line-tables-only
-  # Compiler flags come from .cargo/config.toml (`-C target-cpu=native`) so that CI and a
-  # developer's machine build the same way. Do not duplicate them here: RUSTFLAGS in the
-  # environment would override the config file instead of adding to it.
+  # No compiler flags in CI, on purpose. The 2026-09-30 RUSTFLAGS=x86-64-v3 experiment (git
+  # 88f2561) and the repo's then-active target-cpu=native produced cache entries that crashed
+  # with illegal instructions once rust-cache restored them onto a different runner CPU; the
+  # cleanup chain is 6c4e005, 1c75e69 and 4ae1042 (the last traded the whole cache away —
+  # since reverted). Portable-by-default is the rule; local speed belongs in the user-level
+  # ~/.cargo/config.toml, which CI never reads.
 
 jobs:
   unix:
@@ -74,9 +77,7 @@ jobs:
           cargo nextest --version
 
       - name: Gate
-        run: |
-            cargo clean
-            bash scripts/ci.sh
+        run: bash scripts/ci.sh
 
       - name: Upload test report
         if: always()

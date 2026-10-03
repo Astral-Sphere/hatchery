@@ -1,9 +1,16 @@
 [alias]
 xtask = "run --package xtask --"
 
-# Build for the machine that runs the build (project preference, 2026-09-28). Two consequences
-# worth knowing before changing this: the artifacts are not portable to other CPUs, so release
-# packaging must override it; and cross-compiling out of this workspace needs `RUSTFLAGS=""`, since
-# the environment variable overrides this table rather than adding to it.
+# No rustflags here, on purpose (disabled 2026-10-01, git 1c75e69). CI builds with this file,
+# and `-C target-cpu=native` artifacts are only valid on the exact CPU that built them:
+# rust-cache restored them onto a different runner and the binaries died on illegal
+# instructions. The 2026-09-30 RUSTFLAGS=x86-64-v3 experiment inside the workflow (git
+# 88f2561) hit the same wall; the escape hatch at the time was a per-run `cargo clean`
+# (git 4ae1042), which threw the whole cache away. The durable fix is what this file does
+# now: build portable by default.
+#
+# Want native codegen for local iteration? Put the flag in the *user-level*
+# ~/.cargo/config.toml, which CI never reads. Anything built that way stays non-portable:
+# release packaging and cross-compilation must keep building without it.
 [build]
 # rustflags = ["-C", "target-cpu=native"]
