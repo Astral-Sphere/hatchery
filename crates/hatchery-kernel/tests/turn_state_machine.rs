@@ -1403,3 +1403,119 @@ async fn turn_running_tracks_the_state_machine() {
         "a finished turn is not running"
     );
 }
+
+// ------------------------------------------------------------ control surfaces
+
+#[tokio::test]
+async fn a_rate_limited_notice_is_forwarded_to_the_sink() {
+    // The adapter emits this while working through its backoff; the kernel must forward it
+    // untouched (docs/design/llm.md §6) — a frontend's "hold on, retrying" countdown is built
+    // on it, and a rename or a dropped publish would silence that silently.
+    let provider = ScriptedProvider::new(vec![vec![
+        StreamEvent::RateLimited {
+            retry_after_ms: 250,
+        },
+        StreamEvent::TextDelta {
+            text: "eventually".to_owned(),
+        },
+        StreamEvent::Done {
+            finish_reason: FinishReason::Stop,
+        },
+    ]]);
+    let harness = Harness::new(
+        provider,
+        ScriptedToolHost::new(),
+        MemoryHistory::empty(),
+        TurnLimits::default(),
+    );
+    harness.prompt("go").await;
+    let events = harness.finish().await;
+
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            KernelEvent::RateLimited {
+                retry_after_ms: 250
+            }
+        )),
+        "the notice reaches the sink verbatim, among: {events:?}"
+    );
+    assert_eq!(
+        reason(&events),
+        Some(StopReason::ModelDone),
+        "a rate-limit notice is informational; it must not end the turn"
+    );
+}
+
+#[tokio::test]
+async fn a_fuse_already_at_its_limit_ends_the_turn_without_a_provider_call() {
+    // `max_rounds` of zero trips the fuse before the first round. The turn still ends through
+    // the normal path — a terminal event with the fuse's own reason — rather than hanging or
+    // skipping the turn bookkeeping.
+    let harness = Harness::new(
+        ScriptedProvider::new(vec![]),
+        ScriptedToolHost::new(),
+        MemoryHistory::empty(),
+        TurnLimits::with_max_rounds(0),
+    );
+    harness.prompt("hello").await;
+    let events = harness.finish().await;
+
+    assert_eq!(reason(&events), Some(StopReason::MaxRounds));
+    assert!(
+        harness.provider.requests().is_empty(),
+        "a tripped fuse never reaches the provider"
+    );
+    assert_eq!(
+        kinds(&events),
+        vec![ItemKindTag::UserMessage],
+        "the user's message is recorded even though nothing answered it"
+    );
+}
+
+#[tokio::test]
+async fn dropping_every_handle_mid_turn_still_ends_the_turn() {
+    // The daemon's unload path drops the last handle; the contract promises a terminal event
+    // even then — the turn is cancelled through the command channel closing, never by losing
+    // the future.
+    let (provider, gate) =
+        ScriptedProvider::new(vec![ScriptedProvider::text_round("slow")]).gated();
+    let sink = Arc::new(RecordingSink::new());
+    let (agent, handle) = AgentBuilder::new(
+        SessionId::new(),
+        ChatOptions::new("scripted-model"),
+        Ports::new(
+            Arc::new(provider) as Arc<dyn hatchery_kernel::LlmProvider>,
+            Arc::new(ScriptedToolHost::new()) as Arc<dyn hatchery_kernel::ToolHost>,
+            Arc::new(MemoryHistory::empty()) as Arc<dyn hatchery_kernel::HistorySource>,
+            Arc::clone(&sink) as Arc<dyn hatchery_kernel::EventSink>,
+        ),
+    )
+    .build();
+    let running = tokio::spawn(Agent::run(agent));
+
+    handle
+        .submit(AgentCommand::prompt("hello"))
+        .await
+        .expect("submitted");
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while !handle.turn_running() {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the turn opened");
+
+    drop(handle);
+    let events = sink.wait_for_end().await;
+    assert_eq!(
+        reason(&events),
+        Some(StopReason::Interrupted),
+        "a dropped handle interrupts, it does not abandon"
+    );
+    gate.release(2);
+    tokio::time::timeout(std::time::Duration::from_secs(2), running)
+        .await
+        .expect("the loop exits")
+        .expect("the loop exits cleanly");
+}

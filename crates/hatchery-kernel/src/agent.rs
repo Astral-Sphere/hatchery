@@ -294,7 +294,9 @@ impl Agent {
     pub async fn run(mut self) {
         while let Some(command) = self.commands.recv().await {
             match command {
-                AgentCommand::TurnInput(content) => self.run_turn(content).await,
+                AgentCommand::TurnInput { turn, content } => {
+                    self.run_turn(turn, content).await;
+                }
                 AgentCommand::Interrupt => {
                     tracing::debug!("interrupt with no turn running; ignored");
                 }
@@ -307,8 +309,11 @@ impl Agent {
     }
 
     /// Runs one turn to its terminal event.
-    async fn run_turn(&mut self, content: Content) {
-        let turn = TurnId::new();
+    ///
+    /// The turn id comes from the command: the daemon minted it before submitting, so the
+    /// `session/prompt` reply, every item of the turn and the terminal event all name the same
+    /// turn.
+    async fn run_turn(&mut self, turn: TurnId, content: Content) {
         self.turn = turn;
         self.cancel = CancellationToken::new();
         let mut usage = Usage::default();
@@ -768,7 +773,7 @@ impl Agent {
                     self.cancel.cancel();
                     return Ok(Decision::Interrupted);
                 }
-                StreamStep::Command(Some(AgentCommand::TurnInput(_))) => {
+                StreamStep::Command(Some(AgentCommand::TurnInput { .. })) => {
                     tracing::warn!("turn input while waiting for approval; ignored");
                 }
             }
@@ -782,7 +787,7 @@ impl Agent {
                 self.cancel.cancel();
                 CommandFlow::Stop
             }
-            Some(AgentCommand::TurnInput(_)) => {
+            Some(AgentCommand::TurnInput { .. }) => {
                 // The daemon rejects a second prompt with `TurnInProgress`, so this is a caller
                 // bug. Queueing would invent a turn, which is worse than dropping it loudly.
                 tracing::warn!("turn input while a turn is running; dropped");

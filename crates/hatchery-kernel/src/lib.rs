@@ -28,7 +28,7 @@
 //! assert_eq!(TurnLimits::default().max_rounds, 100);
 //! assert!(matches!(
 //!     AgentCommand::prompt("hello"),
-//!     AgentCommand::TurnInput(_)
+//!     AgentCommand::TurnInput { .. }
 //! ));
 //! assert_eq!(Message::user("hello").role, hatchery_kernel::Role::User);
 //! ```
