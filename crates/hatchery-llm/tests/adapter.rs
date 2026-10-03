@@ -1,6 +1,7 @@
 //! HTTP-level adapter tests: recorded-style SSE fixtures replayed through `MockWire`
-//! (docs/design/testing.md §3.3). Everything here runs offline; the `live_` counterparts live in
-//! `tests/live.rs` behind the `live-tests` feature and real credentials.
+//! (docs/design/testing.md §3.3). Everything here runs offline. The `live-tests` feature is
+//! declared for M2's real-credential probes; there is no `tests/live.rs` yet by design —
+//! live probing runs through `hatchery doctor --provider` and its findings land in the worklog.
 
 use futures::StreamExt;
 use hatchery_kernel::{ChatOptions, LlmError, LlmProvider, Message, StreamEvent};
@@ -813,3 +814,169 @@ fn the_capability_table_stays_constructible_and_overridable() {
 // LlmError is part of the adapter's contract surface; keep the import honest even when the
 // assertions above only read its fields.
 const _: Option<LlmError> = None;
+
+#[tokio::test]
+async fn real_qwen_toolcall_continuations_do_not_blank_the_call_id() {
+    // The qwen recording's continuation fragments echo `"id": ""` on every chunk — the worklog's
+    // live-fix. The deepseek fixture cannot pin this (its fragments carry the id once), so this
+    // is the test that earns the filter: per-index merges must keep the real id and valid JSON.
+    let events = replay("qwen-toolcall", "qwen3.8-flash").await;
+    let kinds: Vec<&'static str> = events.iter().map(|(kind, _)| *kind).collect();
+    assert!(kinds.contains(&"done"), "{kinds:?}");
+    assert!(!kinds.contains(&"error"), "{kinds:?}");
+
+    let mut calls: std::collections::BTreeMap<u32, (Option<String>, String, String)> =
+        std::collections::BTreeMap::new();
+    for (_, event) in &events {
+        if let StreamEvent::ToolCall { delta } = event {
+            let entry = calls.entry(delta.index).or_default();
+            if let Some(id) = &delta.id {
+                assert!(
+                    !id.is_empty(),
+                    "an empty id reached the kernel; the filter at the translation boundary leaked"
+                );
+                entry.0 = Some(id.clone());
+            }
+            if let Some(name) = &delta.name {
+                entry.1 = name.clone();
+            }
+            entry.2.push_str(&delta.args_delta);
+        }
+    }
+    assert!(!calls.is_empty(), "the recording carries a tool call");
+    for (index, (id, name, args)) in calls {
+        let id = id.unwrap_or_else(|| panic!("fragment {index} kept no provider id"));
+        assert!(
+            id.starts_with("call_"),
+            "fragment {index} kept no provider id: {id:?}"
+        );
+        assert!(!name.is_empty(), "fragment {index} lacks a name");
+        serde_json::from_str::<serde_json::Value>(&args)
+            .unwrap_or_else(|error| panic!("fragment {index}: args not JSON: {args:?}: {error}"));
+    }
+}
+
+#[tokio::test]
+async fn an_unparseable_chunk_is_skipped_without_ending_the_stream() {
+    // One malformed `data:` frame is the provider's hiccup: the adapter warns and continues, and
+    // the deltas on both sides of it still reach the kernel.
+    #[rustfmt::skip]
+    let body = concat!(
+        r#"data: {"id":"1","choices":[{"index":0,"delta":{"content":"before"},"finish_reason":null}],"created":1718345013,"model":"m","object":"chat.completion.chunk"}"#, "\n\n",
+        "data: this is not json at all\n\n",
+        r#"data: {"id":"1","choices":[{"index":0,"delta":{"content":" after"},"finish_reason":null}],"created":1718345013,"model":"m","object":"chat.completion.chunk"}"#, "\n\n",
+        r#"data: {"id":"1","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"created":1718345013,"model":"m","object":"chat.completion.chunk"}"#, "\n\n",
+        "data: [DONE]\n\n",
+    );
+    let wire = MockWire::replay_sse(body.to_owned()).await;
+    let mut config = quick_retry();
+    config.base_url = wire.url();
+    let provider = provider(config);
+    arm_key();
+
+    let events = stream_events(&provider, &ChatOptions::new("m"), &[Message::user("hello")]).await;
+    let text: String = events
+        .iter()
+        .filter_map(|event| match event {
+            StreamEvent::TextDelta { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(text, "before after", "both sides of the bad chunk survive");
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, StreamEvent::Done { .. })),
+        "the stream still finishes: {events:?}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, StreamEvent::Error { .. })),
+        "a skipped chunk is not an error event: {events:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_done_flushed_when_the_stream_ends_without_a_usage_chunk() {
+    // A truncated-but-complete-looking stream: the finish chunk arrives, then the connection
+    // closes with no usage-only chunk and no sentinel. The held-back Done must still be
+    // delivered — the kernel judges a missing finish reason, not a missing usage line.
+    #[rustfmt::skip]
+    let body = concat!(
+        r#"data: {"id":"1","choices":[{"index":0,"delta":{"content":"partial"},"finish_reason":null}],"created":1718345013,"model":"m","object":"chat.completion.chunk"}"#, "\n\n",
+        r#"data: {"id":"1","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"created":1718345013,"model":"m","object":"chat.completion.chunk"}"#, "\n\n",
+    );
+    let wire = MockWire::replay_sse(body.to_owned()).await;
+    let mut config = quick_retry();
+    config.base_url = wire.url();
+    let provider = provider(config);
+    arm_key();
+
+    let events = stream_events(&provider, &ChatOptions::new("m"), &[Message::user("hello")]).await;
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, StreamEvent::Done { .. })),
+        "the deferred Done is flushed at stream end: {events:?}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_5xx_backs_off_then_streams() {
+    // The retry matrix's other half at the wire level: a server-side refusal retries with the
+    // same backoff discipline as a 429, and the next attempt streams normally.
+    #[rustfmt::skip]
+    let sse_body = concat!(
+        r#"data: {"id":"1","choices":[{"index":0,"delta":{"content":"late"},"finish_reason":null}],"created":1718345013,"model":"m","object":"chat.completion.chunk"}"#, "\n\n",
+        r#"data: {"id":"1","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"created":1718345013,"model":"m","object":"chat.completion.chunk"}"#, "\n\n",
+        "data: [DONE]\n\n",
+    );
+    let wire = MockWire::refuse_then_sse(503, &error_body("synthetic-429"), 2, sse_body).await;
+    let mut config = quick_retry();
+    config.base_url = wire.url();
+    let provider = provider(config);
+    arm_key();
+
+    let events = stream_events(&provider, &ChatOptions::new("m"), &[Message::user("hello")]).await;
+    let notices = events
+        .iter()
+        .filter(|event| matches!(event, StreamEvent::RateLimited { .. }))
+        .count();
+    assert_eq!(
+        notices, 2,
+        "one backoff notice per refused attempt: {events:?}"
+    );
+    let text: String = events
+        .iter()
+        .filter_map(|event| match event {
+            StreamEvent::TextDelta { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(text, "late", "the third attempt streams");
+}
+
+#[tokio::test]
+async fn a_responses_wire_config_is_refused_not_ignored() {
+    // `wire` is configurable so config files survive into M2 — but silently speaking Chat
+    // Completions at a Responses endpoint would be worse than refusing to start.
+    let mut config = quick_retry();
+    config.wire = hatchery_llm::WireApi::Responses;
+    let provider = provider(config);
+    arm_key();
+
+    let error = provider
+        .chat_stream(
+            &ChatOptions::new("m"),
+            &[Message::user("hi")],
+            CancellationToken::new(),
+        )
+        .await
+        .err()
+        .expect("the wrong wire is fatal");
+    assert!(
+        error.to_string().contains("chat-completions"),
+        "the refusal names the wire it does speak: {error}"
+    );
+}

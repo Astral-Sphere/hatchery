@@ -210,6 +210,36 @@ mod tests {
     }
 
     #[test]
+    fn a_model_switch_row_picks_the_model_by_effort() {
+        // The config-overridable row for older deployments: the effort names the model, `off`
+        // naming the non-reasoning one.
+        let table = CapabilityTable::builtin().with_override(
+            "legacy",
+            ModelCapabilities {
+                reasoning: ReasoningWire::ModelSwitch {
+                    off_model: "legacy-chat".to_owned(),
+                    thinking_model: "legacy-reasoner".to_owned(),
+                },
+                ..ModelCapabilities::default()
+            },
+        );
+        let caps = table.capabilities("legacy-7b");
+        assert_eq!(
+            caps.model_for_effort("legacy-7b", Some(ReasoningEffort::Off)),
+            "legacy-chat"
+        );
+        assert_eq!(
+            caps.model_for_effort("legacy-7b", Some(ReasoningEffort::High)),
+            "legacy-reasoner"
+        );
+        assert_eq!(
+            caps.model_for_effort("legacy-7b", None),
+            "legacy-7b",
+            "no effort requested: the caller's model stands"
+        );
+    }
+
+    #[test]
     fn an_override_wins_by_longest_prefix_and_replaces_its_own_kind() {
         let table = CapabilityTable::builtin().with_override(
             "qwen3.8-flash",

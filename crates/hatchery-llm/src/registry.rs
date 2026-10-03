@@ -32,8 +32,8 @@ impl ProviderRegistry {
 
     /// Registers a provider under `id`, replacing any earlier one.
     ///
-    /// Configs named `"deepseek"` and `"qwen"` start from the built-in endpoints and models
-    /// (see [`ProviderConfig::builtin`]); everything else states its own facts.
+    /// Every config states its own facts; the *daemon's* config layer seeds its deepseek/qwen
+    /// rows from [`ProviderConfig::builtin`] before a user layer merges over them.
     pub fn register(&self, id: impl Into<String>, config: ProviderConfig) -> Registration {
         let id = id.into();
         let mut slots = self
@@ -59,8 +59,10 @@ impl ProviderRegistry {
 
     /// The provider that serves `model`, by exact membership of its configured model list.
     ///
-    /// With exactly one provider registered, that provider serves any model name — a single
-    /// provider deployment should not have to repeat its own name in the model list.
+    /// One registered provider serves any model name — a single provider deployment should not
+    /// have to repeat its own name in the model list. When several providers list the same
+    /// model, the answer is `None`: a `HashMap` iterates in a randomized order, so picking a
+    /// winner would send the same config to different providers on different runs.
     #[must_use]
     pub fn resolve_model(&self, model: &str) -> Option<Arc<ChatCompletionsProvider>> {
         let slots = self
@@ -70,10 +72,11 @@ impl ProviderRegistry {
         if slots.len() == 1 {
             return slots.values().next().cloned();
         }
-        slots
+        let mut serving = slots
             .values()
-            .find(|provider| provider.config().models.iter().any(|m| m == model))
-            .cloned()
+            .filter(|provider| provider.config().models.iter().any(|m| m == model));
+        let first = serving.next()?;
+        serving.next().is_none().then(|| first.clone())
     }
 
     /// Every registered id, sorted for display.
@@ -194,6 +197,18 @@ mod tests {
             registry.resolve_model("m3").is_none(),
             "unlisted model, ambiguous registry: refuse rather than guess"
         );
+    }
+
+    #[test]
+    fn overlapping_model_lists_refuse_rather_than_guess() {
+        // A HashMap iterates in a randomized order: picking a winner on a tie would send the
+        // same model to different providers on different runs. Refusal is the deterministic
+        // answer.
+        tls_installed();
+        let registry = ProviderRegistry::new();
+        registry.register("a", config("K").with_models(["shared"]));
+        registry.register("b", config("K").with_models(["shared"]));
+        assert!(registry.resolve_model("shared").is_none());
     }
 
     #[test]

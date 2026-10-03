@@ -195,8 +195,11 @@ impl ProviderConfig {
 /// The interesting half of [`ProviderConfig::api_key`], apart from the environment lookup so it
 /// needs no process-global state to test.
 fn resolve_key(found: Option<String>, env_key: &str) -> Result<String, String> {
+    // Trimmed on use: a leading/trailing space (the classic `env` copy artifact) would ride
+    // into the bearer header as `Bearer  sk-...` and surface as a 401 far from its cause.
     found
-        .filter(|key| !key.trim().is_empty())
+        .map(|key| key.trim().to_owned())
+        .filter(|key| !key.is_empty())
         .ok_or_else(|| format!("environment variable `{env_key}` is not set"))
 }
 
@@ -253,7 +256,8 @@ mod tests {
     fn the_key_is_accepted_present_and_rejected_absent() {
         assert_eq!(
             resolve_key(Some(" sk-live-1 ".to_owned()), "K").expect("set"),
-            " sk-live-1 "
+            "sk-live-1",
+            "whitespace around a pasted key is trimmed, not sent verbatim"
         );
 
         let error = resolve_key(None, "DEEPSEEK_API_KEY").expect_err("unset");

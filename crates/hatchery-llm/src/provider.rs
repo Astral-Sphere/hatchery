@@ -84,6 +84,14 @@ impl LlmProvider for ChatCompletionsProvider {
         if self.config.base_url.is_empty() {
             return Err(LlmError::fatal("the provider has no base_url configured"));
         }
+        // `wire` is configurable so the config file survives into M2, but this build speaks one
+        // protocol: refusing loudly beats silently speaking Chat Completions at a Responses
+        // endpoint.
+        if self.config.wire != crate::config::WireApi::ChatCompletions {
+            return Err(LlmError::fatal(
+                "this build only speaks `wire = \"chat-completions\"`; the responses wire is a later milestone",
+            ));
+        }
         let api_key = self.config.api_key().map_err(LlmError::fatal)?;
 
         // The borrowed window ends here: body and options are owned from now on, and the stream
@@ -177,6 +185,11 @@ impl RetryStream {
 
         if let (Some(index), false) = (done_at, has_usage) {
             let done = events.remove(index);
+            if let Some(previous) = self.deferred_done.take() {
+                // A second Done-bearing chunk while one is already held back: the first stop is
+                // real and must not be silently replaced by the newer one.
+                self.pending.push_back(previous);
+            }
             self.pending.extend(events);
             self.deferred_done = Some(done);
             return;
@@ -212,11 +225,10 @@ impl RetryStream {
             }
             Verdict::Retry => {
                 self.state = State::Finished;
+                // `attempt` is how many tries actually ran — the honest count even when the
+                // policy's own budget is zero.
                 StreamEvent::Error {
-                    error: LlmError::retryable(format!(
-                        "still failing after {} attempt(s)",
-                        self.policy.max_attempts
-                    )),
+                    error: LlmError::retryable(format!("still failing after {attempt} attempt(s)")),
                 }
             }
             Verdict::Fatal(error) => {

@@ -544,4 +544,32 @@ mod tests {
             }]
         );
     }
+
+    #[test]
+    fn temperature_and_max_output_tokens_land_in_the_body() {
+        let options = ChatOptions {
+            model: "m".to_owned(),
+            temperature: Some(0.3),
+            max_output_tokens: Some(256),
+            ..ChatOptions::new("m")
+        };
+        let body = request_body(
+            &ProviderConfig::new("https://x", "K"),
+            &CapabilityTable::builtin(),
+            &options,
+            &[Message::user("hi")],
+        );
+        assert_eq!(body.temperature, Some(0.3));
+        assert_eq!(body.max_tokens, Some(256));
+
+        let plain = ChatOptions::new("m");
+        let body = request_body(
+            &ProviderConfig::new("https://x", "K"),
+            &CapabilityTable::builtin(),
+            &plain,
+            &[Message::user("hi")],
+        );
+        assert_eq!(body.temperature, None);
+        assert_eq!(body.max_tokens, None, "unset knobs are absent, not zero");
+    }
 }
