@@ -46,6 +46,7 @@ async fn read_for_search(
     ctx: &ToolCtx<'_>,
     path: &str,
     skipped_binaries: &mut usize,
+    skipped_oversized: &mut usize,
 ) -> Option<String> {
     if ctx.cancel.is_cancelled() {
         return None;
@@ -53,6 +54,9 @@ async fn read_for_search(
     if let Ok(meta) = ctx.fs.metadata(path).await
         && meta.len > MAX_FILE_BYTES
     {
+        // Counted for the same reason binaries are: an unexplained gap in `searched` is how
+        // "the answer was in that file" turns into a silent wrong answer.
+        *skipped_oversized += 1;
         return None;
     }
     match ctx.fs.read_text_file(path).await {
@@ -151,14 +155,19 @@ impl Tool for Grep {
         let mut hits = Vec::new();
         let mut searched = 0_usize;
         let mut skipped_binaries = 0_usize;
+        let mut skipped_oversized = 0_usize;
+        let mut skipped_dirs = 0_usize;
 
         if root_meta.is_file {
-            if let Some(text) = read_for_search(&ctx, scope, &mut skipped_binaries).await {
+            if let Some(text) =
+                read_for_search(&ctx, scope, &mut skipped_binaries, &mut skipped_oversized).await
+            {
                 searched += 1;
                 collect(&regex, scope, &text, &mut hits);
             }
         } else {
-            let mut paths = walk(&ctx, scope).await?;
+            let (mut paths, skipped_below) = walk(&ctx, scope).await?;
+            skipped_dirs += skipped_below;
             // Files before directories' deeper branches: the walk is depth-first per subtree, so
             // a stable sort keeps shallow files first, which reads better and caps sooner.
             paths.sort_by_key(|path| path.matches('/').count());
@@ -173,7 +182,10 @@ impl Tool for Grep {
                 if !named_ok {
                     continue;
                 }
-                if let Some(text) = read_for_search(&ctx, &path, &mut skipped_binaries).await {
+                if let Some(text) =
+                    read_for_search(&ctx, &path, &mut skipped_binaries, &mut skipped_oversized)
+                        .await
+                {
                     searched += 1;
                     collect(&regex, &path, &text, &mut hits);
                 }
@@ -197,6 +209,12 @@ impl Tool for Grep {
         }
         if skipped_binaries > 0 {
             body.push_str(&format!(" [skipped {skipped_binaries} binary file(s)]"));
+        }
+        if skipped_oversized > 0 {
+            body.push_str(&format!(" [skipped {skipped_oversized} oversized file(s)]"));
+        }
+        if skipped_dirs > 0 {
+            body.push_str(&format!(" [skipped {skipped_dirs} unreadable dir(s)]"));
         }
         Ok(ToolOutput::text(body))
     }

@@ -8,6 +8,21 @@ use hatchery_kernel::ToolHost;
 use hatchery_testkit::MemoryFs;
 use tokio_util::sync::CancellationToken;
 
+/// The same assembly, but over a real tempdir on the real disk: the only coverage the tools
+/// get against actual symlinks, permissions and case behaviour (MemoryFs pins the logic; this
+/// pins the disk).
+fn registry_on_disk(root: &std::path::Path) -> ToolRegistry {
+    let backends = Backends {
+        fs: Arc::new(hatchery_capabilities::LocalFs::new(root).expect("a valid workspace root")),
+        terminal: Arc::new(hatchery_capabilities::NoTerminal),
+    };
+    let mut registry = ToolRegistry::new(backends);
+    for tool in hatchery_tools::chat_tools() {
+        registry.register(tool);
+    }
+    registry
+}
+
 fn registry_on(fs: Arc<MemoryFs>) -> ToolRegistry {
     let backends = Backends {
         fs,
@@ -147,4 +162,109 @@ fn summaries_come_back_human_readable_for_every_chat_tool() {
     for (name, args, expected) in cases {
         assert_eq!(registry.summarize(name, &args).title, expected, "{name}");
     }
+}
+
+#[tokio::test]
+async fn the_disk_backend_serves_the_tools_and_refuses_a_symlink_escape() {
+    let ws = hatchery_testkit::TempWorkspace::new();
+    ws.write("src/lib.rs", "pub fn real() {}\n");
+    // A symlink pointing outside the workspace: classic escape attempt.
+    std::os::unix::fs::symlink("/etc/hostname", ws.root().join("outside")).expect("symlink");
+
+    let registry = registry_on_disk(ws.root());
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+
+    let inside = registry
+        .invoke(
+            "read_file",
+            serde_json::json!({"path": "src/lib.rs"}),
+            CancellationToken::new(),
+            tx.clone(),
+        )
+        .await
+        .expect("read inside");
+    assert!(!inside.is_error);
+    assert!(inside.output.text.contains("pub fn real()"));
+
+    let escaped = registry
+        .invoke(
+            "read_file",
+            serde_json::json!({"path": "outside"}),
+            CancellationToken::new(),
+            tx,
+        )
+        .await
+        .expect("dispatched");
+    assert!(
+        escaped.is_error,
+        "a symlink out of the workspace must be refused, got: {}",
+        escaped.output.text
+    );
+}
+
+#[tokio::test]
+async fn glob_and_grep_walk_the_real_disk() {
+    let ws = hatchery_testkit::TempWorkspace::new();
+    ws.write("src/one.rs", "fn needle() {}\n");
+    ws.write("src/two.rs", "fn other() {}\n");
+    ws.write("docs/readme.md", "no code here\n");
+
+    let registry = registry_on_disk(ws.root());
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+
+    let globbed = registry
+        .invoke(
+            "glob",
+            serde_json::json!({"pattern": "src/*.rs"}),
+            CancellationToken::new(),
+            tx.clone(),
+        )
+        .await
+        .expect("glob");
+    assert!(
+        globbed.output.text.contains("src/one.rs"),
+        "{}",
+        globbed.output.text
+    );
+    assert!(globbed.output.text.contains("src/two.rs"));
+
+    let grepped = registry
+        .invoke(
+            "grep",
+            serde_json::json!({"pattern": "needle", "include": "*.rs"}),
+            CancellationToken::new(),
+            tx,
+        )
+        .await
+        .expect("grep");
+    assert!(
+        grepped.output.text.contains("src/one.rs:1: fn needle()"),
+        "{}",
+        grepped.output.text
+    );
+}
+
+#[tokio::test]
+async fn a_symlink_loop_is_skipped_not_fatal_for_the_walk() {
+    let ws = hatchery_testkit::TempWorkspace::new();
+    ws.write("plain.txt", "content\n");
+    std::os::unix::fs::symlink(ws.root().join("loop"), ws.root().join("loop"))
+        .expect("self-symlink");
+
+    let registry = registry_on_disk(ws.root());
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let found = registry
+        .invoke(
+            "glob",
+            serde_json::json!({"pattern": "**/*.txt"}),
+            CancellationToken::new(),
+            tx,
+        )
+        .await
+        .expect("the walk survives the loop");
+    assert!(
+        found.output.text.contains("plain.txt"),
+        "{}",
+        found.output.text
+    );
 }

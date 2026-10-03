@@ -4,7 +4,10 @@
 //! `hatchery-capabilities` and receive everything they may touch through `ToolCtx`.
 //!
 //! Invariant 4 is enforced at compile time here: direct `std::fs` / `std::process` use is a
-//! clippy error (see the workspace `clippy.toml`). At run time the same invariant is proven by
+//! clippy error - the `disallowed_*` lints are denied in this crate's own `[lints]` table (a
+//! Cargo lint table is a command-line flag and beats a source attribute; the workspace allows
+//! them everywhere else), with the lists in the workspace `clippy.toml`. At run time the same
+//! invariant is proven by tests that inject only the in-memory backends from `hatchery-testkit`.
 //! tests that inject only the in-memory backends from `hatchery-testkit`.
 //!
 //! The M1 set is Chat mode's read-only trio (ADR-0005): [`read_file`], [`glob`], [`grep`]. The

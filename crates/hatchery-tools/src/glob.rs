@@ -78,7 +78,7 @@ impl Tool for Glob {
         }
 
         let mut matches = Vec::new();
-        let paths = walk(&ctx, "").await?;
+        let (paths, skipped_dirs) = walk(&ctx, "").await?;
         let visited = paths.len();
         for path in paths {
             if ctx.cancel.is_cancelled() {
@@ -102,6 +102,9 @@ impl Tool for Glob {
             body.push_str(&format!(
                 " [result cap {MAX_MATCHES} reached; narrow the pattern]"
             ));
+        }
+        if skipped_dirs > 0 {
+            body.push_str(&format!(" [skipped {skipped_dirs} unreadable dir(s)]"));
         }
         Ok(ToolOutput::text(body))
     }

@@ -84,6 +84,12 @@ impl Tool for ReadFile {
         let path = args["path"]
             .as_str()
             .ok_or_else(|| ToolError::InvalidArgs("read_file needs a string `path`".to_owned()))?;
+        if args["limit"].as_u64() == Some(0) {
+            return Err(ToolError::InvalidArgs(
+                "`limit` must be at least 1 (the schema says so; a zero-page asks for nothing)"
+                    .to_owned(),
+            ));
+        }
         let offset = args["offset"].as_u64().map_or(0, |v| v.max(1) as usize - 1);
         let limit = args["limit"].as_u64().map(|v| v as usize);
 
@@ -116,26 +122,44 @@ impl Tool for ReadFile {
             shown += 1;
         }
 
+        // The three "nothing to show" stories are told apart, so the model can act: an empty
+        // file, an offset past the end, and a single line too big for the byte cap each name
+        // themselves instead of all reading as "[empty file]".
         let mut notices = Vec::new();
-        let remaining = total_lines.saturating_sub(offset + shown);
-        if remaining > 0 {
+        if total_lines == 0 {
+            notices.push("[empty file]".to_owned());
+        } else if offset >= total_lines {
             notices.push(format!(
-                "[truncated: showed lines {}–{} of {}; continue with offset {}]",
+                "[offset {} is past the end: the file has {} lines]",
                 offset + 1,
-                offset + shown,
-                total_lines,
-                offset + shown + 1
+                total_lines
             ));
-        }
-        if clipped_by_bytes {
-            notices.push(format!("[read capped at {} bytes]", self.max_bytes));
+        } else {
+            if shown == 0 {
+                notices.push(format!(
+                    "[line {} alone exceeds the {} byte cap; nothing could be shown]",
+                    offset + 1,
+                    self.max_bytes
+                ));
+            } else {
+                let remaining = total_lines - (offset + shown);
+                if remaining > 0 {
+                    notices.push(format!(
+                        "[truncated: showed lines {}–{} of {}; continue with offset {}]",
+                        offset + 1,
+                        offset + shown,
+                        total_lines,
+                        offset + shown + 1
+                    ));
+                }
+            }
+            if clipped_by_bytes {
+                notices.push(format!("[read capped at {} bytes]", self.max_bytes));
+            }
         }
         for notice in &notices {
             body.push_str(notice);
             body.push('\n');
-        }
-        if body.is_empty() {
-            body.push_str("[empty file]\n");
         }
         Ok(ToolOutput::text(body))
     }
@@ -245,6 +269,63 @@ mod tests {
                 .expect_err("bad args");
             assert!(matches!(error, ToolError::InvalidArgs(_)), "{error}");
         }
+    }
+
+    #[tokio::test]
+    async fn limit_zero_is_invalid_args() {
+        let fs = fs_with("a.txt", "one\n");
+        let error = run(
+            &ReadFile::new(),
+            &fs,
+            serde_json::json!({"path": "a.txt", "limit": 0}),
+        )
+        .await
+        .expect_err("limit 0");
+        assert!(matches!(error, ToolError::InvalidArgs(_)), "{error}");
+    }
+
+    #[tokio::test]
+    async fn offset_past_the_end_says_so_rather_than_claiming_an_empty_file() {
+        let fs = fs_with("a.txt", "one\ntwo\n");
+        let output = run(
+            &ReadFile::new(),
+            &fs,
+            serde_json::json!({"path": "a.txt", "offset": 10}),
+        )
+        .await
+        .expect("read");
+        assert!(
+            output.text.contains("past the end"),
+            "the notice names the problem: {}",
+            output.text
+        );
+        assert!(
+            !output.text.contains("[empty file]"),
+            "a non-empty file must not read as empty: {}",
+            output.text
+        );
+    }
+
+    #[tokio::test]
+    async fn a_first_line_bigger_than_the_cap_still_names_a_page() {
+        let fs = fs_with(
+            "one-line.txt",
+            "this single line is far longer than the cap\n",
+        );
+        let tool = ReadFile::with_max_bytes(4);
+        let output = run(&tool, &fs, serde_json::json!({"path": "one-line.txt"}))
+            .await
+            .expect("read");
+        assert!(
+            output.text.contains("exceeds the 4 byte cap"),
+            "{}",
+            output.text
+        );
+        assert!(
+            !output.text.contains("lines 1\u{2013}0"),
+            "the old off-by-one wording is gone: {}",
+            output.text
+        );
     }
 
     #[test]

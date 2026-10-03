@@ -117,7 +117,23 @@ impl LocalFs {
 #[async_trait]
 impl crate::fs::FsBackend for LocalFs {
     async fn read_text_file(&self, path: &str) -> Result<String, FsError> {
+        if path.is_empty() {
+            return Err(FsError::WrongKind(
+                "the empty path is the workspace itself, not a file".to_owned(),
+            ));
+        }
         let resolved = self.resolve(path)?;
+        // A directory is a wrong kind, not an io accident: `File::open` succeeds on one and the
+        // failure only surfaces mid-read as EISDIR, which says nothing a caller can act on.
+        if tokio::fs::metadata(&resolved)
+            .await
+            .map(|meta| meta.is_dir())
+            .unwrap_or(false)
+        {
+            return Err(FsError::WrongKind(format!(
+                "{path} is a directory, not a file"
+            )));
+        }
         Self::sniff_text(&resolved, path)?;
         tokio::fs::read_to_string(&resolved)
             .await
@@ -245,5 +261,73 @@ mod tests {
             matches!(&error, FsError::NotFound(name) if name == "nope.txt"),
             "{error}"
         );
+    }
+
+    #[tokio::test]
+    async fn reading_a_directory_is_wrong_kind_not_an_io_accident() {
+        // Both backends must answer the same input the same way; MemoryFs pins its side in the
+        // testkit, this pins the disk side. `File::open` succeeds on a directory, so without the
+        // explicit check this surfaced as a bare EISDIR string.
+        let ws = hatchery_testkit::TempWorkspace::new();
+        ws.write("src/lib.rs", "pub fn f() {}\n");
+        let fs = LocalFs::new(ws.root()).expect("workspace");
+        let error = fs.read_text_file("src").await.expect_err("a directory");
+        assert!(matches!(error, crate::fs::FsError::WrongKind(_)), "{error}");
+    }
+
+    #[tokio::test]
+    async fn the_empty_path_is_the_workspace_not_a_file() {
+        let ws = hatchery_testkit::TempWorkspace::new();
+        ws.write("a.txt", "x\n");
+        let fs = LocalFs::new(ws.root()).expect("workspace");
+        let error = fs.read_text_file("").await.expect_err("empty path");
+        assert!(matches!(error, crate::fs::FsError::WrongKind(_)), "{error}");
+        // ...while the same empty path stays the root for directory reads.
+        let entries = fs.read_dir("").await.expect("the workspace root");
+        assert!(!entries.is_empty());
+    }
+
+    // The construction and lookup edges, pinned on the disk side: `new` refuses a non-directory
+    // root, the accessor tells the truth, and the read seams name a missing path as their own
+    // kind of refusal.
+    #[tokio::test]
+    async fn the_workspace_root_must_be_a_directory_that_exists() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("a-file");
+        std::fs::write(&file, b"x").expect("write");
+        assert!(
+            matches!(LocalFs::new(&file), Err(FsError::WrongKind(_))),
+            "a file is not a workspace"
+        );
+        assert!(
+            matches!(LocalFs::new(dir.path().join("absent")), Err(FsError::Io(_))),
+            "a missing root is an io refusal, not a panic"
+        );
+    }
+
+    #[tokio::test]
+    async fn directory_reads_name_missing_and_misworn_paths() {
+        use crate::fs::FsBackend as _;
+        let ws = hatchery_testkit::TempWorkspace::new();
+        ws.write("src/lib.rs", "pub fn f() {}\n");
+        let fs = LocalFs::new(ws.root()).expect("workspace");
+
+        assert_eq!(fs.root(), ws.root().canonicalize().expect("root").as_path());
+
+        let error = fs.read_dir("absent").await.expect_err("missing");
+        assert!(matches!(error, crate::fs::FsError::NotFound(_)), "{error}");
+        let error = fs.read_dir("src/lib.rs").await.expect_err("a file");
+        assert!(matches!(error, crate::fs::FsError::WrongKind(_)), "{error}");
+        let names: Vec<String> = fs
+            .read_dir("src")
+            .await
+            .expect("a real directory")
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect();
+        assert_eq!(names, vec!["lib.rs".to_owned()]);
+
+        let error = fs.metadata("absent").await.expect_err("missing");
+        assert!(matches!(error, crate::fs::FsError::NotFound(_)), "{error}");
     }
 }
