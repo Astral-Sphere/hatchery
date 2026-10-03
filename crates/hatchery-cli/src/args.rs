@@ -310,3 +310,84 @@ mod tests {
         assert_eq!(parse(&args(&["-V"])).expect("parse"), Command::Version);
     }
 }
+
+#[cfg(test)]
+mod parse_edges {
+    use super::*;
+
+    fn args(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    #[test]
+    fn chat_parses_every_flag_and_rejects_bogus_session_ids() {
+        let session = SessionId::new();
+        let command = parse(&args(&[
+            "chat",
+            "--session",
+            &session.to_string(),
+            "--workspace",
+            "/ws",
+            "--model",
+            "p/m",
+            "--state-dir",
+            "/sd",
+        ]))
+        .expect("parse");
+        let Command::Chat(chat) = command else {
+            panic!("{command:?}")
+        };
+        assert_eq!(chat.session, Some(session));
+        assert_eq!(chat.workspace, Some(PathBuf::from("/ws")));
+        assert_eq!(chat.model, Some("p/m".to_owned()));
+        assert_eq!(chat.state_dir, Some(PathBuf::from("/sd")));
+
+        let error = parse(&args(&["chat", "--session", "not-a-uuid"])).expect_err("refused");
+        assert!(error.contains("not a session id"), "{error}");
+    }
+
+    #[test]
+    fn missing_flag_values_and_unknown_daemon_actions_name_their_fault() {
+        assert!(
+            parse(&args(&["chat", "--model"]))
+                .expect_err("no value")
+                .contains("--model needs a value"),
+        );
+        assert!(
+            parse(&args(&["exec", "--wat", "hi"]))
+                .expect_err("unknown exec flag")
+                .contains("--json"),
+        );
+        assert!(
+            parse(&args(&["daemon"]))
+                .expect_err("no action")
+                .contains("needs an action"),
+        );
+        assert!(
+            parse(&args(&["daemon", "frobnicate"]))
+                .expect_err("unknown action")
+                .contains("unknown daemon action"),
+        );
+        assert!(
+            parse(&args(&["daemon", "status", "--wat"]))
+                .expect_err("unknown daemon flag")
+                .contains("--state-dir"),
+        );
+        assert!(matches!(
+            parse(&args(&["doctor", "--provider", "deepseek", "--model", "m", "--state-dir", "/s"])),
+            Ok(Command::Doctor(doctor)) if doctor.provider.as_deref() == Some("deepseek")
+                && doctor.model.as_deref() == Some("m")
+                && doctor.state_dir == Some(PathBuf::from("/s")),
+        ));
+    }
+
+    #[test]
+    fn an_unknown_top_level_command_prints_the_usage() {
+        let error = parse(&args(&["frobnicate"])).expect_err("refused");
+        assert!(
+            error.contains("unknown command") && error.contains("USAGE"),
+            "{error}"
+        );
+        assert!(usage().contains("exit codes: 0 completed, 1 failed, 2 cancelled"));
+    }
+}

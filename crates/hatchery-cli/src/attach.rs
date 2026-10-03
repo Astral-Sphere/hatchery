@@ -137,12 +137,20 @@ async fn spawn_and_attach(
     let deadline = tokio::time::Instant::now() + SPAWN_READY_TIMEOUT;
     loop {
         if let Some(info) = state.discover_alive() {
-            let client = attach_info(&info).await?;
-            return Ok(Attached {
-                client,
-                info,
-                spawned: true,
-            });
+            match attach_info(&info).await {
+                Ok(client) => {
+                    return Ok(Attached {
+                        client,
+                        info,
+                        spawned: true,
+                    });
+                }
+                // The publication lands before the socket is bound, so a connect failure here is
+                // "not ready yet", not "broken" — the same rule the pre-spawn path applies to a
+                // stale publication. Anything else (a refused handshake) is real and surfaces.
+                Err(AttachError::Client(ClientError::Connect { .. })) => {}
+                Err(error) => return Err(error),
+            }
         }
         // A child that already exited is a failed start: no point polling out the clock.
         if child.try_wait().map_err(AttachError::Spawn)?.is_some() {

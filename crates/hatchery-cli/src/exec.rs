@@ -185,14 +185,16 @@ pub(crate) async fn open_subscribed(
             replay_from: None,
             generation: None,
         };
-        stream
+        let loaded = stream
             .subscribe(
                 m::SESSION_LOAD,
                 serde_json::to_value(&params).expect("params"),
             )
             .await
             .map_err(|error| error.to_string())?;
-        (session, serde_json::json!({ "session": { "id": session } }))
+        // The load reply is the daemon's own `SessionLoadResult`: the seeders downstream read
+        // the model and config patch out of it, so it must be the real thing, not a stand-in.
+        (session, loaded)
     } else {
         let params = m::SessionNewParams {
             mode: hatchery_protocol::SessionModeId::chat(),
@@ -235,6 +237,7 @@ enum Step {
 }
 
 /// The events `--json` forwards: item-level and turn-terminal, not connection housekeeping.
+/// `generation_bumped` rides along so a script can see the runtime change it names.
 fn is_item_level(event: &ServerEvent) -> bool {
     matches!(
         event,
@@ -246,23 +249,24 @@ fn is_item_level(event: &ServerEvent) -> bool {
             | ServerEvent::ToolCallProgress { .. }
             | ServerEvent::ApprovalRequested { .. }
             | ServerEvent::ModeSwitched { .. }
+            | ServerEvent::GenerationBumped
             | ServerEvent::TurnFinished { .. }
             | ServerEvent::TurnFailed { .. }
     )
 }
 
 fn step(event: &SessionEvent, json: bool, out: &mut dyn ExecOut) -> Step {
-    // One JSON line per kept event, envelope included: session, generation, event.
-    if let (true, Some(line)) = (
-        json && is_item_level(&event.event),
-        serde_json::to_string(&serde_json::json!({
+    // One JSON line per kept event, envelope included: session, generation, event. Built only in
+    // json mode — serialising every delta in plain mode is waste on the hottest path.
+    if json && is_item_level(&event.event) {
+        match serde_json::to_string(&serde_json::json!({
             "session": event.session,
             "generation": event.generation,
             "event": event.event,
-        }))
-        .ok(),
-    ) {
-        out.json_line(&line);
+        })) {
+            Ok(line) => out.json_line(&line),
+            Err(error) => out.note(&format!("hatchery: an event failed to encode: {error}")),
+        }
     }
     match &event.event {
         ServerEvent::TextDelta { text, .. } if !json => out.text(text),

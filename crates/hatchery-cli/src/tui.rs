@@ -6,7 +6,7 @@
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
@@ -176,6 +176,16 @@ impl Model {
                 if let Some(effort) = effort_of(state) {
                     self.status.effort = effort;
                 }
+                // The daemon knows what the session is doing; the bar mirrors it instead of
+                // guessing "idle" while a whole turn streams past.
+                self.status.state = match state.status {
+                    hatchery_protocol::SessionStatus::Running => "thinking".to_owned(),
+                    hatchery_protocol::SessionStatus::WaitingApproval => {
+                        "awaiting approval".to_owned()
+                    }
+                    hatchery_protocol::SessionStatus::Idle => "idle".to_owned(),
+                    hatchery_protocol::SessionStatus::Error => "failed".to_owned(),
+                };
             }
             ServerEvent::TurnFinished { completion, .. } => {
                 self.status.state = "idle".to_owned();
@@ -212,7 +222,7 @@ pub fn draw(model: &Model, frame: &mut Frame) {
         Constraint::Length(1),
         Constraint::Min(1),
         Constraint::Length(model.notes.len().min(3) as u16),
-        Constraint::Length(1),
+        Constraint::Length(input_height(model)),
     ])
     .areas(area);
 
@@ -256,13 +266,14 @@ pub fn draw(model: &Model, frame: &mut Frame) {
         frame.render_widget(Paragraph::new(shown), notes);
     }
 
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled("› ", Style::new().add_modifier(Modifier::BOLD)),
-            Span::raw(model.input.clone()),
-        ])),
-        input,
-    );
+    frame.render_widget(Paragraph::new(model.input.clone()), input);
+}
+
+/// The input area's height: one line plus however many newlines were typed, capped so a pasted
+/// book cannot swallow the transcript.
+fn input_height(model: &Model) -> u16 {
+    let lines = model.input.split('\n').count() as u16;
+    lines.clamp(1, 8)
 }
 
 #[cfg(test)]
@@ -330,6 +341,41 @@ mod tests {
             state: fake_session("new-provider/new-model"),
         });
         assert_eq!(model.status.model, "new-provider/new-model");
+    }
+
+    #[test]
+    fn a_turn_in_flight_shows_in_the_status_bar() {
+        let mut model = Model::new("p/m".to_owned(), "medium".to_owned(), true);
+        let mut state = fake_session("p/m");
+        state.status = hatchery_protocol::SessionStatus::Running;
+        model.push_event(&ServerEvent::SessionUpdated { state });
+        assert_eq!(model.status.state, "thinking", "the bar mirrors the daemon");
+    }
+
+    #[test]
+    fn a_multi_line_input_gets_its_own_room() {
+        let mut model = Model::new("p/m".to_owned(), "medium".to_owned(), true);
+        assert_eq!(input_height(&model), 1);
+        model.input.push_str("first");
+        model.input.push('\n');
+        model.input.push_str("second");
+        assert_eq!(input_height(&model), 2);
+        let frame = drawn(&model, 60, 10);
+        assert!(frame.contains("first"), "{frame}");
+        assert!(frame.contains("second"), "{frame}");
+    }
+
+    #[test]
+    fn reasoning_folds_across_turns_and_delta_kinds() {
+        // Reasoning resumes as its own block after text starts (the kernel closes the reasoning
+        // item when text begins) — the fold must cover the second block too.
+        let mut model = Model::new("p/m".to_owned(), "medium".to_owned(), false);
+        model.push_reasoning("first thought");
+        model.push_assistant_text("the answer");
+        model.push_reasoning("second thought");
+        let frame = drawn(&model, 60, 12);
+        assert!(frame.matches("thinking (").count() >= 2, "{frame}");
+        assert!(!frame.contains("second thought"), "{frame}");
     }
 
     #[test]

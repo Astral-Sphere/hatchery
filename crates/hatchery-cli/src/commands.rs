@@ -24,16 +24,23 @@ pub enum SlashCommand {
     Unknown(String),
 }
 
-/// Parses one input line. `None` when the line is not a command (no leading `/`).
+/// Parses one input line. `None` when the line is not a command: no leading `/`, or a leading
+/// `//` — the escape hatch, which leaves the whole line (slashes included) to go out as a
+/// literal prompt instead of being read as a command.
 #[must_use]
 pub fn parse(line: &str) -> Option<SlashCommand> {
     let trimmed = line.trim();
     let rest = trimmed.strip_prefix('/')?;
+    if rest.starts_with('/') {
+        // `//usr/local/bin` is a path someone wants to talk about, not a command.
+        return None;
+    }
     let (name, argument) = match rest.split_once(' ') {
         Some((name, argument)) => (name, argument.trim()),
         None => (rest, ""),
     };
-    match name {
+    // Command names are case-insensitive (`/EFFORT high` works); the argument's own case stays.
+    match name.to_ascii_lowercase().as_str() {
         "effort" => Some(effort(argument)),
         "model" => Some(model(argument)),
         "prompt" => Some(SlashCommand::Prompt),
@@ -51,7 +58,10 @@ fn effort(argument: &str) -> SlashCommand {
         "medium" => ReasoningEffort::Medium,
         "high" => ReasoningEffort::High,
         "max" => ReasoningEffort::Max,
-        _ => return SlashCommand::Unknown(format!("/effort {argument}")),
+        _ => {
+            let echo = format!("/effort {argument}").trim_end().to_owned();
+            return SlashCommand::Unknown(echo);
+        }
     };
     SlashCommand::Effort(effort)
 }
@@ -61,7 +71,7 @@ fn model(argument: &str) -> SlashCommand {
         Some((provider, model)) if !provider.is_empty() && !model.is_empty() => {
             SlashCommand::Model(ModelRef::new(provider, model))
         }
-        _ => SlashCommand::Unknown(format!("/model {argument}")),
+        _ => SlashCommand::Unknown(format!("/model {argument}").trim_end().to_owned()),
     }
 }
 
@@ -81,9 +91,8 @@ pub fn actions(
                     overrides: None,
                 },
             };
-            serde_json::to_value(&params)
-                .map(|value| vec![(m::SESSION_SET_CONFIG, value)])
-                .unwrap_or_default()
+            let value = serde_json::to_value(&params).expect("typed params always serialise");
+            vec![(m::SESSION_SET_CONFIG, value)]
         }
         SlashCommand::Model(model) => {
             let params = SetConfigParams {
@@ -94,18 +103,16 @@ pub fn actions(
                     overrides: None,
                 },
             };
-            serde_json::to_value(&params)
-                .map(|value| vec![(m::SESSION_SET_CONFIG, value)])
-                .unwrap_or_default()
+            let value = serde_json::to_value(&params).expect("typed params always serialise");
+            vec![(m::SESSION_SET_CONFIG, value)]
         }
         SlashCommand::Prompt => {
             let params = m::PromptRenderParams {
                 session_id: Some(session),
                 mode: None,
             };
-            serde_json::to_value(&params)
-                .map(|value| vec![(m::PROMPT_RENDER, value)])
-                .unwrap_or_default()
+            let value = serde_json::to_value(&params).expect("typed params always serialise");
+            vec![(m::PROMPT_RENDER, value)]
         }
         // `/mode` reads the session the TUI already has; `/quit` is local.
         SlashCommand::Mode | SlashCommand::Quit => Vec::new(),
@@ -203,5 +210,29 @@ mod tests {
             parse("/frobnicate").is_some(),
             "unknown commands parse, to be rejected kindly"
         );
+    }
+
+    #[test]
+    fn double_slash_escapes_command_land() {
+        // An absolute path is something to talk about, not to run.
+        assert!(parse("//usr/local/bin/tool").is_none());
+        assert!(parse("// and a note that starts with slashes").is_none());
+        assert!(
+            parse("/usr/local/bin/tool").is_some(),
+            "single slash still parses"
+        );
+    }
+
+    #[test]
+    fn command_names_are_case_insensitive_and_the_echo_is_trimmed() {
+        assert_eq!(
+            parse("/EFFORT high"),
+            parse("/effort high"),
+            "the name's case does not matter"
+        );
+        match parse("/effort  ") {
+            Some(SlashCommand::Unknown(echo)) => assert_eq!(echo, "/effort", "no trailing space"),
+            other => panic!("an empty argument is an unknown command, not a crash: {other:?}"),
+        }
     }
 }
