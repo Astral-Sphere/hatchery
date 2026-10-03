@@ -249,6 +249,15 @@ pub(crate) use crate::clock::humantime_date;
 /// Fail-loud (ADR-0009): the missing pieces are listed, all at once, and the daemon exits —
 /// a half-wired runtime would surface as confusing per-session failures instead.
 #[must_use]
+/// Whether an env-var read means "no usable key": unset, or present but blank (a common
+/// copy-paste artifact the request-time resolver would refuse on every turn).
+fn env_key_unusable(value: Result<String, std::env::VarError>) -> bool {
+    match value {
+        Ok(value) => value.trim().is_empty(),
+        Err(_) => true,
+    }
+}
+
 pub fn audit(
     config: &LayeredConfig,
     state_dir: &crate::discover::StateDir,
@@ -262,9 +271,12 @@ pub fn audit(
         if provider.env_key.is_empty() {
             continue; // the entry itself is incomplete; the per-provider check below catches it
         }
-        if std::env::var(&provider.env_key).is_err() {
+        // Unset and set-but-blank are the same unusable state — the request-time key resolver
+        // refuses blank values, and a daemon that passes its audit and then fails every turn
+        // would have been a lie with extra steps.
+        if env_key_unusable(std::env::var(&provider.env_key)) {
             missing.push(format!(
-                "provider `{id}` needs environment variable `{}` set",
+                "provider `{id}` needs environment variable `{}` set to a non-empty key",
                 provider.env_key
             ));
         }
@@ -544,6 +556,15 @@ mod tests {
                 .any(|f| f.contains("HATCHERY_TEST_MISSING_KEY")),
             "the missing key is named: {findings:?}"
         );
+    }
+
+    #[test]
+    fn an_env_key_counts_as_missing_when_blank() {
+        // Unset and set-but-blank are the same unusable state at request time, so the audit
+        // treats them identically.
+        assert!(env_key_unusable(Err(std::env::VarError::NotPresent)));
+        assert!(env_key_unusable(Ok("   ".to_owned())));
+        assert!(!env_key_unusable(Ok("sk-real-key".to_owned())));
     }
 
     #[test]

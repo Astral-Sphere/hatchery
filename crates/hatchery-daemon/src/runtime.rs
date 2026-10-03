@@ -11,6 +11,7 @@
 //! * [`SessionRuntime`] — the assembled pair plus the running agent, with its generation.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
 
@@ -155,6 +156,10 @@ pub struct HubSink {
     generation: u64,
     hub: Arc<LiveHub>,
     store: Arc<dyn SessionStore>,
+    /// Cleared when the sink sees a turn end: the manager marks a turn in flight the moment it
+    /// submits, which is earlier than the kernel's own state machine can say so, and this is
+    /// what hands the truth back.
+    in_flight: Arc<AtomicBool>,
 }
 
 impl HubSink {
@@ -165,12 +170,14 @@ impl HubSink {
         generation: u64,
         hub: Arc<LiveHub>,
         store: Arc<dyn SessionStore>,
+        in_flight: Arc<AtomicBool>,
     ) -> Self {
         Self {
             session,
             generation,
             hub,
             store,
+            in_flight,
         }
     }
 
@@ -209,6 +216,10 @@ impl EventSink for HubSink {
                     .await
                 {
                     self.publish(ServerEvent::SessionUpdated { state: session });
+                } else {
+                    // The row stays stale on the failure; a frontend still hears the state
+                    // change as deltas, and recovery straightens the row at the next restart.
+                    tracing::error!(session = %self.session, "failed to persist a state change");
                 }
             }
             KernelEvent::ItemStarted { item } => self.publish(ServerEvent::ItemStarted { item }),
@@ -220,9 +231,16 @@ impl EventSink for HubSink {
             }
             KernelEvent::ItemFinished { item } => {
                 // Commit, then publish: a subscriber that sees ItemFinished can immediately ask
-                // for the session and must find the row (invariant 2, in that order).
+                // for the session and must find the row (invariant 2, in that order). When the
+                // commit fails, publishing anyway would show the subscriber an item the store
+                // does not have — the exact divergence the ordering exists to prevent — so the
+                // event is held back with the error.
                 if let Err(error) = self.store.append_item(item.clone()).await {
-                    tracing::error!(session = %self.session, "failed to commit an item: {error}");
+                    tracing::error!(
+                        session = %self.session,
+                        "failed to commit an item; its ItemFinished is withheld: {error}"
+                    );
+                    return;
                 }
                 self.publish(ServerEvent::ItemFinished { item });
             }
@@ -254,6 +272,9 @@ impl EventSink for HubSink {
                 }
             }
             KernelEvent::TurnEnded { turn, completion } => {
+                // However the turn ended, the manager's early marker is released here: this is
+                // the one event every turn produces, so it is the one place the flag clears.
+                self.in_flight.store(false, Ordering::Release);
                 let recorded = completion.is_ok().then(|| {
                     hatchery_protocol::TurnCompletion::new(
                         completion
@@ -299,6 +320,12 @@ pub struct SessionRuntime {
     pub generation: u64,
     /// The command end of the kernel agent.
     pub handle: hatchery_kernel::AgentHandle,
+    /// Set the moment the manager accepts a prompt, cleared by the sink's turn-end projection.
+    ///
+    /// The kernel's own state machine only opens once the turn starts running, which is after
+    /// the submit has already succeeded — the gap between the two is exactly where a second
+    /// prompt would slip through a plain state check, so acceptance is marked at the source.
+    in_flight: Arc<AtomicBool>,
     /// The agent task; aborted on unload.
     task: tokio::task::JoinHandle<()>,
 }
@@ -321,6 +348,7 @@ impl SessionRuntime {
         tools: Arc<dyn ToolHost>,
         echo_reasoning: bool,
     ) -> Result<Self, hatchery_store::StoreError> {
+        let in_flight = Arc::new(AtomicBool::new(false));
         let ports = Ports::new(
             provider,
             tools,
@@ -329,28 +357,48 @@ impl SessionRuntime {
                 session.id,
                 echo_reasoning,
             )),
-            Arc::new(HubSink::new(session.id, generation, hub, store)),
+            Arc::new(HubSink::new(
+                session.id,
+                generation,
+                hub,
+                store,
+                Arc::clone(&in_flight),
+            )),
         );
         let options = ChatOptions::new(session.model.model.clone());
         let (agent, handle) =
             hatchery_kernel::AgentBuilder::new(session.id, options, ports).build();
         let task = tokio::spawn(agent.run());
-
-        let mut updated = session.clone();
-        updated.generation = generation;
         Ok(Self {
             session: session.id,
             generation,
             handle,
+            in_flight,
             task,
         })
     }
 
-    /// True while a turn is running: the kernel state machine's own view, read by the
-    /// second-prompt refusal and the idle sweep alike.
+    /// Marks a turn accepted, refusing when one already is.
+    ///
+    /// `false` means another prompt got there first; the caller answers the protocol's
+    /// `TurnInProgress`. The flag clears when the sink projects the turn's end.
+    pub fn begin_turn(&self) -> bool {
+        !self.in_flight.swap(true, Ordering::AcqRel)
+    }
+
+    /// Releases the in-flight marker after a submit that never landed: no turn will run to
+    /// clear it, and a wedged marker would refuse every later prompt.
+    pub fn end_turn(&self) {
+        self.in_flight.store(false, Ordering::Release);
+    }
+
+    /// True while a turn is in flight: from the moment a prompt is accepted until the kernel's
+    /// terminal event has been projected — the union of the manager's marker and the kernel
+    /// state machine's own view, so the second-prompt refusal and the idle sweep cannot see
+    /// opposite truths.
     #[must_use]
     pub fn is_busy(&self) -> bool {
-        self.handle.turn_running()
+        self.in_flight.load(Ordering::Acquire) || self.handle.turn_running()
     }
 
     /// Stops the agent. The command channel closes with the task, so a frontend holding the

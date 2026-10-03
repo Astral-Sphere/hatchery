@@ -179,23 +179,28 @@ pub async fn run_until(options: RunOptions, external: CancellationToken) -> Resu
     }
 
     tracing::info!("the daemon is up");
-    tokio::select! {
-        _ = external.cancelled() => {},
-        _ = shutdown.cancelled() => {},
+    let listener_outcome = tokio::select! {
+        _ = external.cancelled() => Ok(()),
+        _ = shutdown.cancelled() => Ok(()),
         result = crate::server::serve_uds(Arc::clone(&core), Arc::clone(&manager), Arc::clone(&hub), socket_path.clone()) => {
             // `serve_uds` only returns when the listener dies; that is a teardown-worthy event
-            // either way.
+            // either way — and `daemon.json` is already published at this point, so a bind
+            // failure must fall through to the teardown below, not return past it and leave a
+            // publication pointing at a socket that never served.
             match result {
-                Ok(()) => tracing::warn!("the UDS listener ended without an error"),
-                Err(error) => return Err(error.into()),
+                Ok(()) => {
+                    tracing::warn!("the UDS listener ended without an error");
+                    Ok(())
+                }
+                Err(error) => Err(error),
             }
         },
-    }
+    };
 
     let order = disposers.run_reverse();
     tracing::info!("teardown ran {order:?}; releasing the instance lock");
     drop(instance);
-    Ok(())
+    listener_outcome.map_err(EntryError::Io)
 }
 
 /// Blocks until SIGINT or SIGTERM (unix) or Ctrl-C (elsewhere).

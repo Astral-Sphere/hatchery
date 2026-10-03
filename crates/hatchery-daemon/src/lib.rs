@@ -3,8 +3,9 @@
 //! Layer **L4** (docs/architecture.md §3). The daemon discovers or spawns itself as a
 //! single instance per user, accepts JSON-RPC clients over UDS and stdio, assembles one runtime
 //! per session, and fans every event out through the live hub so that several frontends can watch
-//! the same session. Leases plus a monotonic generation number keep a stale runtime's late events
-//! from polluting its replacement (invariant 1).
+//! the same session. A monotonic generation number, the hub's and the client's own stale-event
+//! filters, and the turn gate's `TurnInProgress` refusal keep a superseded runtime — and a
+//! second concurrent prompt — from polluting the one that owns the session (invariant 1).
 //!
 //! Assembly is profile-based and audited at startup: a missing required component means the
 //! daemon refuses to serve and prints the list of what is missing — never a silent runtime

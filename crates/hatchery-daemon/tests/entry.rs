@@ -174,3 +174,31 @@ async fn startup_audit_names_the_missing_env_key() {
         "the audit should name the missing variable: {message}"
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_listener_bind_failure_still_clears_daemon_json() {
+    // daemon.json is published before the socket is bound, so a bind failure returning without
+    // the teardown would leave a publication pointing at a socket that never served — every
+    // later `attach` would trust it.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let state = state_dir(dir.path());
+    // Occupy the socket path with a directory: bind cannot succeed, and `serve_uds`'s own
+    // pre-bind remove cannot clear it either.
+    let socket_path = state.socket_path();
+    std::fs::create_dir_all(&socket_path).expect("occupy the socket path");
+
+    let error = run_until(
+        options(&state, &dir.path().join("data")),
+        CancellationToken::new(),
+    )
+    .await
+    .expect_err("the bind must fail");
+    assert!(
+        matches!(error, EntryError::Io(_)),
+        "an io failure it is: {error:?}"
+    );
+    assert!(
+        state.discover().is_none(),
+        "the failed start must not leave daemon.json behind"
+    );
+}

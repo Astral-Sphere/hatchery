@@ -7,11 +7,12 @@
 //!
 //! Two degradation rules, both per-key (decided 2026-09-28):
 //!
-//! * A key outside the schema is **ignored with a warning**, never a hard parse failure of the
-//!   whole file — a typo in `[ui]` must not take down `[providers]`.
-//! * A security-relevant key that fails to parse takes its **strictest default** and logs at
-//!   error level. M1 has no such keys yet (the write-path approval rules arrive in M2); the
-//!   mechanism is [`strict_keys`] and the tests pin its behaviour.
+//! * A key outside the schema — or a known key whose value has the wrong type — is **ignored
+//!   with a warning**, never a hard parse failure of the whole file: a typo in `[ui]` must not
+//!   take down `[providers]`, and one bad key must not reset a whole provider.
+//! * A security-relevant key that fails to parse must take its **strictest default** and log at
+//!   error level. M1 has no such keys yet (the write-path approval rules arrive in M2), so that
+//!   mechanism is not wired yet — [`STRICT_KEYS`] exists as its seam and must not grow first.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -143,9 +144,10 @@ impl Default for BuiltinDaemon {
 
 /// Keys whose parse failure must not degrade (M2's approval rules and friends).
 ///
-/// A key listed here that fails to parse is dropped and logged at error level, and the typed
-/// reader falls back to the strictest default. Nothing in M1 qualifies; the list exists so the
-/// mechanism is real and the tests can pin it.
+/// The strict path — drop, log at error level, typed reader falls back to the strictest default —
+/// is an M2 mechanism: M1 has no security-relevant keys yet, so the list is empty and the only
+/// pinned behaviour is that it is empty. Nothing reads it yet; wiring it into `filter_keys` and
+/// the typed readers is the M2 task, so the list must not silently grow before that.
 const STRICT_KEYS: &[&str] = &[];
 
 /// True when the dotted key path is one this build reads.
@@ -305,6 +307,11 @@ impl LayeredConfig {
         let toml_value = toml::Value::try_from(value.clone()).map_err(|_| {
             ConfigError::UnknownKey(format!("{key_path} (value is not TOML-representable)"))
         })?;
+        if !type_accepts(key_path, &toml_value) {
+            return Err(ConfigError::UnknownKey(format!(
+                "{key_path} (the value's type does not fit this key)"
+            )));
+        }
         let entry = {
             let mut inner = self.inner.write().expect("config is not poisoned");
             let runtime = inner
@@ -316,7 +323,11 @@ impl LayeredConfig {
                 ConfigOrigin::Runtime,
                 "the runtime layer is last"
             );
-            insert_dotted(&mut runtime.1, key_path, toml_value);
+            if !insert_dotted(&mut runtime.1, key_path, toml_value) {
+                return Err(ConfigError::UnknownKey(format!(
+                    "{key_path} (an intermediate key is not a table to write through)"
+                )));
+            }
             inner.remerge();
             let effective = inner
                 .effective
@@ -431,7 +442,9 @@ pub struct DaemonConfig {
     pub idle_timeout: std::time::Duration,
 }
 
-/// Per-key validation of a layer document: unknown dotted keys are dropped, loudly.
+/// Per-key validation of a layer document: unknown dotted keys are dropped, loudly, and so are
+/// known keys whose value has the wrong type (the typed views then take their defaults, and the
+/// warning says which key and layer were dropped).
 fn filter_keys(value: toml::Value, prefix: String, origin: ConfigOrigin) -> Option<toml::Value> {
     let table = value.as_table()?.clone();
     let mut kept = toml::Table::new();
@@ -441,13 +454,22 @@ fn filter_keys(value: toml::Value, prefix: String, origin: ConfigOrigin) -> Opti
         } else {
             format!("{prefix}.{key}")
         };
-        let child = if child.is_table() && !path.starts_with("providers.") {
+        let child = if child.is_table() && recurses_into(&path) {
             match filter_keys(child, path.clone(), origin) {
                 Some(child) => child,
                 None => continue,
             }
         } else if is_known_key(&path) {
-            child
+            if type_accepts(&path, &child) {
+                child
+            } else {
+                tracing::warn!(
+                    key = %path,
+                    layer = ?origin,
+                    "configuration key ignored: the value has the wrong type for this key"
+                );
+                continue;
+            }
         } else {
             tracing::warn!(key = %path, layer = ?origin, "unknown configuration key ignored");
             continue;
@@ -457,20 +479,70 @@ fn filter_keys(value: toml::Value, prefix: String, origin: ConfigOrigin) -> Opti
     Some(toml::Value::Table(kept))
 }
 
+/// True when a table at this dotted path is *structural* — its children are checked key by key —
+/// rather than a named leaf the schema keeps whole.
+///
+/// Under `providers` the tree recurses down to `providers.<id>.<subtable>` (so one bad key
+/// degrades alone instead of resetting the whole provider to its built-ins), but the leaves that
+/// are tables by design — `http_headers`, whose keys are the user's own header names — are kept
+/// whole.
+fn recurses_into(path: &str) -> bool {
+    if !path.starts_with("providers") {
+        return true;
+    }
+    let rest = path.strip_prefix("providers").unwrap_or("");
+    let depth = rest.split('.').filter(|part| !part.is_empty()).count();
+    depth <= 2 && !path.ends_with(".http_headers")
+}
+
+/// Whether `value` has the type the schema gives `path`. Unknown leaves answer `true`: they are
+/// somebody else's rejection.
+fn type_accepts(path: &str, value: &toml::Value) -> bool {
+    type TypeCheck = fn(&toml::Value) -> bool;
+    let static_types: &[(&str, TypeCheck)] = &[
+        ("ui.show_reasoning", toml::Value::is_bool),
+        ("ui.language", toml::Value::is_str),
+        ("ui.response_language", toml::Value::is_str),
+        ("daemon.idle_timeout_min", toml::Value::is_integer),
+    ];
+    if let Some((_, check)) = static_types.iter().find(|(key, _)| *key == path) {
+        return check(value);
+    }
+    let mut parts = path.splitn(3, '.');
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some("providers"), Some(_id), Some(leaf)) => match leaf {
+            "base_url" | "env_key" | "wire" => value.is_str(),
+            "models" | "capabilities" => value.is_array(),
+            "http_headers" | "retry" | "reasoning" => value.is_table(),
+            "retry.max_attempts"
+            | "retry.backoff_ms"
+            | "retry.max_backoff_ms"
+            | "retry.jitter_percent" => value.is_integer(),
+            _ => true,
+        },
+        _ => true,
+    }
+}
+
 /// Inserts at a dotted path, creating intermediate tables.
-fn insert_dotted(table: &mut toml::Table, path: &str, value: toml::Value) {
+///
+/// `false` when an intermediate component already exists as a *value*: writing through it would
+/// silently do nothing, and a `config/set` that reports success without writing is a lie.
+fn insert_dotted(table: &mut toml::Table, path: &str, value: toml::Value) -> bool {
     let mut parts = path.splitn(2, '.');
     let head = parts.next().expect("splitn always yields one");
     match parts.next() {
         None => {
             table.insert(head.to_owned(), value);
+            true
         }
         Some(rest) => {
             let child = table
                 .entry(head.to_owned())
                 .or_insert_with(|| toml::Value::Table(toml::Table::new()));
-            if let Some(child) = child.as_table_mut() {
-                insert_dotted(child, rest, value);
+            match child.as_table_mut() {
+                Some(child) => insert_dotted(child, rest, value),
+                None => false,
             }
         }
     }
@@ -748,5 +820,66 @@ mod tests {
             !is_known_key("providers"),
             "whole-table assignments are not honoured"
         );
+    }
+
+    #[test]
+    fn one_bad_subkey_does_not_reset_the_whole_provider() {
+        let config = LayeredConfig::from_layers(vec![(
+            ConfigOrigin::User,
+            table(
+                "[providers.gw]\nbase_url = \"https://gw\"\nenv_key = \"GW\"\nmodels = [\"m\"]\ntypo_leaf = 1\n\n[providers.gw.retry]\nmax_attempts = \"many\"\nbackoff_ms = 200\n",
+            ),
+        )]);
+        let gw = &config.providers()["gw"];
+        assert_eq!(
+            gw.base_url, "https://gw",
+            "the sibling keys survive the bad ones"
+        );
+        assert_eq!(gw.env_key, "GW");
+        assert_eq!(gw.models, vec!["m".to_owned()]);
+        assert_eq!(
+            gw.retry.backoff_ms, 200,
+            "the well-typed retry key survives its bad sibling"
+        );
+        assert_eq!(
+            gw.retry.max_attempts,
+            hatchery_llm::RetryPolicy::default().max_attempts,
+            "the wrong-typed key takes the default, not zero"
+        );
+    }
+
+    #[test]
+    fn a_known_key_with_a_wrong_typed_value_is_dropped_with_the_rest_kept() {
+        let config = LayeredConfig::from_layers(vec![(
+            ConfigOrigin::User,
+            table("ui.show_reasoning = \"banana\"\nui.show_reasoning_note = 1\n"),
+        )]);
+        assert!(
+            config.ui().show_reasoning,
+            "the wrong-typed value is dropped and the default stands"
+        );
+        // And config/set refuses a type mismatch instead of lying on the wire.
+        let error = config
+            .set("ui.show_reasoning", serde_json::json!("banana"))
+            .expect_err("wrong type");
+        assert!(error.to_string().contains("type"), "{error}");
+    }
+
+    #[test]
+    fn set_through_a_non_table_intermediate_is_refused_not_silently_null() {
+        // The schema checks in `set` bounce most of these earlier, but the writer itself must
+        // not lie either: an intermediate that exists as a value refuses instead of no-op'ing.
+        let mut table = toml::Table::new();
+        table.insert("leaf".to_owned(), toml::Value::Integer(1));
+        assert!(
+            !insert_dotted(&mut table, "leaf.deeper", toml::Value::Integer(2)),
+            "writing through a leaf is refused"
+        );
+        assert_eq!(table["leaf"].as_integer(), Some(1), "the leaf is untouched");
+        assert!(
+            insert_dotted(&mut table, "branch.leaf", toml::Value::Integer(3)),
+            "writing through a table path works"
+        );
+        assert_eq!(table["branch"]["leaf"].as_integer(), Some(3));
     }
 }

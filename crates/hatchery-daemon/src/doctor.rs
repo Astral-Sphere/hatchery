@@ -88,8 +88,14 @@ pub fn environment_checks(config: &LayeredConfig, state: &StateDir, data_dir: &P
 }
 
 fn dir_check(name: &str, path: &Path) -> Check {
-    let created = std::fs::create_dir_all(path);
-    let ok = created.is_ok() && std::fs::metadata(path).is_ok();
+    // A real write, not just a stat: a read-only directory passes `create_dir_all` + `metadata`
+    // and would have been reported "writable" without ever being so.
+    let ok = std::fs::create_dir_all(path).is_ok() && {
+        let probe = path.join(".hatchery-doctor-probe");
+        let written = std::fs::write(&probe, b"probe").is_ok();
+        let _ = std::fs::remove_file(&probe);
+        written
+    };
     Check {
         name: name.to_owned(),
         ok,

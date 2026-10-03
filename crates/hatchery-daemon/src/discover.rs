@@ -189,18 +189,33 @@ impl StateDir {
         self.ensure()?;
         let body = serde_json::to_string_pretty(info).unwrap_or_else(|_| "{}".to_owned());
         let path = self.info_path();
-        // Write-then-rename keeps a reader from seeing a torn file.
+        // Write-then-rename keeps a reader from seeing a torn file. The temp file is created at
+        // 0600 directly: the boot token inside must never touch the disk world-readable, not
+        // even for the instant between `write` and a later `restrict`.
         let temp = path.with_extension("json.tmp");
-        std::fs::write(&temp, body).map_err(|source| DiscoverError::StateDir {
-            path: temp.clone(),
-            source,
-        })?;
-        restrict_to_owner(&temp);
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options
+            .open(&temp)
+            .map_err(|source| DiscoverError::StateDir {
+                path: temp.clone(),
+                source,
+            })?;
+        file.write_all(body.as_bytes())
+            .map_err(|source| DiscoverError::StateDir {
+                path: temp.clone(),
+                source,
+            })?;
+        drop(file);
         std::fs::rename(&temp, &path).map_err(|source| DiscoverError::StateDir {
             path: path.clone(),
             source,
         })?;
-        restrict_file(&path);
         Ok(())
     }
 
@@ -264,21 +279,6 @@ pub(crate) fn restrict_to_owner(path: &Path) {
     {
         use std::os::unix::fs::PermissionsExt;
         if let Err(error) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)) {
-            tracing::warn!("could not restrict {}: {error}", path.display());
-        }
-    }
-    #[cfg(windows)]
-    {
-        let _ = path;
-    }
-}
-
-/// Best-effort owner-read-only for a file carrying the boot token.
-fn restrict_file(path: &Path) {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if let Err(error) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
             tracing::warn!("could not restrict {}: {error}", path.display());
         }
     }
