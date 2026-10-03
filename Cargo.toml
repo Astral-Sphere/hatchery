@@ -80,6 +80,8 @@ todo = "warn"
 # clippy.toml's disallowed lists are workspace-wide, but only tool implementations must go
 # through the capability seam (invariant 4, ADR-0004). daemon, store, capabilities and xtask touch
 # the OS legitimately, and hatchery-acp spawns external agent processes, so the lint is allowed
-# here and denied by a crate attribute in hatchery-tools only.
+# here and denied in hatchery-tools only - by that crate's own local `[lints]` table,
+# because Cargo lint tables are command-line flags that beat any source-level
+# `#![deny]`, and a workspace inheritance cannot mix with a local table.
 disallowed_methods = "allow"
 disallowed_types = "allow"

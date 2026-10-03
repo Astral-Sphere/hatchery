@@ -1224,6 +1224,7 @@ dependencies = [
  "hatchery-testkit",
  "minimad",
  "ratatui",
+ "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.21",
@@ -1310,6 +1311,7 @@ version = "0.0.0"
 dependencies = [
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.21",
  "tokio",
  "tracing",

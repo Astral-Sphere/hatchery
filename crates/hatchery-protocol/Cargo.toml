@@ -20,5 +20,9 @@ tokio = { workspace = true, features = ["io-util", "net", "sync", "time"] }
 tracing.workspace = true
 uuid.workspace = true
 
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
 [lints]
 workspace = true
