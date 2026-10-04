@@ -1,54 +1,20 @@
-//! Markdown to ratatui lines: the D5 decision (2026-09-30) in code.
+//! Markdown to ratatui lines: the D5 decision (2026-09-30) in code, themed.
 //!
 //! minimad (termimad's parser, no rendering stack of its own) produces the parse tree; this
-//! module maps it onto ratatui `Line`s with a fixed skin. ratatui's `Paragraph` wrapping keeps
-//! span styles across line breaks — the spike verified that cell-by-cell — so wrapping stays
-//! delegated and no line-width logic lives here. Syntax highlighting of code blocks is an M2
-//! concern (syntect); for now code renders dim.
+//! module maps it onto ratatui `Line`s through the [`Theme`] roles. ratatui's own wrapping is
+//! deliberately not used here — the transcript wraps once, over whole cells, so scroll offsets
+//! stay meaningful (see `tui::widgets::transcript`). Syntax highlighting of code blocks is an M2
+//! concern (syntect); for now code renders dim behind a left bar.
 
 use minimad::{Composite, CompositeStyle, Line, Options};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line as RtLine, Span};
 
-/// The skin: block-level base styles and the two bullets.
-pub struct Skin;
+use crate::tui::theme::Theme;
 
-impl Skin {
-    #[must_use]
-    pub fn composite(&self, style: CompositeStyle) -> Style {
-        match style {
-            CompositeStyle::Header(depth) => Style::new().bold().fg(match depth {
-                1 => Color::LightBlue,
-                _ => Color::White,
-            }),
-            CompositeStyle::ListItem(_) | CompositeStyle::OrderedListItem { .. } => {
-                Style::new().fg(Color::LightGreen)
-            }
-            CompositeStyle::Code => Style::new().fg(Color::DarkGray),
-            CompositeStyle::Quote => Style::new().italic().fg(Color::Gray),
-            CompositeStyle::Paragraph => Style::new(),
-        }
-    }
-
-    #[must_use]
-    pub fn code_block(&self) -> Style {
-        Style::new().fg(Color::DarkGray)
-    }
-
-    #[must_use]
-    pub fn horizontal_rule(&self) -> Style {
-        Style::new().fg(Color::DarkGray)
-    }
-
-    #[must_use]
-    pub fn bullet(&self) -> &'static str {
-        "• "
-    }
-}
-
-/// Parses markdown and renders it as ratatui lines, wrapped later by the widget.
+/// Parses markdown and renders it as ratatui lines, wrapped later by the transcript.
 #[must_use]
-pub fn render(md: &str) -> Vec<RtLine<'static>> {
+pub fn render(md: &str, theme: &Theme) -> Vec<RtLine<'static>> {
     let text = minimad::parse_text(
         md,
         Options {
@@ -56,48 +22,68 @@ pub fn render(md: &str) -> Vec<RtLine<'static>> {
             ..Options::default()
         },
     );
-    let skin = Skin;
     let mut out = Vec::new();
     for line in &text.lines {
         match line {
-            Line::Normal(composite) => out.push(composite_line(composite, None, &skin)),
+            Line::Normal(composite) => out.push(composite_line(composite, theme)),
             // With `keep_code_fences`, fence markers are empty lines and the fenced content
-            // carries `CompositeStyle::Code`; the markers themselves render as nothing.
+            // carries `CompositeStyle::Code`; the markers themselves render as a left bar.
             Line::CodeFence(_) => {}
             Line::HorizontalRule => {
-                out.push(RtLine::styled(
-                    "────────────────────────",
-                    skin.horizontal_rule(),
-                ));
+                out.push(RtLine::styled("─".repeat(24), Style::new().fg(theme.faint)));
             }
-            Line::TableRow(_) | Line::TableRule(_) => out.push(RtLine::from("")),
+            Line::TableRow(row) => out.push(table_row(row, theme)),
+            Line::TableRule(row) => out.push(table_rule(row, theme)),
         }
     }
     out
 }
 
-fn composite_line<'a>(
-    composite: &Composite<'a>,
-    force: Option<Style>,
-    skin: &Skin,
-) -> RtLine<'static> {
-    let base = force.unwrap_or_else(|| skin.composite(composite.style));
+/// A table row as a pipe-joined line: column widths would need the viewport width, and the
+/// transcript's wrapping must stay width-independent per cell, so alignment is the M2 diff
+/// view's job — here a table at least reads as a table instead of vanishing.
+fn table_row(row: &minimad::TableRow<'_>, theme: &Theme) -> RtLine<'static> {
+    let cells: Vec<String> = row
+        .cells
+        .iter()
+        .map(|cell| {
+            cell.compounds
+                .iter()
+                .map(|compound| compound.src.to_owned())
+                .collect()
+        })
+        .collect();
+    RtLine::from(Span::styled(cells.join(" │ "), Style::new().fg(theme.dim)))
+}
+
+/// The rule row under a table header, one dash group per column.
+fn table_rule(row: &minimad::TableRule, theme: &Theme) -> RtLine<'static> {
+    RtLine::from(Span::styled(
+        vec!["───"; row.cells.len().max(1)].join(" "),
+        Style::new().fg(theme.faint),
+    ))
+}
+
+fn composite_line(composite: &Composite<'_>, theme: &Theme) -> RtLine<'static> {
+    let base = base_style(composite.style, theme);
     let mut spans: Vec<Span<'static>> = Vec::new();
     match composite.style {
         CompositeStyle::ListItem(level) => {
             spans.push(Span::raw("  ".repeat(level as usize)));
-            spans.push(Span::styled(skin.bullet().to_owned(), base));
+            spans.push(Span::styled("• ", base));
         }
         CompositeStyle::OrderedListItem { level, index } => {
             spans.push(Span::raw("  ".repeat(level as usize)));
             spans.push(Span::styled(format!("{index}. "), base));
         }
-        _ => {}
+        CompositeStyle::Code => spans.push(Span::styled("▎ ", Style::new().fg(theme.code))),
+        CompositeStyle::Quote => spans.push(Span::styled("│ ", Style::new().fg(theme.faint))),
+        CompositeStyle::Header(_) | CompositeStyle::Paragraph => {}
     }
     for compound in &composite.compounds {
         let mut style = base;
-        if compound.code {
-            style = style.fg(Color::LightCyan);
+        if compound.code && !matches!(composite.style, CompositeStyle::Code) {
+            style = style.fg(theme.accent);
         }
         if compound.bold {
             style = style.add_modifier(Modifier::BOLD);
@@ -113,34 +99,59 @@ fn composite_line<'a>(
     RtLine::from(spans)
 }
 
+/// Block-level base styles: headings take the accent, code the code role, quotes dim italic.
+fn base_style(style: CompositeStyle, theme: &Theme) -> Style {
+    match style {
+        CompositeStyle::Header(1) => Style::new().bold().fg(theme.accent),
+        CompositeStyle::Header(_) => Style::new().bold().fg(theme.text),
+        CompositeStyle::ListItem(_) | CompositeStyle::OrderedListItem { .. } => {
+            Style::new().fg(theme.text)
+        }
+        CompositeStyle::Code => Style::new().fg(theme.code),
+        CompositeStyle::Quote => Style::new().italic().fg(theme.dim),
+        CompositeStyle::Paragraph => Style::new().fg(theme.text),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ratatui::Terminal;
-    use ratatui::backend::TestBackend;
-    use ratatui::widgets::{Paragraph, Wrap};
+    use ratatui::style::Color;
 
     const SAMPLE: &str = "\
 # Heading text
 A paragraph with **bold**, *italic* and `inline code`, long enough that the narrow
-test width forces ratatui to wrap it while keeping the spans styled.
+test width forces the transcript to wrap it while keeping the spans styled.
 - item one
 ```
 fn main() {}
 ```
 > a quote
+
+| a | b |
+|---|---|
+| 1 | 2 |
 ";
 
+    fn rendered(theme: &Theme) -> Vec<RtLine<'static>> {
+        render(SAMPLE, theme)
+    }
+
     #[test]
-    fn blocks_and_inline_attributes_map_to_spans() {
-        let lines = render(SAMPLE);
+    fn blocks_and_inline_attributes_map_to_themed_spans() {
+        let theme = Theme::dark();
+        let lines = rendered(&theme);
+        assert_eq!(
+            lines[0].spans[0].style.fg,
+            Some(theme.accent),
+            "a heading takes the accent, never plain white: {:?}",
+            lines[0]
+        );
         assert!(
-            lines[0]
-                .spans
-                .iter()
-                .any(|span| span.style.fg == Some(Color::LightBlue)),
-            "heading style: {:?}",
-            lines[0]
+            lines[0].spans[0]
+                .style
+                .add_modifier
+                .contains(Modifier::BOLD)
         );
         let paragraph = &lines[1];
         let bold = paragraph
@@ -154,13 +165,13 @@ fn main() {}
             .iter()
             .find(|span| span.content.contains("inline code"))
             .expect("code span");
-        assert_eq!(code.style.fg, Some(Color::LightCyan));
+        assert_eq!(code.style.fg, Some(theme.accent));
         assert!(
             lines
                 .iter()
                 .any(|line| line.spans.iter().any(|span| span.content == "• "))
         );
-        // The fenced block renders dim, its markers not at all.
+        // The fenced block renders dim behind its bar, its markers not at all.
         let fence = lines
             .iter()
             .find(|line| {
@@ -169,43 +180,41 @@ fn main() {}
                     .any(|span| span.content.contains("fn main()"))
             })
             .expect("fence content");
-        assert_eq!(fence.spans[0].style.fg, Some(Color::DarkGray));
+        assert_eq!(fence.spans[0].content, "▎ ");
+        assert_eq!(fence.spans[1].style.fg, Some(theme.code));
     }
 
     #[test]
-    fn wrapped_paragraph_keeps_span_styles() {
-        let lines = render(SAMPLE);
-        let backend = TestBackend::new(40, 12);
-        let mut terminal = Terminal::new(backend).expect("terminal");
-        terminal
-            .draw(|frame| {
-                let area = frame.area();
-                frame.render_widget(
-                    Paragraph::new(lines.clone()).wrap(Wrap { trim: true }),
-                    area,
-                );
-            })
-            .expect("draw");
-        let buffer = terminal.backend().buffer();
-        // The bold word survived wrapping with its modifier on every cell it covers.
-        let bold_cells = (0..12u16)
-            .flat_map(|y| (0..40u16).map(move |x| (x, y)))
-            .filter(|(x, y)| {
-                let cell = &buffer[(*x, *y)];
-                cell.symbol() == "b"
-                    || cell.symbol() == "o"
-                    || cell.symbol() == "l"
-                    || cell.symbol() == "d"
-            })
-            .count();
-        let bold_styled = (0..12u16)
-            .flat_map(|y| (0..40u16).map(move |x| (x, y)))
-            .filter(|(x, y)| buffer[(*x, *y)].modifier.contains(Modifier::BOLD))
-            .count();
-        assert!(bold_cells > 0, "the word should be present");
+    fn tables_render_as_rows_instead_of_vanishing() {
+        let lines = rendered(&Theme::light());
+        let header = lines
+            .iter()
+            .find(|line| line.spans.iter().any(|span| span.content.contains("a │ b")))
+            .expect("header row");
+        assert!(header.spans[0].content.contains("a │ b"));
+        let rule = lines
+            .iter()
+            .find(|line| line.spans.iter().any(|span| span.content.contains("───")))
+            .expect("rule row");
         assert!(
-            bold_styled >= bold_cells / 2,
-            "bold cells must carry the modifier"
+            rule.spans[0].content.matches("───").count() == 2,
+            "{rule:?}"
         );
+        let body = lines
+            .iter()
+            .find(|line| line.spans.iter().any(|span| span.content.contains("1 │ 2")))
+            .expect("body row");
+        assert!(body.spans[0].content.contains("1 │ 2"));
+    }
+
+    #[test]
+    fn the_two_themes_disagree_on_the_heading_colour() {
+        let dark = rendered(&Theme::dark());
+        let light = rendered(&Theme::light());
+        assert_ne!(dark[0].spans[0].style.fg, light[0].spans[0].style.fg);
+        assert!(matches!(
+            dark[0].spans[0].style.fg,
+            Some(Color::Rgb(_, _, _))
+        ));
     }
 }

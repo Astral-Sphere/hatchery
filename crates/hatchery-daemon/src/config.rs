@@ -111,6 +111,8 @@ fn toml_value_of<T: Serialize>(value: &T) -> toml::Value {
 pub struct BuiltinUi {
     /// Whether the frontend shows reasoning by default.
     pub show_reasoning: bool,
+    /// Palette choice: `auto` (follow the terminal background), `dark` or `light`.
+    pub theme: String,
     /// UI language; empty means the environment decides (fluent lookup is M4).
     pub language: String,
     /// A "reply in …" instruction injected into the environment prompt section.
@@ -121,6 +123,7 @@ impl Default for BuiltinUi {
     fn default() -> Self {
         Self {
             show_reasoning: true,
+            theme: "auto".to_owned(),
             language: String::new(),
             response_language: String::new(),
         }
@@ -155,6 +158,7 @@ const STRICT_KEYS: &[&str] = &[];
 pub fn is_known_key(path: &str) -> bool {
     let known_static = [
         "ui.show_reasoning",
+        "ui.theme",
         "ui.language",
         "ui.response_language",
         "daemon.idle_timeout_min",

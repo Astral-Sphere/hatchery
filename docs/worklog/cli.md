@@ -33,6 +33,18 @@ M1 Phase 4 交付:TUI/exec/daemon 子命令/doctor 全部接线,attach-or-spawn(
 
 ## 变更日志
 
+### 2026-10-04 · TUI 翻新：widget 层、融合视觉、双主题、UI 级滚动
+
+单文件 `tui.rs`（402 行）退役为 `tui/` 模块树：`theme`（语义色层 × dark/light 调色板）、`scroll`（follow/偏移状态）、`widgets/{transcript, composer, status, indicator, toasts}`，`mod.rs` 留 Model 与帧组合。渲染不变量不变：`draw(&Model, Frame)` 纯函数、TestBackend 黄金帧。
+
+- **布局**（对照 qwen-code 与 codex 的 TUI）：状态从顶部蓝底条移到底部一行（`mode · model · effort · state`，状态段带色；非 follow 时右侧 `↑ top/total · end follows`）；输入进圆角框 composer（`>` prompt glyph + 占位符 + 框下键位提示行）；turn 活跃时 composer 上方一行 braille spinner 指示器（`⠋ working 12s · esc to interrupt`，250ms tick 驱动）；notes 改为吐司（图标按 kind、5 秒过期、最多 3 条）；transcript 顶部一行会话摘要（model · effort · workspace）。
+- **角色 glyph**（qwen-code 词汇）：用户 `>`、助手 `◆`、reasoning 折叠 `∴ Thought for n chars (Ctrl+R to expand)`；工具单元格带生命周期 glyph（in-flight spinner / `✓` / `✗` / denied `−`），名字在 `ItemFinished` 到达后补上，detail 与 progress 尾行走左竖条。
+- **滚动是 UI 级的**：transcript 自绘换行（unicode-width 进 workspace 依赖；词边界断开、折点空格丢弃、宽字符两列、硬断超宽词），换行后行表缓存于 Model（`relayout(width)` 在模型或宽度变化时重建），滚动偏移与 `Ctrl+↑/↓` 消息跳转地址化真实渲染行—— PgUp 可回到会话第一行，终端回滚不参与（alternate screen）。ratatui 的 `Paragraph::wrap` 否决：它不报告折行落点，偏移与跳转无从算起（`line_count` 在 0.30 仍是 unstable feature，不引）。
+- **主题**：`ui.theme = auto|dark|light` 进 daemon 配置 schema（`is_known_key` 同步），`/theme` 前端本地切换（纯命令层照 `/effort` 的用法回复纪律）；`auto` = OSC 11 背景查询（raw mode 后、事件流前的 150ms 窗口，/dev/tty + 线程读，无 unsafe）→ `$COLORFGBG` → dark。解析与亮度判定全纯函数单测（含截断/异槽回复为 None）。
+- **markdown**：皮肤改走主题角色（标题 accent 粗体——旧纯白在亮底不可见）；代码块左竖条；**表格从渲染成空行改为 pipe 行**（列宽对齐需要视口宽，与单元格换行缓存的宽度无关性冲突，留给 M2 diff 视图）。
+- **键位**：新增 PgUp/PgDn/Home/End、Ctrl+↑/Ctrl+↓（用户消息边界跳转）、Esc（turn 进行中发 `session/cancel`，空闲无副作用）；流式 delta 不再把已上滚的窗口拽回尾部（只有用户发送新消息才 follow）。
+- 实测：cli 75 项全绿（原 24+31 两轮计数口径合并后的现值），workspace 默认组 557 项全绿（1 skipped 为既有）；`./scripts/ci.sh` 全门禁绿。真实 provider 的手动 live 验收仍挂 M1 收口清单（roadmap）。
+
 ### 2026-10-04 · live 验收反馈：已知命令答用法，不说 unknown
 
 TUI 实测打出 `unknown command /effort; try /effort, /model, …`——回复在推荐刚输入的那个命令。根因：`/effort` 与 `/model` 的缺参/坏参路径被折进 `Unknown` 变体，而 Unknown 按「命令名不认识」措辞。新增 `SlashCommand::Usage { command, argument }`：裸 `/effort` 回 `effort is high; set it with /effort off|low|medium|high|max`（捎上状态栏现值，裸命令本来就是一问）；参数错回 `not an effort: banana; usage: …`；只有真正不认识的名字才说 unknown。顺带：斜杠后的空白不再吞掉命令（`/ effort off` 可解析——实测就有人这么打）。清单一处笔误一并更正：关推理是 `/effort off`，不是裸 `/effort`。

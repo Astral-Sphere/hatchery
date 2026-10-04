@@ -29,20 +29,44 @@ impl DaemonClient {
 
 ```
 ┌────────────────────────────────────────────┐
-│ 会话标题   [mode:code] [model:xx] [effort:high] │  ← 状态栏（点击/快捷键切模式与 effort）
+│ 消息流（UI 级滚动窗口，全历史可达）：        │
+│   hatchery · model · effort · workspace    │  ← 开场一行会话摘要
+│   > 用户原文                                │  ← accent `>` glyph
+│   ◆ 助手 markdown                           │  ← accent `◆` glyph
+│   ∴ Thought for n chars (Ctrl+R to expand) │  ← reasoning 折叠行
+│   /✓/✗ 工具名 · 摘要 ▎detail ▎progress     │  ← 工具单元格（左竖条 + 生命周期 glyph）
 ├────────────────────────────────────────────┤
-│ 消息流：user/assistant/reasoning(可折叠)/    │
-│ 工具调用(摘要+展开详情)/diff(语法高亮)        │
-├────────────────────────────────────────────┤
-│ > 输入区（多行、粘贴图片路径、@文件引用）      │
+│ ✓/!/· 吐司（最多 3 条，5 秒过期）            │
+│ ⠋ working 12s · esc to interrupt           │  ← turn 指示器（仅 turn 活跃时占一行）
+│ ╭────────────────────────────────────────╮ │
+│ │ > 输入区（多行、bracketed paste）         │ │  ← 圆角框 composer + 占位符
+│ ╰────────────────────────────────────────╯ │
+│ enter send · pgup/pgdn scroll · …          │  ← 键位提示行
+│ chat · model · effort · state   ↑ n/m …    │  ← 状态行（底部；非 follow 时右侧显示位置）
 └────────────────────────────────────────────┘
 ```
 
-- 渲染原则：TUI 是事件流的投影（view projection），无本地状态机复制；所有动作发协议方法。
-- 斜杠命令：`/mode /effort /model /prompt(查看导出) /rewind /branch(list|switch|delete) /edit(选择历史消息编辑) /approval(规则管理) /export /clear /quit`。
-- 审批 UI：内联弹层展示 ApprovalRequest（含 diff/命令预览），快捷键 1-4 对应四个 option。
-- reasoning 展示：默认折叠为「Thinking…(n chars)」（M1 决策：按字符计数，逐字节纪律优先于估算），`Ctrl+R` 展开；尊重配置 `show_reasoning`。
-- 键位与交互细节在 M1 实现中定稿；TUI 文案全部走 gettext catalog（platform.md）。
+- 渲染原则：TUI 是事件流的投影（view projection），无本地状态机复制；所有动作发协议方法。`draw(&Model, Frame)` 是纯函数，TestBackend 黄金帧验证；widget 层（`tui/widgets/`）每个表面一个模块：transcript / composer / status / indicator / toasts。
+- **滚动是 UI 级的**：TUI 占用 alternate screen，终端回滚不参与；transcript 自绘换行（unicode-width，词边界断开、宽字符按两列）并缓存换行后的行表（`Model::relayout`，模型或宽度变化时重建），滚动偏移与消息跳转地址化真实渲染行。follow 态骑在尾部；任何上滚打破 follow，`End` 或滚回尾部恢复。
+- 主题：语义色层（accent/text/dim/faint/success/warn/error/code/tool/thinking）× dark/light 两套调色板；`ui.theme = auto|dark|light`（配置播种）+ `/theme` 前端本地切换；`auto` 用 OSC 11 背景查询探测（150ms 上限），回退 `$COLORFGBG`，再回退 dark。
+- 动画：250ms tick 驱动 braille spinner、turn 秒数与吐司过期；仅 turn 活跃或工具 in-flight 时 tick 才脏化重排。
+- 斜杠命令：`/mode /effort /model /theme /prompt(查看导出) /rewind /branch(list|switch|delete) /edit(选择历史消息编辑) /approval(规则管理) /export /clear /quit`。
+- 审批 UI：内联弹层展示 ApprovalRequest（含 diff/命令预览），快捷键 1-4 对应四个 option（M2）。
+- reasoning 展示：默认折叠为「∴ Thought for n chars」（M1 决策：按字符计数，逐字节纪律优先于估算），`Ctrl+R` 展开；尊重配置 `ui.show_reasoning`。
+
+键位（M1 定稿，2026-10-04）：
+
+| 键 | 动作 |
+|---|---|
+| `Enter` / `Alt`/`Shift+Enter` | 发送 / 换行 |
+| `Ctrl+R` | reasoning 折叠切换 |
+| `PgUp` / `PgDn` | 上/下翻一页（打破 follow；滚回尾部恢复） |
+| `Home` / `End` | 顶部 / 恢复 follow |
+| `Ctrl+↑` / `Ctrl+↓` | 跳到上/下一条用户消息边界并对齐窗口顶部 |
+| `Esc` | turn 进行中发 `session/cancel`（空闲为误触，无副作用） |
+| `Ctrl+C` | 退出 TUI |
+
+- 键位与交互细节在 M1 实现中定稿；TUI 文案全部走 gettext catalog（platform.md，M4 落地）。
 
 ### 2.3 headless exec
 

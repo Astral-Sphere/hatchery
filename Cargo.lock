@@ -1232,6 +1232,7 @@ dependencies = [
  "tokio-util",
  "toml",
  "tracing",
+ "unicode-width 0.2.2",
 ]
 
 [[package]]

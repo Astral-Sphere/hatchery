@@ -49,6 +49,9 @@ fs2 = "0.4.3"
 minimad = "0.16.0"
 ratatui = "0.30.2"
 crossterm = { version = "0.29.0", features = ["event-stream"] }
+# Transcript wrapping is the TUI's own (ratatui's Paragraph wrap cannot report where a wrapped
+# line landed, which scroll offsets and message jumps need); minimad already depends on it.
+unicode-width = "0.2.2"
 # Layered configuration files (platform.md §1): TOML in, per-key validated.
 toml = "1.1.6+spec-1.1.0"
 serde = { version = "1.0.229", features = ["derive"] }
