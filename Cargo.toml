@@ -30,8 +30,8 @@ hatchery-testkit = { path = "crates/hatchery-testkit", version = "0.0.0" }
 anyhow = "1.0.104"
 # Tool-layer matching (D6, 2026-10-01): ripgrep's pattern engines, matching only — the walking
 # itself goes through the FsBackend seam so tools stay fs-free and MemoryFs-testable.
-globset = "0.4.16"
-regex = "1.12.2"
+globset = "0.4.20"
+regex = "1.13.1"
 async-trait = "0.1.92"
 futures = "0.3.34"
 # The sole wire layer for hatchery-llm (ADR-0007): no hand-written HTTP/SSE this side. Feature
@@ -50,11 +50,11 @@ minimad = "0.16.0"
 ratatui = "0.30.2"
 crossterm = { version = "0.29.0", features = ["event-stream"] }
 # Layered configuration files (platform.md §1): TOML in, per-key validated.
-toml = "0.9.8"
+toml = "1.1.6+spec-1.1.0"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
-thiserror = "2.0.21"
-tokio = { version = "1.53.1", features = ["macros", "rt", "rt-multi-thread", "sync", "time"] }
+thiserror = "2.0"
+tokio = { version = "1.53", features = ["macros", "rt", "rt-multi-thread", "sync", "time"] }
 tokio-util = "0.7.19"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
@@ -62,7 +62,7 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 # allocator is fine) and fts (tantivy is a heavy dependency we do not use). The engine's measured
 # behaviour is pinned by crates/hatchery-store/tests/spike_engine.rs — rerun it on any upgrade.
 turso = { version = "0.7.2", default-features = false }
-uuid = { version = "1.26.1", features = ["v7", "serde"] }
+uuid = { version = "1.27", features = ["v7", "serde"] }
 
 proptest = "1.11.0"
 tempfile = "3.27.0"
