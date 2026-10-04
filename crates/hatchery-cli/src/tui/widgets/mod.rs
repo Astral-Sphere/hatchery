@@ -7,6 +7,7 @@
 
 pub mod composer;
 pub mod indicator;
+pub mod scrollbar;
 pub mod status;
 pub mod toasts;
 pub mod transcript;

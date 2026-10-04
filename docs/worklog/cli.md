@@ -33,6 +33,15 @@ M1 Phase 4 交付:TUI/exec/daemon 子命令/doctor 全部接线,attach-or-spawn(
 
 ## 变更日志
 
+### 2026-10-05 · 滚动条与滚轮：UI 级滚动窗口的鼠标半边
+
+live 验收反馈：上一轮翻新做了 UI 级滚动，但没有滚动条、也没有滚轮。补 `tui/widgets/scrollbar.rs`，chat 循环启用鼠标捕获。
+
+- **gutter 常占一列**：`relayout` 按 `width − 1` 换行，`transcript_areas` 把 transcript 行切成内容列 + bar 列；bar 显隐不改换行宽度，缓存不在滚动中途重排（与 qwen-code `VirtualizedList`「列常驻、不 reflow」同裁决）。有溢出时画比例滚动条：thumb `█`、track `│`，`thumb = max(1, round(track²/total))`、`top = round(offset/max·(track−thumb))`，几何照抄 qwen-code；track 行反解 offset 用同一比例，**拖到底行落 sticky-bottom（follow）**，与滚轮/按键滚到底同语义。与 qwen-code 的差异只有一处：bar 常显而非空闲自动隐藏（它的 flash 式 auto-hide 在空闲态截图里等于没有滚动条，而用户要的是看得见的轨）。
+- **鼠标**：`EnableMouseCapture`（退出配对 disable）；滚轮每 notch 3 行（qwen-code `WHEEL_LINES_PER_TICK`）；bar 上左键按下 = Grab，Drag 离开该列仍继续抓（同 qwen-code），Up 释放；文本区的按下/移动一律忽略。事件→意图是纯函数 `mouse_input`，`apply` 的视口半边拆成同步 `viewport(input, model, height, bar)`，测试不需要终端也不需要 daemon。hints 行加 wheel。
+- **坑留痕**：ratatui 0.30 的 `TestBackend::to_string` 给每行包双引号（`buffer_view` 要标多宽字符 overwrite）；既有黄金帧全用 `contains` 所以没碰过它，这次的行尾断言（`ends_with('█')`）头一回撞上，测试先 `trim_matches('"')`。
+- 实测：cli 85 项全绿（75 + 新 10：scrollbar 几何/渲染 5、gutter 换行宽与 bar 黄金帧 2、鼠标映射/滚轮/拖拽 3）；`./scripts/ci.sh` 全门禁绿。真实终端的滚轮手感与拖拽仍挂 live 验收。
+
 ### 2026-10-04 · TUI 翻新：widget 层、融合视觉、双主题、UI 级滚动
 
 单文件 `tui.rs`（402 行）退役为 `tui/` 模块树：`theme`（语义色层 × dark/light 调色板）、`scroll`（follow/偏移状态）、`widgets/{transcript, composer, status, indicator, toasts}`，`mod.rs` 留 Model 与帧组合。渲染不变量不变：`draw(&Model, Frame)` 纯函数、TestBackend 黄金帧。

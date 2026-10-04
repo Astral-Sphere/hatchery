@@ -13,7 +13,7 @@ use ratatui::widgets::{Block, Borders, Paragraph, Widget, Wrap};
 use crate::tui::Model;
 
 /// The key hints, one dim line under the box.
-pub const HINTS: &str = "enter send · alt+enter newline · ctrl+r reasoning · pgup/pgdn scroll · ctrl+↑/↓ jump · end follow · esc interrupt · ctrl+c quit";
+pub const HINTS: &str = "enter send · alt+enter newline · ctrl+r reasoning · pgup/pgdn/wheel scroll · ctrl+↑/↓ jump · end follow · esc interrupt · ctrl+c quit";
 
 /// The composer box over the model's input.
 pub struct Composer<'a>(pub &'a Model);

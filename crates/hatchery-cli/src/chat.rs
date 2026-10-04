@@ -6,7 +6,10 @@
 //! `commands` and the model, so the loop has no tests of its own — it is the only untested code
 //! here, and it reads like it.
 
-use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+    MouseEventKind,
+};
 use futures::StreamExt;
 use hatchery_daemon::discover::StateDir;
 use hatchery_protocol::method as m;
@@ -17,10 +20,14 @@ use crate::args::ChatArgs;
 use crate::attach;
 use crate::commands;
 use crate::tui::theme::{self, ThemeSetting};
+use crate::tui::widgets::scrollbar;
 use crate::tui::{self, Model, ToastKind};
 
 /// The animation cadence: four frames a second, enough for a braille wheel and a seconds count.
 const TICK: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Lines one wheel notch scrolls: qwen-code's `WHEEL_LINES_PER_TICK`.
+const WHEEL_LINES: isize = 3;
 
 /// Runs the TUI until `/quit` or EOF on the event stream; the process exit code.
 pub async fn run(state: StateDir, args: ChatArgs) -> i32 {
@@ -175,9 +182,14 @@ async fn app_loop(
     // being submitted and the rest fired off as stray prompts.
     let paste_on =
         crossterm::execute!(std::io::stdout(), crossterm::event::EnableBracketedPaste).is_ok();
+    // Mouse capture on: the wheel scrolls the transcript and the scrollbar drags. While it is
+    // on, the terminal's own text selection needs Shift — the trade every mouse-aware TUI makes.
+    let mouse_on =
+        crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture).is_ok();
     let mut reader = EventStream::new();
     let mut ticker = tokio::time::interval(TICK);
     ticker.tick().await; // the immediate first tick is not a frame
+    let mut dragging = false;
     let outcome = loop {
         let size = match terminal.size() {
             Ok(size) => size,
@@ -211,6 +223,16 @@ async fn app_loop(
                         }
                     }
                     Some(Ok(Event::Paste(text))) if paste_on => model.input.push_str(&text),
+                    Some(Ok(Event::Mouse(mouse))) => {
+                        let size = terminal_size();
+                        let [messages, ..] = tui::layout(&model, Rect::new(0, 0, size.0, size.1));
+                        let [_, bar] = tui::transcript_areas(messages);
+                        let (input, next) = mouse_input(mouse, bar, dragging);
+                        dragging = next;
+                        if let Some(input) = input {
+                            apply(input, &mut model, &attached, &session).await;
+                        }
+                    }
                     Some(Ok(_)) => {}
                     Some(Err(error)) => break Err(ClientError::Connection(error.to_string())),
                     None => break Ok(()), // the terminal went away
@@ -228,6 +250,9 @@ async fn app_loop(
     if paste_on {
         let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableBracketedPaste);
     }
+    if mouse_on {
+        let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture);
+    }
     ratatui::restore();
     outcome
 }
@@ -236,7 +261,31 @@ async fn app_loop(
 async fn apply(input: Input, model: &mut Model, attached: &attach::Attached, session: &SessionId) {
     let size = terminal_size();
     let [messages, ..] = tui::layout(model, Rect::new(0, 0, size.0, size.1));
+    let [_, bar] = tui::transcript_areas(messages);
     let height = messages.height as usize;
+    if let Input::Cancel = input {
+        // Only a turn in flight can be interrupted; while an approval waits, M2's dialog
+        // owns Esc, and idle Esc is a mispress, not an error.
+        if model.status.state == "thinking" || model.status.state.starts_with("rate limited") {
+            let params = m::SessionCancelParams {
+                session_id: *session,
+            };
+            if let Err(error) = attached
+                .client
+                .call::<_, m::SessionCancelResult>(m::SESSION_CANCEL, &params)
+                .await
+            {
+                model.note(error.to_string(), ToastKind::Error);
+            }
+        }
+        return;
+    }
+    viewport(input, model, height, bar);
+}
+
+/// The viewport actions: pure model mutations, keyed by the window height and the scrollbar's
+/// column so tests need neither a terminal nor a daemon.
+fn viewport(input: Input, model: &mut Model, height: usize, bar: Rect) {
     match input {
         Input::PageUp => model.scroll_by(-(height as isize), height),
         Input::PageDown => model.scroll_by(height as isize, height),
@@ -244,23 +293,24 @@ async fn apply(input: Input, model: &mut Model, attached: &attach::Attached, ses
         Input::Bottom => model.scroll.follow(),
         Input::JumpPrev => model.jump_prev(height),
         Input::JumpNext => model.jump_next(height),
-        Input::Cancel => {
-            // Only a turn in flight can be interrupted; while an approval waits, M2's dialog
-            // owns Esc, and idle Esc is a mispress, not an error.
-            if model.status.state == "thinking" || model.status.state.starts_with("rate limited") {
-                let params = m::SessionCancelParams {
-                    session_id: *session,
-                };
-                if let Err(error) = attached
-                    .client
-                    .call::<_, m::SessionCancelResult>(m::SESSION_CANCEL, &params)
-                    .await
-                {
-                    model.note(error.to_string(), ToastKind::Error);
+        Input::WheelUp => model.scroll_by(-WHEEL_LINES, height),
+        Input::WheelDown => model.scroll_by(WHEEL_LINES, height),
+        Input::Grab(row) => {
+            // A press or drag maps the pointer's track row back to an offset; the bottom row
+            // is the sticky tail, exactly where wheeling or keying down to it would land.
+            let total = model.wrapped_lines().len();
+            let max = total.saturating_sub(height);
+            if max > 0 {
+                let row_in_track = usize::from(row).saturating_sub(usize::from(bar.y));
+                let target = scrollbar::offset_for_row(row_in_track, total, height);
+                if target >= max {
+                    model.scroll.follow();
+                } else {
+                    model.scroll.jump_to(target, total, height);
                 }
             }
         }
-        Input::Continue | Input::Submit | Input::Quit => {}
+        Input::Cancel | Input::Continue | Input::Submit | Input::Quit => {}
     }
 }
 
@@ -281,6 +331,34 @@ enum Input {
     Bottom,
     JumpPrev,
     JumpNext,
+    WheelUp,
+    WheelDown,
+    /// A scrollbar press or drag, carrying the pointer's terminal row.
+    Grab(u16),
+}
+
+/// What a mouse event means for the viewport: a wheel notch scrolls by lines anywhere over
+/// the frame, a left press on the scrollbar grabs the window onto that row, and a drag keeps
+/// grabbing — even off the column — until the button lifts. qwen-code's scroll-intent
+/// pipeline, minus its frame coalescing window: one event, one applied action.
+fn mouse_input(event: MouseEvent, bar: Rect, dragging: bool) -> (Option<Input>, bool) {
+    match event.kind {
+        MouseEventKind::ScrollUp => (Some(Input::WheelUp), dragging),
+        MouseEventKind::ScrollDown => (Some(Input::WheelDown), dragging),
+        MouseEventKind::Down(MouseButton::Left) if over_bar(bar, event) => {
+            (Some(Input::Grab(event.row)), true)
+        }
+        MouseEventKind::Drag(MouseButton::Left) if dragging => (Some(Input::Grab(event.row)), true),
+        MouseEventKind::Up(MouseButton::Left) => (None, false),
+        _ => (None, dragging),
+    }
+}
+
+fn over_bar(bar: Rect, event: MouseEvent) -> bool {
+    event.column >= bar.x
+        && event.column < bar.x + bar.width
+        && event.row >= bar.y
+        && event.row < bar.y + bar.height
 }
 
 fn key_input(key: KeyEvent, model: &mut Model) -> Input {
@@ -472,5 +550,123 @@ mod tests {
             Input::Continue
         );
         assert_eq!(model.input, "x");
+    }
+
+    fn mouse(kind: MouseEventKind) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::empty(),
+        }
+    }
+
+    fn mouse_at(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::empty(),
+        }
+    }
+
+    #[test]
+    fn the_wheel_scrolls_and_the_bar_grabs() {
+        let bar = Rect::new(79, 2, 1, 10);
+        let (input, dragging) = mouse_input(mouse(MouseEventKind::ScrollUp), bar, false);
+        assert_eq!(input, Some(Input::WheelUp));
+        assert!(!dragging, "the wheel never starts a drag");
+        let (input, _) = mouse_input(mouse(MouseEventKind::ScrollDown), bar, false);
+        assert_eq!(input, Some(Input::WheelDown));
+
+        let (input, dragging) = mouse_input(
+            mouse_at(MouseEventKind::Down(MouseButton::Left), 79, 5),
+            bar,
+            false,
+        );
+        assert_eq!(input, Some(Input::Grab(5)));
+        assert!(dragging, "a press on the bar starts a drag");
+
+        let (input, dragging) = mouse_input(
+            mouse_at(MouseEventKind::Down(MouseButton::Left), 10, 5),
+            bar,
+            false,
+        );
+        assert_eq!(input, None, "a press in the text is not a grab");
+        assert!(!dragging);
+
+        // A drag keeps grabbing after the pointer leaves the column, until the button lifts.
+        let (input, dragging) = mouse_input(
+            mouse_at(MouseEventKind::Drag(MouseButton::Left), 3, 8),
+            bar,
+            true,
+        );
+        assert_eq!(input, Some(Input::Grab(8)));
+        assert!(dragging);
+        let (input, dragging) = mouse_input(
+            mouse_at(MouseEventKind::Drag(MouseButton::Left), 3, 8),
+            bar,
+            false,
+        );
+        assert_eq!(input, None, "motion without a held button is nothing");
+        assert!(!dragging);
+
+        let (input, dragging) =
+            mouse_input(mouse(MouseEventKind::Up(MouseButton::Left)), bar, true);
+        assert_eq!(input, None);
+        assert!(!dragging, "the release ends the drag");
+    }
+
+    #[test]
+    fn wheel_ticks_walk_the_transcript_three_lines_at_a_time() {
+        let mut model = model();
+        for index in 0..20 {
+            model.push_user(&format!("question {index}"));
+            model.push_assistant_text(&format!("answer {index}"));
+        }
+        model.relayout(60);
+        let height = 10;
+        let bar = Rect::new(59, 0, 1, 10);
+        assert!(model.scroll.following());
+        viewport(Input::WheelUp, &mut model, height, bar);
+        let tail = model.wrapped_lines().len() - height;
+        assert_eq!(model.scroll_offset(height), tail - 3);
+        viewport(Input::WheelUp, &mut model, height, bar);
+        assert_eq!(model.scroll_offset(height), tail - 6);
+        viewport(Input::WheelDown, &mut model, height, bar);
+        viewport(Input::WheelDown, &mut model, height, bar);
+        assert!(
+            model.scroll.following(),
+            "wheeling back to the tail resumes follow"
+        );
+    }
+
+    #[test]
+    fn grabbing_the_bar_puts_the_pointed_row_at_the_top_and_its_bottom_at_the_tail() {
+        let mut model = model();
+        for index in 0..20 {
+            model.push_user(&format!("question {index}"));
+            model.push_assistant_text(&format!("answer {index}"));
+        }
+        model.relayout(60);
+        let height = 10;
+        let bar = Rect::new(59, 0, 1, 10);
+        let total = model.wrapped_lines().len();
+
+        viewport(Input::Grab(0), &mut model, height, bar);
+        assert_eq!(model.scroll_offset(height), 0);
+        assert!(!model.scroll.following(), "a grab pins the window");
+
+        viewport(Input::Grab(5), &mut model, height, bar);
+        assert_eq!(
+            model.scroll_offset(height),
+            scrollbar::offset_for_row(5, total, height)
+        );
+
+        viewport(Input::Grab(9), &mut model, height, bar);
+        assert!(
+            model.scroll.following(),
+            "the bottom track row is the sticky tail"
+        );
     }
 }

@@ -26,7 +26,7 @@ mod scroll;
 pub use scroll::ScrollState;
 
 use theme::{Theme, ThemeSetting};
-use widgets::{composer, indicator, status, toasts, transcript};
+use widgets::{composer, indicator, scrollbar, status, toasts, transcript};
 
 /// The TUI's whole state: what the events said, what the user is typing, and where the window
 /// sits in the wrapped transcript.
@@ -386,6 +386,9 @@ impl Model {
             return;
         }
         let width = usize::from(width.max(8));
+        // The scrollbar gutter keeps its column whether or not the bar shows, so the wrap
+        // width never depends on overflow and the cache never reflows mid-scroll.
+        let content = width - 1;
         let mut wrapped = Vec::new();
         let mut starts = Vec::new();
         for (index, cell) in self.cells.iter().enumerate() {
@@ -396,7 +399,7 @@ impl Model {
                 starts.push(wrapped.len());
             }
             let lines = transcript::render_cell(cell, &self.theme, self.show_reasoning, self.tick);
-            wrapped.extend(transcript::wrap_lines(&lines, width));
+            wrapped.extend(transcript::wrap_lines(&lines, content));
         }
         self.wrapped = wrapped;
         self.user_starts = starts;
@@ -479,13 +482,40 @@ pub fn layout(model: &Model, area: Rect) -> [Rect; 6] {
     .areas(area)
 }
 
+/// The transcript's two columns: the wrapped text and the scrollbar gutter beside it. The
+/// gutter is always one column wide so the bar never overlays text and the wrap width never
+/// changes with overflow.
+#[must_use]
+pub fn transcript_areas(messages: Rect) -> [Rect; 2] {
+    let gutter = messages.width.min(1);
+    let content = Rect {
+        width: messages.width - gutter,
+        ..messages
+    };
+    let bar = Rect {
+        x: content.right(),
+        width: gutter,
+        ..messages
+    };
+    [content, bar]
+}
+
 /// Draws the whole frame. Pure: same model, same buffer.
 pub fn draw(model: &Model, frame: &mut Frame) {
     let [messages, notes, indicator, composer, hints, status] = layout(model, frame.area());
+    let [content, bar] = transcript_areas(messages);
     let total = model.wrapped_lines().len();
     let offset = model.scroll.resolve(total, messages.height as usize);
 
-    frame.render_widget(transcript::Transcript { model, offset }, messages);
+    frame.render_widget(transcript::Transcript { model, offset }, content);
+    frame.render_widget(
+        scrollbar::Scrollbar {
+            total,
+            offset,
+            theme: &model.theme,
+        },
+        bar,
+    );
     frame.render_widget(toasts::Toasts(model), notes);
     frame.render_widget(indicator::Indicator(model), indicator);
     frame.render_widget(composer::Composer(model), composer);
@@ -589,6 +619,44 @@ mod tests {
             joined.contains("eleven"),
             "the tail of the line survives wrapping"
         );
+    }
+
+    #[test]
+    fn the_transcript_wraps_one_column_narrower_than_the_terminal() {
+        let mut model = model();
+        model.push_assistant_text(&"a".repeat(120));
+        model.relayout(41);
+        let widest = model
+            .wrapped_lines()
+            .iter()
+            .map(Line::width)
+            .max()
+            .unwrap_or(0);
+        assert_eq!(widest, 40, "the gutter column stays free");
+    }
+
+    #[test]
+    fn the_scrollbar_marks_the_window_and_stays_out_of_a_transcript_that_fits() {
+        let mut long = model();
+        for index in 0..20 {
+            long.push_user(&format!("question {index}"));
+            long.push_assistant_text(&format!("answer {index}"));
+        }
+        long.relayout(60);
+        long.scroll.top();
+        // `TestBackend::to_string` quotes every row (its buffer view marks multi-width
+        // overwrites), so edge assertions strip the quotes first.
+        let scrolled = drawn(&long, 60, 12);
+        let rows: Vec<&str> = scrolled.lines().map(|row| row.trim_matches('"')).collect();
+        assert!(
+            rows[0].ends_with('█'),
+            "the thumb opens at the top: {rows:?}"
+        );
+        assert!(rows[6].ends_with('│'), "the track fills the rest: {rows:?}");
+
+        let fits = drawn(&model(), 60, 12);
+        let rows: Vec<&str> = fits.lines().map(|row| row.trim_matches('"')).collect();
+        assert!(rows[0].ends_with(' '), "no overflow, no bar: {rows:?}");
     }
 
     #[test]

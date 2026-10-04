@@ -28,14 +28,14 @@ impl DaemonClient {
 ### 2.2 TUI 布局（ratatui）
 
 ```
-┌────────────────────────────────────────────┐
-│ 消息流（UI 级滚动窗口，全历史可达）：        │
-│   hatchery · model · effort · workspace    │  ← 开场一行会话摘要
-│   > 用户原文                                │  ← accent `>` glyph
-│   ◆ 助手 markdown                           │  ← accent `◆` glyph
-│   ∴ Thought for n chars (Ctrl+R to expand) │  ← reasoning 折叠行
-│   /✓/✗ 工具名 · 摘要 ▎detail ▎progress     │  ← 工具单元格（左竖条 + 生命周期 glyph）
-├────────────────────────────────────────────┤
+┌────────────────────────────────────────────┬─┐
+│ 消息流（UI 级滚动窗口，全历史可达）：        │█│  ← 比例滚动条 gutter（常占一列）
+│   hatchery · model · effort · workspace    │││
+│   > 用户原文                                │││  ← accent `>` glyph
+│   ◆ 助手 markdown                           │││  ← accent `◆` glyph
+│   ∴ Thought for n chars (Ctrl+R to expand) │││  ← reasoning 折叠行
+│   /✓/✗ 工具名 · 摘要 ▎detail ▎progress     │││  ← 工具单元格（左竖条 + 生命周期 glyph）
+├────────────────────────────────────────────┴─┤
 │ ✓/!/· 吐司（最多 3 条，5 秒过期）            │
 │ ⠋ working 12s · esc to interrupt           │  ← turn 指示器（仅 turn 活跃时占一行）
 │ ╭────────────────────────────────────────╮ │
@@ -46,15 +46,16 @@ impl DaemonClient {
 └────────────────────────────────────────────┘
 ```
 
-- 渲染原则：TUI 是事件流的投影（view projection），无本地状态机复制；所有动作发协议方法。`draw(&Model, Frame)` 是纯函数，TestBackend 黄金帧验证；widget 层（`tui/widgets/`）每个表面一个模块：transcript / composer / status / indicator / toasts。
+- 渲染原则：TUI 是事件流的投影（view projection），无本地状态机复制；所有动作发协议方法。`draw(&Model, Frame)` 是纯函数，TestBackend 黄金帧验证；widget 层（`tui/widgets/`）每个表面一个模块：transcript / composer / status / indicator / toasts / scrollbar。
 - **滚动是 UI 级的**：TUI 占用 alternate screen，终端回滚不参与；transcript 自绘换行（unicode-width，词边界断开、宽字符按两列）并缓存换行后的行表（`Model::relayout`，模型或宽度变化时重建），滚动偏移与消息跳转地址化真实渲染行。follow 态骑在尾部；任何上滚打破 follow，`End` 或滚回尾部恢复。
+- **滚动条与鼠标**：transcript 最右列是常驻预留的 gutter（换行按 `width − 1`；bar 显隐不改换行宽度，缓存不在滚动中途重排——与 qwen-code `VirtualizedList`「列常驻、不 reflow」同裁决）。有溢出时画比例滚动条：thumb `█`、track `│`，`thumb = track² / total`，位置随 offset 成比例。滚轮每 notch 3 行（qwen-code 的 `WHEEL_LINES_PER_TICK`）；bar 上左键按下/拖拽按 track 行绝对定位窗口，拖到底行回 follow（sticky-bottom 同 qwen-code）。与 qwen-code 的差异：bar 常显而非空闲自动隐藏——常驻的轨是「上面还有历史」的 affordance。鼠标捕获开启期间，终端自带的文本选择需 Shift。
 - 主题：语义色层（accent/text/dim/faint/success/warn/error/code/tool/thinking）× dark/light 两套调色板；`ui.theme = auto|dark|light`（配置播种）+ `/theme` 前端本地切换；`auto` 用 OSC 11 背景查询探测（150ms 上限），回退 `$COLORFGBG`，再回退 dark。
 - 动画：250ms tick 驱动 braille spinner、turn 秒数与吐司过期；仅 turn 活跃或工具 in-flight 时 tick 才脏化重排。
 - 斜杠命令：`/mode /effort /model /theme /prompt(查看导出) /rewind /branch(list|switch|delete) /edit(选择历史消息编辑) /approval(规则管理) /export /clear /quit`。
 - 审批 UI：内联弹层展示 ApprovalRequest（含 diff/命令预览），快捷键 1-4 对应四个 option（M2）。
 - reasoning 展示：默认折叠为「∴ Thought for n chars」（M1 决策：按字符计数，逐字节纪律优先于估算），`Ctrl+R` 展开；尊重配置 `ui.show_reasoning`。
 
-键位（M1 定稿，2026-10-04）：
+键位与鼠标（M1 定稿，2026-10-05）：
 
 | 键 | 动作 |
 |---|---|
@@ -63,6 +64,8 @@ impl DaemonClient {
 | `PgUp` / `PgDn` | 上/下翻一页（打破 follow；滚回尾部恢复） |
 | `Home` / `End` | 顶部 / 恢复 follow |
 | `Ctrl+↑` / `Ctrl+↓` | 跳到上/下一条用户消息边界并对齐窗口顶部 |
+| 滚轮上 / 滚轮下 | 上/下滚 3 行（打破 follow；滚回尾部恢复） |
+| 滚动条左键按下 / 拖拽 | 按 track 行绝对定位窗口；拖到底行恢复 follow |
 | `Esc` | turn 进行中发 `session/cancel`（空闲为误触，无副作用） |
 | `Ctrl+C` | 退出 TUI |
 
