@@ -20,6 +20,14 @@ pub enum SlashCommand {
     Mode,
     /// Leave the TUI.
     Quit,
+    /// A known command whose argument is missing or not understood. The reply is its usage —
+    /// "unknown command /effort; try /effort" would be a reply recommending what was typed.
+    Usage {
+        /// Which command was recognised ("effort" or "model").
+        command: &'static str,
+        /// The argument as typed ("" when there was none).
+        argument: String,
+    },
     /// Something that looks like a command but is not one.
     Unknown(String),
 }
@@ -30,7 +38,8 @@ pub enum SlashCommand {
 #[must_use]
 pub fn parse(line: &str) -> Option<SlashCommand> {
     let trimmed = line.trim();
-    let rest = trimmed.strip_prefix('/')?;
+    // Whitespace between the slash and the name is tolerated: `/ effort off` is still /effort.
+    let rest = trimmed.strip_prefix('/')?.trim_start();
     if rest.starts_with('/') {
         // `//usr/local/bin` is a path someone wants to talk about, not a command.
         return None;
@@ -58,10 +67,7 @@ fn effort(argument: &str) -> SlashCommand {
         "medium" => ReasoningEffort::Medium,
         "high" => ReasoningEffort::High,
         "max" => ReasoningEffort::Max,
-        _ => {
-            let echo = format!("/effort {argument}").trim_end().to_owned();
-            return SlashCommand::Unknown(echo);
-        }
+        _ => return usage("effort", argument),
     };
     SlashCommand::Effort(effort)
 }
@@ -71,7 +77,15 @@ fn model(argument: &str) -> SlashCommand {
         Some((provider, model)) if !provider.is_empty() && !model.is_empty() => {
             SlashCommand::Model(ModelRef::new(provider, model))
         }
-        _ => SlashCommand::Unknown(format!("/model {argument}").trim_end().to_owned()),
+        _ => usage("model", argument),
+    }
+}
+
+/// A recognised command with nothing (or nothing sensible) to act on.
+fn usage(command: &'static str, argument: &str) -> SlashCommand {
+    SlashCommand::Usage {
+        command,
+        argument: argument.to_owned(),
     }
 }
 
@@ -114,8 +128,9 @@ pub fn actions(
             let value = serde_json::to_value(&params).expect("typed params always serialise");
             vec![(m::PROMPT_RENDER, value)]
         }
-        // `/mode` reads the session the TUI already has; `/quit` is local.
-        SlashCommand::Mode | SlashCommand::Quit => Vec::new(),
+        // `/mode` reads the session the TUI already has; `/quit` is local. A usage reply has
+        // nothing to send — the whole point is that the line did not parse into an action.
+        SlashCommand::Mode | SlashCommand::Usage { .. } | SlashCommand::Quit => Vec::new(),
         SlashCommand::Unknown(_) => Vec::new(),
     }
 }
@@ -130,11 +145,25 @@ pub fn local_reply(
 ) -> Option<String> {
     match command {
         SlashCommand::Mode => Some(format!("mode: {mode}")),
+        SlashCommand::Usage { command, argument } => Some(match *command {
+            // A bare `/effort` is a question, so the status bar's own value rides along.
+            "effort" if argument.is_empty() => {
+                format!("effort is {effort}; set it with /effort off|low|medium|high|max")
+            }
+            "effort" => {
+                format!("not an effort: {argument}; usage: /effort off|low|medium|high|max")
+            }
+            "model" if argument.is_empty() => {
+                format!("model is {model}; set it with /model provider/model")
+            }
+            "model" => format!("not a model: {argument}; usage: /model provider/model"),
+            other => unreachable!("usage is only minted for effort and model, not {other}"),
+        }),
+        SlashCommand::Effort(_) | SlashCommand::Model(_) | SlashCommand::Prompt => None,
+        SlashCommand::Quit => Some(format!("bye ({mode}, {model}, {effort} remain set)")),
         SlashCommand::Unknown(line) => Some(format!(
             "unknown command {line}; try /effort, /model, /prompt, /mode, /quit"
         )),
-        SlashCommand::Effort(_) | SlashCommand::Model(_) | SlashCommand::Prompt => None,
-        SlashCommand::Quit => Some(format!("bye ({mode}, {model}, {effort} remain set)")),
     }
 }
 
@@ -166,10 +195,10 @@ mod tests {
             parse("/model deepseek/deepseek-chat"),
             Some(SlashCommand::Model(_))
         ));
-        assert!(matches!(
-            parse("/model deepseek"),
-            Some(SlashCommand::Unknown(_))
-        ));
+        assert!(
+            matches!(parse("/model deepseek"), Some(SlashCommand::Usage { .. })),
+            "a half model reference is a usage reply, not an unknown command"
+        );
         let session = SessionId::new();
         let command = parse("/model deepseek/deepseek-chat").expect("command");
         let (method, value) = one(&command, session);
@@ -224,15 +253,58 @@ mod tests {
     }
 
     #[test]
-    fn command_names_are_case_insensitive_and_the_echo_is_trimmed() {
+    fn command_names_are_case_insensitive_and_whitespace_never_names_the_command() {
         assert_eq!(
             parse("/EFFORT high"),
             parse("/effort high"),
             "the name's case does not matter"
         );
         match parse("/effort  ") {
-            Some(SlashCommand::Unknown(echo)) => assert_eq!(echo, "/effort", "no trailing space"),
-            other => panic!("an empty argument is an unknown command, not a crash: {other:?}"),
+            Some(SlashCommand::Usage { command, argument }) => {
+                assert_eq!(command, "effort");
+                assert_eq!(argument, "", "trailing whitespace is no argument");
+            }
+            other => panic!("an empty argument is a usage reply, not a crash: {other:?}"),
         }
+        assert_eq!(
+            parse("/ effort off"),
+            Some(SlashCommand::Effort(ReasoningEffort::Off)),
+            "whitespace after the slash still finds the command"
+        );
+    }
+
+    #[test]
+    fn a_known_command_with_a_bad_argument_gets_its_usage_not_unknown() {
+        // `/effort` bare used to answer "unknown command /effort; try /effort" — a reply
+        // recommending what was just typed.
+        for (line, command) in [
+            ("/effort", "effort"),
+            ("/effort banana", "effort"),
+            ("/model", "model"),
+            ("/model deepseek", "model"),
+        ] {
+            match parse(line) {
+                Some(SlashCommand::Usage { command: which, .. }) => {
+                    assert_eq!(which, command, "{line}");
+                }
+                other => panic!("{line} should be a usage reply: {other:?}"),
+            }
+        }
+        let session = SessionId::new();
+        let bare = parse("/effort").expect("command");
+        assert!(actions(&bare, session).is_empty(), "usage sends nothing");
+        assert_eq!(
+            local_reply(&bare, "chat", "deepseek/deepseek-flash", "high").expect("local"),
+            "effort is high; set it with /effort off|low|medium|high|max"
+        );
+        let mistyped = parse("/effort banana").expect("command");
+        assert_eq!(
+            local_reply(&mistyped, "chat", "deepseek/deepseek-flash", "high").expect("local"),
+            "not an effort: banana; usage: /effort off|low|medium|high|max"
+        );
+        // The genuinely unknown keep their old reply.
+        let stranger = parse("/frobnicate").expect("command");
+        let reply = local_reply(&stranger, "chat", "m", "high").expect("local");
+        assert!(reply.contains("unknown command"), "{reply}");
     }
 }

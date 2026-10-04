@@ -263,7 +263,9 @@ async fn submit_line(
                 model.notes.push("/quit".to_owned());
                 return Ok(false);
             }
-            commands::SlashCommand::Mode | commands::SlashCommand::Unknown(_) => {
+            commands::SlashCommand::Mode
+            | commands::SlashCommand::Usage { .. }
+            | commands::SlashCommand::Unknown(_) => {
                 if let Some(reply) = commands::local_reply(
                     &command,
                     &model.status.mode,

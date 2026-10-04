@@ -33,6 +33,10 @@ M1 Phase 4 交付:TUI/exec/daemon 子命令/doctor 全部接线,attach-or-spawn(
 
 ## 变更日志
 
+### 2026-10-04 · live 验收反馈：已知命令答用法，不说 unknown
+
+TUI 实测打出 `unknown command /effort; try /effort, /model, …`——回复在推荐刚输入的那个命令。根因：`/effort` 与 `/model` 的缺参/坏参路径被折进 `Unknown` 变体，而 Unknown 按「命令名不认识」措辞。新增 `SlashCommand::Usage { command, argument }`：裸 `/effort` 回 `effort is high; set it with /effort off|low|medium|high|max`（捎上状态栏现值，裸命令本来就是一问）；参数错回 `not an effort: banana; usage: …`；只有真正不认识的名字才说 unknown。顺带：斜杠后的空白不再吞掉命令（`/ effort off` 可解析——实测就有人这么打）。清单一处笔误一并更正：关推理是 `/effort off`，不是裸 `/effort`。
+
 ### 2026-10-01 · 评审⑤自查轮（cli）
 
 交互正确性四处：turn 进行中打字不再整窗退出（submit 错误降级为 notes，连接断开仍由事件流收尾；被拒 prompt 文本退回输入框可改再发）；多行输入落地（Alt/Shift+Enter 换行、bracketed paste 启停与整块粘贴、输入区随行数 1..8 行增高）；resume 播种改读 `session/load` 回复里的真 session（exec.rs 曾伪造最小回复，导致 model 空白、effort 写死 medium）；状态栏从 `SessionUpdated.status` 投影 thinking/awaiting approval（此前整个 turn 期间显示 idle）。解析层：`//` 转义、命令名大小写不敏感、Unknown 回显去尾随空格、空输入不发送；`actions` 的序列化失败从静默空表改为 expect。attach 轮询容忍发布先于 bind 的连接失败（与预检路径同一裁决）。计数见 worklog/testing.md 本日条目（cli 31 项）。
