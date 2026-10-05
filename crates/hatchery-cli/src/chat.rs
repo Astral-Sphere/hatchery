@@ -226,8 +226,14 @@ async fn app_loop(
                     Some(Ok(Event::Mouse(mouse))) => {
                         let size = terminal_size();
                         let [messages, ..] = tui::layout(&model, Rect::new(0, 0, size.0, size.1));
-                        let [_, bar] = tui::transcript_areas(messages);
-                        let (input, next) = mouse_input(mouse, bar, dragging);
+                        let [content, bar] = tui::transcript_areas(messages);
+                        let ctx = MouseCtx {
+                            bar,
+                            content,
+                            offset: model.scroll_offset(messages.height as usize),
+                            cell_of: model.cell_of_row(),
+                        };
+                        let (input, next) = mouse_input(mouse, &ctx, dragging);
                         dragging = next;
                         if let Some(input) = input {
                             apply(input, &mut model, &attached, &session).await;
@@ -295,6 +301,7 @@ fn viewport(input: Input, model: &mut Model, height: usize, bar: Rect) {
         Input::JumpNext => model.jump_next(height),
         Input::WheelUp => model.scroll_by(-WHEEL_LINES, height),
         Input::WheelDown => model.scroll_by(WHEEL_LINES, height),
+        Input::ToggleCell(index) => model.toggle_cell(index),
         Input::Grab(row) => {
             // A press or drag maps the pointer's track row back to an offset; the bottom row
             // is the sticky tail, exactly where wheeling or keying down to it would land.
@@ -335,19 +342,48 @@ enum Input {
     WheelDown,
     /// A scrollbar press or drag, carrying the pointer's terminal row.
     Grab(u16),
+    /// A click on a foldable transcript cell, by cell index.
+    ToggleCell(usize),
+}
+
+/// Where the pointer can land: the scrollbar column, the transcript window, and the
+/// row→cell map that turns a click into "fold that cell".
+struct MouseCtx<'a> {
+    bar: Rect,
+    content: Rect,
+    offset: usize,
+    cell_of: &'a [usize],
+}
+
+impl MouseCtx<'_> {
+    fn cell_at(&self, event: MouseEvent) -> Option<usize> {
+        if event.column >= self.content.x + self.content.width
+            || event.row < self.content.y
+            || event.row >= self.content.y + self.content.height
+        {
+            return None;
+        }
+        let row = self.offset + usize::from(event.row - self.content.y);
+        self.cell_of.get(row).copied()
+    }
 }
 
 /// What a mouse event means for the viewport: a wheel notch scrolls by lines anywhere over
-/// the frame, a left press on the scrollbar grabs the window onto that row, and a drag keeps
-/// grabbing — even off the column — until the button lifts. qwen-code's scroll-intent
-/// pipeline, minus its frame coalescing window: one event, one applied action.
-fn mouse_input(event: MouseEvent, bar: Rect, dragging: bool) -> (Option<Input>, bool) {
+/// the frame, a left press on the scrollbar grabs the window onto that row, a drag keeps
+/// grabbing — even off the column — until the button lifts, and a left press on a foldable
+/// transcript cell folds or unfolds it. qwen-code's scroll-intent pipeline, minus its frame
+/// coalescing window: one event, one applied action.
+fn mouse_input(event: MouseEvent, ctx: &MouseCtx<'_>, dragging: bool) -> (Option<Input>, bool) {
     match event.kind {
         MouseEventKind::ScrollUp => (Some(Input::WheelUp), dragging),
         MouseEventKind::ScrollDown => (Some(Input::WheelDown), dragging),
-        MouseEventKind::Down(MouseButton::Left) if over_bar(bar, event) => {
+        MouseEventKind::Down(MouseButton::Left) if over_bar(ctx.bar, event) => {
             (Some(Input::Grab(event.row)), true)
         }
+        MouseEventKind::Down(MouseButton::Left) => match ctx.cell_at(event) {
+            Some(index) => (Some(Input::ToggleCell(index)), dragging),
+            None => (None, dragging),
+        },
         MouseEventKind::Drag(MouseButton::Left) if dragging => (Some(Input::Grab(event.row)), true),
         MouseEventKind::Up(MouseButton::Left) => (None, false),
         _ => (None, dragging),
@@ -572,16 +608,21 @@ mod tests {
 
     #[test]
     fn the_wheel_scrolls_and_the_bar_grabs() {
-        let bar = Rect::new(79, 2, 1, 10);
-        let (input, dragging) = mouse_input(mouse(MouseEventKind::ScrollUp), bar, false);
+        let ctx = MouseCtx {
+            bar: Rect::new(79, 2, 1, 10),
+            content: Rect::new(0, 2, 79, 10),
+            offset: 0,
+            cell_of: &[],
+        };
+        let (input, dragging) = mouse_input(mouse(MouseEventKind::ScrollUp), &ctx, false);
         assert_eq!(input, Some(Input::WheelUp));
         assert!(!dragging, "the wheel never starts a drag");
-        let (input, _) = mouse_input(mouse(MouseEventKind::ScrollDown), bar, false);
+        let (input, _) = mouse_input(mouse(MouseEventKind::ScrollDown), &ctx, false);
         assert_eq!(input, Some(Input::WheelDown));
 
         let (input, dragging) = mouse_input(
             mouse_at(MouseEventKind::Down(MouseButton::Left), 79, 5),
-            bar,
+            &ctx,
             false,
         );
         assert_eq!(input, Some(Input::Grab(5)));
@@ -589,7 +630,7 @@ mod tests {
 
         let (input, dragging) = mouse_input(
             mouse_at(MouseEventKind::Down(MouseButton::Left), 10, 5),
-            bar,
+            &ctx,
             false,
         );
         assert_eq!(input, None, "a press in the text is not a grab");
@@ -598,23 +639,64 @@ mod tests {
         // A drag keeps grabbing after the pointer leaves the column, until the button lifts.
         let (input, dragging) = mouse_input(
             mouse_at(MouseEventKind::Drag(MouseButton::Left), 3, 8),
-            bar,
+            &ctx,
             true,
         );
         assert_eq!(input, Some(Input::Grab(8)));
         assert!(dragging);
         let (input, dragging) = mouse_input(
             mouse_at(MouseEventKind::Drag(MouseButton::Left), 3, 8),
-            bar,
+            &ctx,
             false,
         );
         assert_eq!(input, None, "motion without a held button is nothing");
         assert!(!dragging);
 
         let (input, dragging) =
-            mouse_input(mouse(MouseEventKind::Up(MouseButton::Left)), bar, true);
+            mouse_input(mouse(MouseEventKind::Up(MouseButton::Left)), &ctx, true);
         assert_eq!(input, None);
         assert!(!dragging, "the release ends the drag");
+    }
+
+    #[test]
+    fn a_click_addresses_the_cell_under_the_pointer_through_the_window_offset() {
+        // Rows 0-1 are the banner, row 2 a reasoning fold line, row 3 its neighbour's.
+        let cell_of = [0, 0, 1, 2];
+        let ctx = MouseCtx {
+            bar: Rect::new(79, 0, 1, 4),
+            content: Rect::new(0, 0, 79, 4),
+            offset: 0,
+            cell_of: &cell_of,
+        };
+        let (input, _) = mouse_input(
+            mouse_at(MouseEventKind::Down(MouseButton::Left), 5, 2),
+            &ctx,
+            false,
+        );
+        assert_eq!(input, Some(Input::ToggleCell(1)));
+
+        // A scrolled window addresses the same screen row further down the transcript.
+        let scrolled = MouseCtx { offset: 2, ..ctx };
+        let (input, _) = mouse_input(
+            mouse_at(MouseEventKind::Down(MouseButton::Left), 5, 1),
+            &scrolled,
+            false,
+        );
+        assert_eq!(input, Some(Input::ToggleCell(2)));
+
+        // Below the transcript and on the gutter column, a click is not a fold.
+        let (input, _) = mouse_input(
+            mouse_at(MouseEventKind::Down(MouseButton::Left), 5, 4),
+            &ctx,
+            false,
+        );
+        assert_eq!(input, None);
+        let (input, _) = mouse_input(
+            mouse_at(MouseEventKind::Down(MouseButton::Left), 79, 2),
+            &ctx,
+            false,
+        );
+        assert_eq!(input, Some(Input::Grab(2)), "the bar wins over the fold");
     }
 
     #[test]

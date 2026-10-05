@@ -55,6 +55,8 @@ pub struct Model {
     probe: Option<(u8, u8, u8)>,
     colorfgbg: Option<String>,
     wrapped: Vec<Line<'static>>,
+    /// Which cell each wrapped row belongs to, so a click can fold its cell.
+    cell_of: Vec<usize>,
     user_starts: Vec<usize>,
     dirty: bool,
     last_width: u16,
@@ -71,6 +73,9 @@ pub struct Cell {
     pub item: Option<ItemId>,
     /// Tool-call detail, when this is a tool cell.
     pub tool: Option<ToolCell>,
+    /// Per-cell fold override set by a click; `None` follows the kind's default
+    /// (reasoning: the global Ctrl+R state, tool: expanded).
+    pub expanded: Option<bool>,
 }
 
 /// The kinds of cell; the glyph and the fold behaviour follow from it.
@@ -169,6 +174,7 @@ impl Model {
             probe,
             colorfgbg: std::env::var("COLORFGBG").ok(),
             wrapped: Vec::new(),
+            cell_of: Vec::new(),
             user_starts: Vec::new(),
             dirty: true,
             last_width: 0,
@@ -178,6 +184,7 @@ impl Model {
             raw: format!("hatchery · {model} · effort {effort} · {workspace}"),
             item: None,
             tool: None,
+            expanded: None,
         });
         seeded
     }
@@ -199,6 +206,7 @@ impl Model {
             raw: text.to_owned(),
             item: None,
             tool: None,
+            expanded: None,
         });
         self.dirty = true;
         self.scroll.follow();
@@ -226,6 +234,7 @@ impl Model {
             raw: text.to_owned(),
             item: None,
             tool: None,
+            expanded: None,
         });
         self.dirty = true;
     }
@@ -247,6 +256,7 @@ impl Model {
                         status: ToolStatus::Running,
                         tail: String::new(),
                     }),
+                    expanded: None,
                 });
                 self.dirty = true;
             }
@@ -361,8 +371,29 @@ impl Model {
     }
 
     /// Toggles the reasoning fold; the transcript must re-wrap, so this dirties the cache.
+    /// The master switch speaks for every reasoning cell again: per-cell clicks were
+    /// exceptions to the old global state, not to the new one.
     pub fn toggle_reasoning(&mut self) {
         self.show_reasoning = !self.show_reasoning;
+        for cell in &mut self.cells {
+            if cell.kind == CellKind::Reasoning {
+                cell.expanded = None;
+            }
+        }
+        self.dirty = true;
+    }
+
+    /// Folds or unfolds one cell against its kind's default; a click sets the override.
+    pub fn toggle_cell(&mut self, index: usize) {
+        let Some(cell) = self.cells.get_mut(index) else {
+            return;
+        };
+        let current = match cell.kind {
+            CellKind::Reasoning => cell.expanded.unwrap_or(self.show_reasoning),
+            CellKind::Tool => cell.expanded.unwrap_or(true),
+            _ => return,
+        };
+        cell.expanded = Some(!current);
         self.dirty = true;
     }
 
@@ -390,18 +421,23 @@ impl Model {
         // width never depends on overflow and the cache never reflows mid-scroll.
         let content = width - 1;
         let mut wrapped = Vec::new();
+        let mut cell_of = Vec::new();
         let mut starts = Vec::new();
         for (index, cell) in self.cells.iter().enumerate() {
             if index > 0 {
                 wrapped.push(Line::from(""));
+                cell_of.push(index);
             }
             if cell.kind == CellKind::User {
                 starts.push(wrapped.len());
             }
             let lines = transcript::render_cell(cell, &self.theme, self.show_reasoning, self.tick);
-            wrapped.extend(transcript::wrap_lines(&lines, content));
+            let rows = transcript::wrap_lines(&lines, content);
+            cell_of.extend(std::iter::repeat_n(index, rows.len()));
+            wrapped.extend(rows);
         }
         self.wrapped = wrapped;
+        self.cell_of = cell_of;
         self.user_starts = starts;
         self.dirty = false;
         self.last_width = width as u16;
@@ -411,6 +447,12 @@ impl Model {
     #[must_use]
     pub fn wrapped_lines(&self) -> &[Line<'static>] {
         &self.wrapped
+    }
+
+    /// Which cell each wrapped row belongs to, for click-to-fold hit testing.
+    #[must_use]
+    pub fn cell_of_row(&self) -> &[usize] {
+        &self.cell_of
     }
 
     /// Scrolls by whole lines (negative up); the chat loop passes a viewport height.
@@ -681,6 +723,76 @@ mod tests {
         model.relayout(60);
         let expanded = drawn(&model, 60, 10);
         assert!(expanded.contains("let me think"), "{expanded}");
+    }
+
+    #[test]
+    fn a_click_folds_one_reasoning_cell_and_ctrl_r_speaks_for_all_again() {
+        let mut model = Model::new(
+            "p/m".to_owned(),
+            "medium".to_owned(),
+            false,
+            ThemeSetting::Dark,
+            Theme::dark(),
+            None,
+            "/tmp".to_owned(),
+        );
+        model.push_reasoning("secret thoughts");
+        model.relayout(60);
+        assert!(
+            drawn(&model, 60, 10).contains("∴ Thought for 15 chars"),
+            "the global fold starts closed"
+        );
+
+        model.toggle_cell(1);
+        model.relayout(60);
+        let open = drawn(&model, 60, 10);
+        assert!(open.contains("secret thoughts"), "{open}");
+        assert_eq!(model.cells[1].expanded, Some(true));
+
+        model.toggle_cell(1);
+        model.relayout(60);
+        assert!(!drawn(&model, 60, 10).contains("secret thoughts"));
+
+        // A per-cell exception survives until the master switch moves, which clears them.
+        model.toggle_cell(1);
+        assert_eq!(model.cells[1].expanded, Some(true));
+        model.toggle_reasoning();
+        assert_eq!(
+            model.cells[1].expanded, None,
+            "Ctrl+R clears the exceptions"
+        );
+        model.relayout(60);
+        assert!(
+            drawn(&model, 60, 10).contains("secret thoughts"),
+            "the global fold is now open"
+        );
+
+        model.toggle_cell(0);
+        assert_eq!(model.cells[0].expanded, None, "the banner is not foldable");
+    }
+
+    #[test]
+    fn clicking_a_tool_cell_hides_its_body_behind_an_ellipsis() {
+        let mut model = model();
+        let item = hatchery_protocol::ItemId::new();
+        model.push_event(&ServerEvent::ToolCallStarted {
+            item,
+            summary: hatchery_protocol::ToolCallSummary::new("read src/main.rs")
+                .with_detail("the whole file"),
+        });
+        model.relayout(60);
+        assert!(drawn(&model, 60, 10).contains("the whole file"));
+
+        model.toggle_cell(1);
+        model.relayout(60);
+        let folded = drawn(&model, 60, 10);
+        assert!(!folded.contains("the whole file"), "{folded}");
+        assert!(folded.contains("read src/main.rs"), "{folded}");
+        assert!(folded.contains("⋯"), "{folded}");
+
+        model.toggle_cell(1);
+        model.relayout(60);
+        assert!(drawn(&model, 60, 10).contains("the whole file"));
     }
 
     #[test]

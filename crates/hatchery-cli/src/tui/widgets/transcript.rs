@@ -65,10 +65,11 @@ pub fn render_cell(
             lines
         }
         CellKind::Reasoning => {
-            if !show_reasoning {
+            // A click sets the cell's own override; Ctrl+R's global fold is the default.
+            if !cell.expanded.unwrap_or(show_reasoning) {
                 let chars = cell.raw.chars().count();
                 return vec![Line::from(Span::styled(
-                    format!("∴ Thought for {chars} chars (Ctrl+R to expand)"),
+                    format!("∴ Thought for {chars} chars (click or Ctrl+R to expand)"),
                     Style::new().fg(theme.faint).italic(),
                 ))];
             }
@@ -108,18 +109,29 @@ pub fn render_cell(
             }
             let mut lines = vec![Line::from(spans)];
             let bar = Style::new().fg(theme.code);
+            let mut body = Vec::new();
             if let Some(detail) = tool.detail.as_ref().filter(|detail| !detail.is_empty()) {
-                lines.push(Line::from(vec![
+                body.push(Line::from(vec![
                     Span::styled("▎ ", bar),
                     Span::styled(detail.clone(), Style::new().fg(theme.dim)),
                 ]));
             }
             if !tool.tail.is_empty() {
-                lines.push(Line::from(vec![
+                body.push(Line::from(vec![
                     Span::styled("▎ ", bar),
                     Span::styled(tool.tail.clone(), Style::new().fg(theme.faint)),
                 ]));
             }
+            // Folded by a click: the header stays, the body becomes an ellipsis.
+            if !cell.expanded.unwrap_or(true) {
+                if !body.is_empty() {
+                    lines[0]
+                        .spans
+                        .push(Span::styled(" · ⋯", Style::new().fg(theme.faint)));
+                }
+                return lines;
+            }
+            lines.extend(body);
             lines
         }
     }
@@ -142,41 +154,148 @@ fn tool_glyph(
     }
 }
 
-/// Wraps one line at `width` columns, word-breaking at spaces and hard-breaking anything wider
-/// than the whole width. The space a break falls on is dropped, as `Wrap { trim: true }` would.
+/// Wraps one line at `width` columns: whole words move to the next row, wide characters
+/// break between each other (CJK has a break opportunity between every pair), and only a
+/// word wider than the whole width is split. The space a break falls on is dropped, as
+/// `Wrap { trim: true }` would.
 #[must_use]
 pub fn wrap_line(line: &Line<'_>, width: usize) -> Vec<Line<'static>> {
     let mut rows: Vec<Vec<Span<'static>>> = vec![Vec::new()];
     let mut used = 0usize;
-    for span in &line.spans {
-        let mut current = String::new();
-        for ch in span.content.chars() {
-            let columns = UnicodeWidthChar::width(ch).unwrap_or(0);
-            if used + columns > width && used > 0 {
-                // The space a break falls on is dropped, as `Wrap { trim: true }` would.
-                let trimmed = current.trim_end();
-                if !trimmed.is_empty() {
-                    rows.last_mut()
-                        .expect("rows starts with one row")
-                        .push(Span::styled(trimmed.to_owned(), span.style));
-                }
-                current.clear();
-                rows.push(Vec::new());
-                used = 0;
-                if ch == ' ' {
-                    continue;
-                }
+    let mut at_start = true;
+    for atom in atoms(line) {
+        if atom.space {
+            // Indentation at the very start of the line survives; spaces after a break do not.
+            if used == 0 && !at_start {
+                continue;
             }
-            current.push(ch);
-            used += columns;
-        }
-        if !current.is_empty() {
             rows.last_mut()
                 .expect("rows starts with one row")
-                .push(Span::styled(current, span.style));
+                .push(Span::styled(atom.text, atom.style));
+            used += atom.width;
+            at_start = false;
+            continue;
+        }
+        let mut word = atom.text.as_str();
+        let mut word_width = atom.width;
+        loop {
+            if used > 0 && used + word_width > width {
+                trim_trailing_spaces(&mut rows, &mut used);
+                rows.push(Vec::new());
+                used = 0;
+            }
+            if word_width <= width {
+                rows.last_mut()
+                    .expect("rows starts with one row")
+                    .push(Span::styled(word.to_owned(), atom.style));
+                used += word_width;
+                at_start = false;
+                break;
+            }
+            // A word wider than the whole width is the one thing that gets split.
+            let (head, tail) = split_at_width(word, width);
+            rows.last_mut()
+                .expect("rows starts with one row")
+                .push(Span::styled(head.to_owned(), atom.style));
+            rows.push(Vec::new());
+            used = 0;
+            at_start = false;
+            word = tail;
+            word_width = unicode_width::UnicodeWidthStr::width(tail);
+            if tail.is_empty() {
+                break;
+            }
         }
     }
+    trim_trailing_spaces(&mut rows, &mut used);
     rows.into_iter().map(Line::from).collect()
+}
+
+/// How a character joins its neighbours: spaces group, wide characters stand alone (every
+/// pair is a break opportunity), narrow characters glue into words.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    Space,
+    Wide,
+    Narrow,
+}
+
+fn kind_of(ch: char) -> Kind {
+    if ch == ' ' {
+        Kind::Space
+    } else if UnicodeWidthChar::width(ch).unwrap_or(0) >= 2 {
+        Kind::Wide
+    } else {
+        Kind::Narrow
+    }
+}
+
+/// One style-carrying unit of wrapping: a word, a single wide character, or a run of spaces.
+struct Atom {
+    text: String,
+    style: Style,
+    width: usize,
+    space: bool,
+}
+
+fn atoms(line: &Line<'_>) -> Vec<Atom> {
+    let mut out = Vec::new();
+    for span in &line.spans {
+        let mut text = String::new();
+        let mut width = 0usize;
+        let mut kind = Kind::Narrow;
+        let mut started = false;
+        for ch in span.content.chars() {
+            let next = kind_of(ch);
+            if started && (next != kind || next == Kind::Wide) {
+                out.push(Atom {
+                    text: std::mem::take(&mut text),
+                    style: span.style,
+                    width,
+                    space: kind == Kind::Space,
+                });
+                width = 0;
+            }
+            text.push(ch);
+            width += UnicodeWidthChar::width(ch).unwrap_or(0);
+            kind = next;
+            started = true;
+        }
+        if started {
+            out.push(Atom {
+                text,
+                style: span.style,
+                width,
+                space: kind == Kind::Space,
+            });
+        }
+    }
+    out
+}
+
+/// Splits off the longest prefix that fits in `width` columns.
+fn split_at_width(text: &str, width: usize) -> (&str, &str) {
+    let mut used = 0usize;
+    for (index, ch) in text.char_indices() {
+        let columns = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if used + columns > width {
+            return (&text[..index], &text[index..]);
+        }
+        used += columns;
+    }
+    (text, "")
+}
+
+/// Drops the space atoms a row ends with; they belong to neither side of a break.
+fn trim_trailing_spaces(rows: &mut Vec<Vec<Span<'static>>>, used: &mut usize) {
+    let row = rows.last_mut().expect("rows starts with one row");
+    while row
+        .last()
+        .is_some_and(|span| !span.content.is_empty() && span.content.chars().all(|ch| ch == ' '))
+    {
+        let span = row.pop().expect("just checked");
+        *used = used.saturating_sub(unicode_width::UnicodeWidthStr::width(span.content.as_ref()));
+    }
 }
 
 /// Wraps every line, keeping empty lines as single empty rows.
@@ -227,6 +346,16 @@ mod tests {
             .map(|row| row.spans.iter().map(|span| span.content.as_ref()).collect())
             .collect();
         assert_eq!(texts, vec!["hello wide", "world"], "{texts:?}");
+    }
+
+    #[test]
+    fn words_move_whole_to_the_next_row() {
+        let wrapped = wrap_line(&line("alpha beta gamma"), 11);
+        let texts: Vec<String> = wrapped
+            .iter()
+            .map(|row| row.spans.iter().map(|span| span.content.as_ref()).collect())
+            .collect();
+        assert_eq!(texts, vec!["alpha beta", "gamma"], "{texts:?}");
     }
 
     #[test]

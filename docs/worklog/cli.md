@@ -42,6 +42,14 @@ live 验收反馈：上一轮翻新做了 UI 级滚动，但没有滚动条、�
 - **坑留痕**：ratatui 0.30 的 `TestBackend::to_string` 给每行包双引号（`buffer_view` 要标多宽字符 overwrite）；既有黄金帧全用 `contains` 所以没碰过它，这次的行尾断言（`ends_with('█')`）头一回撞上，测试先 `trim_matches('"')`。
 - 实测：cli 85 项全绿（75 + 新 10：scrollbar 几何/渲染 5、gutter 换行宽与 bar 黄金帧 2、鼠标映射/滚轮/拖拽 3）；`./scripts/ci.sh` 全门禁绿。真实终端的滚轮手感与拖拽仍挂 live 验收。
 
+### 2026-10-05 · 词级换行与点击折叠
+
+live 验收反馈两条：换行把单词劈开（截图里 `check t / he workspace`）；工具/思考区域不能点开看或收起来。
+
+- **词级换行**：旧 `wrap_line` 是字符级贪心（doc 注释写着词边界，代码不是——live 截图抓出来的谎）。重写为 atom 贪心：窄字符粘成词、空格成段、**宽字符单独成 atom**（CJK 任意两字之间是断点，中文照旧按字折），整词放不下才换行，只有比整行还宽的词才硬断；行首缩进保留、断点空格两边都不留。样式随 atom 走，折行穿样式不变。
+- **点击折叠**：`Cell.expanded: Option<bool>` 单格覆盖；reasoning 默认跟 Ctrl+R 全局折叠，tool 默认展开（折叠后 header 留 `· ⋯` 提示有藏起来的内容）。`relayout` 顺带记录 row→cell（`cell_of`），左键单击 transcript 行经 `offset + 行` 地址化到 cell 再 `toggle_cell`。**与 Ctrl+R 的关系**：Ctrl+R 翻转全局折叠并清除全部 reasoning 单格覆盖——主开关一动例外归零，避免「全局说折、单格说开」的两套真值打架；折叠行文案改为 `(click or Ctrl+R to expand)`。bar 命中优先于折叠（点在 gutter 上是抓滚动条）。
+- 实测：cli 89 项全绿（85 + 新 4：词级换行 1、点击地址化 1、reasoning 单格/全局关系 1、tool 折叠黄金帧 1）；`./scripts/ci.sh` 全门禁绿。
+
 ### 2026-10-04 · TUI 翻新：widget 层、融合视觉、双主题、UI 级滚动
 
 单文件 `tui.rs`（402 行）退役为 `tui/` 模块树：`theme`（语义色层 × dark/light 调色板）、`scroll`（follow/偏移状态）、`widgets/{transcript, composer, status, indicator, toasts}`，`mod.rs` 留 Model 与帧组合。渲染不变量不变：`draw(&Model, Frame)` 纯函数、TestBackend 黄金帧。
