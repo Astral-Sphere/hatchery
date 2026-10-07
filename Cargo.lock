@@ -1244,7 +1244,6 @@ dependencies = [
  "fs2",
  "futures",
  "git2",
- "hatchery-acp",
  "hatchery-capabilities",
  "hatchery-kernel",
  "hatchery-llm",

@@ -18,7 +18,6 @@ async-trait.workspace = true
 fs2.workspace = true
 futures.workspace = true
 git2.workspace = true
-hatchery-acp.workspace = true
 hatchery-capabilities.workspace = true
 hatchery-kernel.workspace = true
 hatchery-llm.workspace = true
