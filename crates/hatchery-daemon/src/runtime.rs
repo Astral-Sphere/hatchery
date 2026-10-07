@@ -26,11 +26,13 @@ use hatchery_protocol::{
 use hatchery_store::SessionStore;
 
 use crate::hub::LiveHub;
+use crate::prompt::AssembledSection;
 
 /// The conversation as the provider will see it, rebuilt from the store.
 ///
-/// The mapping is deliberately mechanical — the request must be rebuildable byte for byte from
-/// what is recorded (invariant 2), so assembly adds nothing it did not store:
+/// The mapping is deliberately mechanical — the branch history must be rebuildable byte for byte
+/// from what is recorded (invariant 2), so assembly adds nothing to it that the store does not
+/// hold:
 ///
 /// * `UserMessage` → a user message.
 /// * `Reasoning` → held back, attached to the following assistant message when the provider's
@@ -40,21 +42,34 @@ use crate::hub::LiveHub;
 ///   before the field existed get a stable synthesized stand-in).
 /// * `ToolResult` → a tool message, `tool_call_id` = the answered call's provider id.
 /// * `Checkpoint` / `ModeSwitch` / `BranchNote` / `Compaction` → not provider-visible; skipped.
+///
+/// The one thing in the request that is *not* an item leads it: the system prompt. It is a
+/// derived artifact — reproducible from the shipped templates plus the runtime facts frozen when
+/// this runtime was assembled — so invariant 2's byte-exactness covers the branch history behind
+/// it, and `prompt/render` covers the prompt itself (docs/design/kernel.md §6, D15).
 pub struct StoreHistory {
     store: Arc<dyn SessionStore>,
     session: SessionId,
     /// Whether reasoning rides back into requests on this provider (ADR-0007).
     echo_reasoning: bool,
+    /// The rendered prompt, frozen for this runtime's life; `None` sends no system message.
+    system: Option<String>,
 }
 
 impl StoreHistory {
-    /// A history for one session, with the provider's echo setting.
+    /// A history for one session, with the provider's echo setting and the prompt to lead with.
     #[must_use]
-    pub fn new(store: Arc<dyn SessionStore>, session: SessionId, echo_reasoning: bool) -> Self {
+    pub fn new(
+        store: Arc<dyn SessionStore>,
+        session: SessionId,
+        echo_reasoning: bool,
+        system: Option<String>,
+    ) -> Self {
         Self {
             store,
             session,
             echo_reasoning,
+            system,
         }
     }
 }
@@ -74,6 +89,9 @@ impl HistorySource for StoreHistory {
             .map_err(|error| KernelError::history(error.to_string()))?;
 
         let mut messages = Vec::new();
+        if let Some(system) = &self.system {
+            messages.push(Message::system(system.clone()));
+        }
         let mut pending_reasoning: Option<ReasoningBlock> = None;
         // item id → provider call id, so results can be paired after the fact.
         let mut call_ids: std::collections::HashMap<ItemId, String> =
@@ -312,12 +330,36 @@ fn completion_error(completion: &hatchery_kernel::TurnCompletion) -> EventError 
     error.to_event_error()
 }
 
+/// The seams one assembly binds into a runtime.
+///
+/// Named fields rather than positional arguments: most of these are `Arc`s of the same shape, and
+/// transposing two of them at a call site is a mistake the compiler does not always catch.
+pub struct RuntimeParts {
+    /// Where items are committed and history is read from.
+    pub store: Arc<dyn SessionStore>,
+    /// The fan-out this runtime's events are published to.
+    pub hub: Arc<LiveHub>,
+    /// The provider adapter serving the session's model.
+    pub provider: Arc<dyn LlmProvider>,
+    /// The tool catalogue and dispatcher for the session's mode.
+    pub tools: Arc<dyn ToolHost>,
+    /// Whether reasoning rides back into requests on this provider (ADR-0007).
+    pub echo_reasoning: bool,
+    /// The prompt rendered for this assembly, frozen into the runtime (D15).
+    pub prompt: Vec<AssembledSection>,
+}
+
 /// One assembled, running session.
 pub struct SessionRuntime {
     /// The session this runtime owns.
     pub session: SessionId,
     /// Which assembly this is; every event this runtime emits carries it (invariant 1).
     pub generation: u64,
+    /// The prompt this runtime was assembled with, section by section.
+    ///
+    /// Frozen for the runtime's life (D15) and kept in sections so `prompt/render` can answer
+    /// "why did the model see this" with the text the requests actually carry, sources included.
+    pub prompt: Vec<AssembledSection>,
     /// The command end of the kernel agent.
     pub handle: hatchery_kernel::AgentHandle,
     /// Set the moment the manager accepts a prompt, cleared by the sink's turn-end projection.
@@ -342,12 +384,16 @@ impl SessionRuntime {
     pub async fn spawn(
         session: &Session,
         generation: u64,
-        store: Arc<dyn SessionStore>,
-        hub: Arc<LiveHub>,
-        provider: Arc<dyn LlmProvider>,
-        tools: Arc<dyn ToolHost>,
-        echo_reasoning: bool,
+        parts: RuntimeParts,
     ) -> Result<Self, hatchery_store::StoreError> {
+        let RuntimeParts {
+            store,
+            hub,
+            provider,
+            tools,
+            echo_reasoning,
+            prompt,
+        } = parts;
         let in_flight = Arc::new(AtomicBool::new(false));
         let ports = Ports::new(
             provider,
@@ -356,6 +402,7 @@ impl SessionRuntime {
                 Arc::clone(&store),
                 session.id,
                 echo_reasoning,
+                Some(crate::prompt::join(&prompt)),
             )),
             Arc::new(HubSink::new(
                 session.id,
@@ -372,6 +419,7 @@ impl SessionRuntime {
         Ok(Self {
             session: session.id,
             generation,
+            prompt,
             handle,
             in_flight,
             task,
@@ -521,7 +569,7 @@ mod tests {
     #[tokio::test]
     async fn the_chain_rebuilds_the_provider_request_exactly() {
         let (_dir, store, session) = store_with_items(true).await;
-        let history = StoreHistory::new(store, session, true);
+        let history = StoreHistory::new(store, session, true, None);
         let view = history.view().await.expect("view");
 
         assert_eq!(
@@ -554,7 +602,7 @@ mod tests {
     #[tokio::test]
     async fn reasoning_is_dropped_when_the_provider_does_not_echo() {
         let (_dir, store, session) = store_with_items(false).await;
-        let view = StoreHistory::new(store, session, false)
+        let view = StoreHistory::new(store, session, false, None)
             .view()
             .await
             .expect("view");
@@ -594,7 +642,7 @@ mod tests {
             .await
             .expect("append");
 
-        let view = StoreHistory::new(store, session_id, false)
+        let view = StoreHistory::new(store, session_id, false, None)
             .view()
             .await
             .expect("view");
@@ -610,13 +658,44 @@ mod tests {
     #[tokio::test]
     async fn checkpoints_are_not_provider_visible() {
         let (_dir, store, session) = store_with_items(true).await;
-        let view = StoreHistory::new(store, session, true)
+        let view = StoreHistory::new(store, session, true, None)
             .view()
             .await
             .expect("view");
+        // The chain holds six items; four of them are conversation. The checkpoint is the one
+        // that must not surface — its commit id is the tell.
+        assert_eq!(view.messages.len(), 4, "{view:?}");
         assert!(
-            view.messages.iter().all(|m| m.role != Role::System),
+            view.messages
+                .iter()
+                .all(|m| !m.content.text.contains("abc")),
             "a checkpoint must not become a message"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_prompt_leads_the_view_and_does_not_move_between_views() {
+        let (_dir, store, session) = store_with_items(true).await;
+        let history =
+            StoreHistory::new(store, session, true, Some("the shipped prompt".to_owned()));
+
+        let first = history.view().await.expect("view");
+        assert_eq!(
+            first.messages[0].role,
+            Role::System,
+            "the prompt leads, ahead of the branch history"
+        );
+        assert_eq!(first.messages[0].content.text, "the shipped prompt");
+        assert_eq!(first.messages.len(), 5, "the prompt plus the four messages");
+
+        // Frozen for the runtime's life (D15): the same string on every view, so the provider's
+        // prefix cache keeps its head stable across turns.
+        let second = history.view().await.expect("view");
+        assert_eq!(second.messages[0], first.messages[0], "unchanged");
+        assert_eq!(
+            second.messages[1..],
+            first.messages[1..],
+            "and the history behind it is rebuilt the same way"
         );
     }
 }

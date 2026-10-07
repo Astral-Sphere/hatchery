@@ -29,7 +29,8 @@ use hatchery_store::SessionStore;
 
 use crate::config::LayeredConfig;
 use crate::hub::LiveHub;
-use crate::runtime::SessionRuntime;
+use crate::prompt::AssembledSection;
+use crate::runtime::{RuntimeParts, SessionRuntime};
 
 /// Why a manager call failed, in the wire's vocabulary.
 #[derive(Clone, Debug, thiserror::Error)]
@@ -76,6 +77,12 @@ pub struct SessionManager {
     /// sweep would unload a session somebody is watching).
     watchers: Mutex<HashMap<SessionId, u32>>,
     providers: Mutex<ProviderRegistry>,
+    /// Where the per-section prompt overrides are read from; `None` reads none.
+    ///
+    /// The production entry passes [`crate::prompt::default_prompts_dir`]. Tests pass `None`
+    /// rather than inheriting whatever the machine running them happens to have configured —
+    /// the same reason `LayeredConfig` is built from injected layers in a test.
+    prompts_dir: Option<std::path::PathBuf>,
 }
 
 impl SessionManager {
@@ -86,6 +93,7 @@ impl SessionManager {
         config: Arc<LayeredConfig>,
         hub: Arc<LiveHub>,
         data_dir: std::path::PathBuf,
+        prompts_dir: Option<std::path::PathBuf>,
     ) -> Self {
         Self {
             store,
@@ -96,6 +104,7 @@ impl SessionManager {
             turn_gates: Mutex::new(HashMap::new()),
             watchers: Mutex::new(HashMap::new()),
             providers: Mutex::new(ProviderRegistry::new()),
+            prompts_dir,
         }
     }
 
@@ -523,6 +532,15 @@ impl SessionManager {
     async fn assemble(&self, session: &Session) -> Result<Arc<SessionRuntime>, ManagerError> {
         let (provider, echo) = self.provider_for(&session.model.model)?;
         let tools = self.chat_tools(session)?;
+        // Rendered here and frozen for the runtime's life (D15): re-rendering per turn would move
+        // the `environment` section's date and cwd under the provider's prefix cache, which is the
+        // stability the rest of the request is built to preserve. Freezing is also what the model
+        // and the effort already do — nothing reassembles a live runtime on a config change (the
+        // only unload is the idle sweep), so all three land at the next assembly. `prompt/render`
+        // reports the frozen text rather than a fresh render, so "why did the model see this"
+        // stays answerable; whether a config change *should* reassemble is daemon.md's open
+        // question 5.
+        let prompt = self.render_prompt(Some(session));
 
         let updated = self
             .store
@@ -533,11 +551,14 @@ impl SessionManager {
             SessionRuntime::spawn(
                 &updated,
                 updated.generation,
-                Arc::clone(&self.store),
-                Arc::clone(&self.hub),
-                Arc::new(provider),
-                Arc::new(tools),
-                echo,
+                RuntimeParts {
+                    store: Arc::clone(&self.store),
+                    hub: Arc::clone(&self.hub),
+                    provider: Arc::new(provider),
+                    tools: Arc::new(tools),
+                    echo_reasoning: echo,
+                    prompt,
+                },
             )
             .await
             .map_err(store_error)?,
@@ -630,6 +651,35 @@ impl SessionManager {
         Ok(registry)
     }
 
+    /// The prompt for a session, or for a bare mode when there is none.
+    ///
+    /// The manager is the assembler: it owns the config layer that supplies `response_language`,
+    /// the session row that supplies the workspace, and the override directory. `prompt/render`
+    /// calls this too, so the transparency answer and the text a request carries cannot drift.
+    #[must_use]
+    pub fn render_prompt(&self, session: Option<&Session>) -> Vec<AssembledSection> {
+        let overrides = self.config.ui();
+        let workspace = session.and_then(|session| session.workspace.as_deref());
+        let env = crate::prompt::environment(workspace, overrides.response_language.as_deref());
+        crate::prompt::render_chat(&env, self.prompts_dir.as_ref())
+    }
+
+    /// The prompt a *live* runtime was assembled with, if this session has one.
+    ///
+    /// `prompt/render` prefers this over a fresh render: the question it answers is "why did the
+    /// model see this", and a fresh render may legitimately differ from the frozen one — the date
+    /// moved, or an override file changed since the assembly. A runtime whose agent has stopped
+    /// counts as absent, because the next prompt reassembles and renders again.
+    #[must_use]
+    pub fn rendered_prompt(&self, session: SessionId) -> Option<Vec<AssembledSection>> {
+        self.slots
+            .lock()
+            .expect("slots is not poisoned")
+            .get(&session)
+            .filter(|slot| !slot.runtime.handle.is_closed())
+            .map(|slot| slot.runtime.prompt.clone())
+    }
+
     /// The model a new session uses when the caller did not pick one: the first configured
     /// provider's first listed model.
     fn default_model(&self) -> Result<hatchery_protocol::ModelRef, ManagerError> {
@@ -679,6 +729,7 @@ mod tests {
             config,
             Arc::clone(&hub),
             dir.path().to_path_buf(),
+            None,
         ));
         (dir, manager, hub)
     }
@@ -904,6 +955,7 @@ mod tests {
             config,
             Arc::clone(&hub),
             dir.path().to_path_buf(),
+            None,
         ));
         (dir, manager, hub)
     }

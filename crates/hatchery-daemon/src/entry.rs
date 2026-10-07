@@ -109,6 +109,7 @@ pub async fn run_until(options: RunOptions, external: CancellationToken) -> Resu
         Arc::clone(&config),
         Arc::clone(&hub),
         data_dir,
+        crate::prompt::default_prompts_dir(),
     ));
     let recovered = manager.recover_crashed_sessions().await?;
     if recovered > 0 {

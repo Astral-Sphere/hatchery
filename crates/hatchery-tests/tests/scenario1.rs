@@ -106,19 +106,33 @@ async fn invariant_minimal_chat_replays_reasoning_byte_exact() {
     assert_eq!(requests.len(), 2, "one POST per turn");
     let first: serde_json::Value =
         serde_json::from_str(&requests[0].body).expect("a JSON request body");
+    let first_messages = first["messages"].as_array().expect("messages");
     assert_eq!(
-        first["messages"].as_array().expect("messages").len(),
-        1,
-        "the first turn starts from the bare prompt"
+        first_messages[0]["role"], "system",
+        "the assembled prompt leads the request"
+    );
+    let system = first_messages[0]["content"].as_str().expect("system text");
+    assert!(!system.is_empty(), "an empty prompt is not a prompt");
+    assert_eq!(
+        serde_json::to_value(&first_messages[1..]).expect("serialisable"),
+        serde_json::json!([{ "role": "user", "content": "hi" }]),
+        "the first turn carries the bare prompt behind it"
     );
 
     let second: serde_json::Value =
         serde_json::from_str(&requests[1].body).expect("a JSON request body");
     assert_eq!(second["model"], "m");
+    let second_messages = second["messages"].as_array().expect("messages");
+    assert_eq!(
+        second_messages[0]["content"].as_str(),
+        Some(system),
+        "rendered once per assembly and frozen for the runtime's life: re-rendering per turn \
+         would move the date and the cwd under the provider's prefix cache"
+    );
     // The full context, rebuilt from the store by hand — this is invariant 2's two sides held
     // next to each other: serde string equality is byte equality, whitespace included.
     assert_eq!(
-        second["messages"],
+        serde_json::to_value(&second_messages[1..]).expect("serialisable"),
         serde_json::json!([
             { "role": "user", "content": "hi" },
             {
@@ -129,6 +143,31 @@ async fn invariant_minimal_chat_replays_reasoning_byte_exact() {
             { "role": "user", "content": "and again" },
         ]),
         "the second request is the recorded history plus the new prompt, byte for byte"
+    );
+
+    // Invariant 2's boundary: the branch history is pinned byte for byte above, and the system
+    // prompt — a derived artifact that is deliberately not an item — is pinned here, by the
+    // method whose whole purpose is answering "why did the model see this?".
+    let rendered: m::PromptRenderResult = probe
+        .call(
+            m::PROMPT_RENDER,
+            &m::PromptRenderParams {
+                session_id: Some(session),
+                mode: None,
+            },
+        )
+        .await;
+    assert_eq!(
+        rendered.text, system,
+        "`prompt/render` reports the text the model was actually sent"
+    );
+    assert!(
+        rendered
+            .sections
+            .iter()
+            .all(|section| !section.text.is_empty()),
+        "every section says something: {:?}",
+        rendered.sections
     );
 
     daemon.stop().await;

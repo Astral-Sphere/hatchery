@@ -10,7 +10,8 @@
 //! The assembled prompt is what `prompt/render` hands back, section by section with sources, so
 //! "why did the model see this" is always answerable.
 
-use std::path::PathBuf;
+use std::ffi::OsStr;
+use std::path::{Path, PathBuf};
 
 use hatchery_protocol::method::PromptSection;
 
@@ -36,6 +37,55 @@ pub struct Environment {
     pub git_status: String,
     /// The configured reply language, if one is set.
     pub response_language: String,
+}
+
+/// The runtime facts behind one session's prompt.
+///
+/// One builder for both callers — `prompt/render` and the runtime assembly — because they must
+/// not drift: the transparency answer and the text a request carries are supposed to be the same
+/// text.
+#[must_use]
+pub fn environment(workspace: Option<&Path>, response_language: Option<&str>) -> Environment {
+    let cwd = match workspace {
+        Some(workspace) => workspace.display().to_string(),
+        None => std::env::current_dir()
+            .unwrap_or_default()
+            .display()
+            .to_string(),
+    };
+    Environment {
+        cwd,
+        platform: std::env::consts::OS.to_owned(),
+        date: super::clock::humantime_date(),
+        git_status: git_summary(workspace),
+        response_language: response_language.unwrap_or_default().to_owned(),
+    }
+}
+
+/// Where the per-section override files live, from the two variables that can say.
+///
+/// The pure half of [`default_prompts_dir`]: the sibling of the user config layer
+/// (`config::LoadPaths::detect`), so `$XDG_CONFIG_HOME/hatchery/prompts`, else
+/// `~/.config/hatchery/prompts`.
+#[must_use]
+pub fn prompts_dir(config_home: Option<&OsStr>, home: Option<&OsStr>) -> Option<PathBuf> {
+    config_home
+        .map(PathBuf::from)
+        .or_else(|| home.map(|home| Path::new(home).join(".config")))
+        .map(|dir| dir.join("hatchery").join("prompts"))
+}
+
+/// [`prompts_dir`] against this process's environment.
+///
+/// `None` only when neither variable is set. A directory that does not exist is the normal case,
+/// not an error: [`render_chat`] reads each section's file and falls back to the builtin when the
+/// read fails.
+#[must_use]
+pub fn default_prompts_dir() -> Option<PathBuf> {
+    prompts_dir(
+        std::env::var_os("XDG_CONFIG_HOME").as_deref(),
+        std::env::var_os("HOME").as_deref(),
+    )
 }
 
 /// One assembled section.
@@ -250,6 +300,42 @@ mod tests {
     #[test]
     fn a_missing_workspace_reads_as_not_bound() {
         assert_eq!(git_summary(None), "not bound (Chat without a workspace)");
+    }
+
+    #[test]
+    fn the_prompts_dir_is_the_user_config_layer_sibling() {
+        assert_eq!(
+            prompts_dir(Some(OsStr::new("/xdg")), Some(OsStr::new("/home/u"))),
+            Some(PathBuf::from("/xdg/hatchery/prompts")),
+            "XDG_CONFIG_HOME wins when it is set"
+        );
+        assert_eq!(
+            prompts_dir(None, Some(OsStr::new("/home/u"))),
+            Some(PathBuf::from("/home/u/.config/hatchery/prompts")),
+            "the documented fallback"
+        );
+        assert_eq!(prompts_dir(None, None), None, "no home, no overrides");
+    }
+
+    #[test]
+    fn the_environment_builder_supplies_every_variable_a_render_interpolates() {
+        let env = environment(None, Some("简体中文"));
+        assert_eq!(env.git_status, "not bound (Chat without a workspace)");
+        assert_eq!(env.response_language, "简体中文");
+        assert_eq!(env.platform, std::env::consts::OS);
+        assert!(!env.cwd.is_empty(), "the daemon's cwd stands in");
+        let date = env.date.clone();
+        assert_eq!(date.len(), "YYYY-MM-DD".len(), "{date}");
+        assert!(
+            !join(&render_chat(&env, None)).contains("{{"),
+            "nothing is left uninterpolated"
+        );
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bound = environment(Some(dir.path()), None);
+        assert_eq!(bound.cwd, dir.path().display().to_string());
+        assert!(!bound.git_status.is_empty(), "a workspace is described");
+        assert_eq!(bound.response_language, "", "no configured language");
     }
 
     #[test]

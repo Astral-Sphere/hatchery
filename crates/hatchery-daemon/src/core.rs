@@ -194,37 +194,28 @@ impl DaemonCore {
     }
 
     /// `prompt/render`: the assembled Chat prompt for a session or a bare mode.
+    ///
+    /// A session with a live runtime reports the prompt that runtime froze at assembly — the text
+    /// its requests actually carry — rather than a fresh render, which may legitimately differ.
     async fn render_prompt(
         &self,
         params: m::PromptRenderParams,
     ) -> Result<serde_json::Value, EventError> {
-        let (workspace, model) = match params.session_id {
-            Some(session_id) => {
-                let session =
-                    self.store.session(session_id).await.map_err(|error| {
+        let sections = match params.session_id {
+            Some(session_id) => match self.manager.rendered_prompt(session_id) {
+                Some(frozen) => frozen,
+                None => {
+                    let session = self.store.session(session_id).await.map_err(|error| {
                         EventError::new(ErrorCode::StoreError, error.to_string())
                     })?;
-                (session.workspace.clone(), session.model.model)
-            }
-            None => (None, String::new()),
+                    self.manager.render_prompt(Some(&session))
+                }
+            },
+            // A bare mode: nothing is running, so a fresh render is the only answer.
+            // `params.mode` is not read yet because Chat is the only mode with a prompt — the
+            // Code variant is M2 Phase 2.
+            None => self.manager.render_prompt(None),
         };
-        let overrides = self.config.ui();
-        let env = crate::prompt::Environment {
-            cwd: workspace
-                .as_ref()
-                .map_or_else(
-                    || std::env::current_dir().unwrap_or_default(),
-                    std::clone::Clone::clone,
-                )
-                .display()
-                .to_string(),
-            platform: std::env::consts::OS.to_owned(),
-            date: humantime_date(),
-            git_status: crate::prompt::git_summary(workspace.as_deref()),
-            response_language: overrides.response_language.unwrap_or_default(),
-        };
-        let _ = model;
-        let sections = crate::prompt::render_chat(&env, None);
         serde_json::to_value(crate::prompt::render_result(&sections)).map_err(internal)
     }
 }
@@ -241,14 +232,6 @@ fn manager(error: crate::manager::ManagerError) -> EventError {
     error.into_event()
 }
 
-/// Today as `YYYY-MM-DD` via the standard library only.
-pub(crate) use crate::clock::humantime_date;
-
-/// The audit: what must be true before the daemon may serve.
-///
-/// Fail-loud (ADR-0009): the missing pieces are listed, all at once, and the daemon exits —
-/// a half-wired runtime would surface as confusing per-session failures instead.
-#[must_use]
 /// Whether an env-var read means "no usable key": unset, or present but blank (a common
 /// copy-paste artifact the request-time resolver would refuse on every turn).
 fn env_key_unusable(value: Result<String, std::env::VarError>) -> bool {
@@ -258,6 +241,11 @@ fn env_key_unusable(value: Result<String, std::env::VarError>) -> bool {
     }
 }
 
+/// The audit: what must be true before the daemon may serve.
+///
+/// Fail-loud (ADR-0009): the missing pieces are listed, all at once, and the daemon exits —
+/// a half-wired runtime would surface as confusing per-session failures instead.
+#[must_use]
 pub fn audit(
     config: &LayeredConfig,
     state_dir: &crate::discover::StateDir,
@@ -409,6 +397,7 @@ mod tests {
             Arc::clone(&config),
             hub,
             dir.path().to_path_buf(),
+            None,
         ));
         (
             dir,

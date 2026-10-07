@@ -59,6 +59,7 @@ impl TestDaemon {
             Arc::clone(&config),
             Arc::clone(&hub),
             dir.path().to_path_buf(),
+            None,
         ));
         manager.recover_crashed_sessions().await.expect("recover");
 

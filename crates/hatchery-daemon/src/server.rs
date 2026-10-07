@@ -313,6 +313,7 @@ mod tests {
             Arc::clone(&config),
             Arc::clone(&hub),
             dir.path().to_path_buf(),
+            None,
         ));
         let core = Arc::new(DaemonCore::new(
             Arc::clone(&manager),
