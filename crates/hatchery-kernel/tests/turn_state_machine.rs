@@ -12,8 +12,8 @@ use hatchery_kernel::{
     KernelEvent, LlmError, Message, Ports, StreamEvent, TurnCompletion, TurnLimits, TurnState,
 };
 use hatchery_protocol::{
-    Item, ItemId, ItemKind, ItemKindTag, RiskLevel, SessionId, SignatureBlock, StopReason,
-    ToolOutput, ToolStatus,
+    ApprovalOption, ApprovalRequest, Item, ItemId, ItemKind, ItemKindTag, RiskLevel, SessionId,
+    SignatureBlock, StopReason, ToolOutput, ToolStatus,
 };
 use hatchery_testkit::{
     MemoryHistory, RecordingSink, ScriptedApproval, ScriptedProvider, ScriptedToolHost,
@@ -634,6 +634,93 @@ async fn approving_always_still_only_runs_the_call_once() {
 
     // Persisting the rule is the approval gate's job (M2); the kernel just runs the call.
     assert_eq!(harness.tools.call_names(), vec!["write_file"]);
+    assert_eq!(reason(&events), Some(StopReason::ModelDone));
+}
+
+#[tokio::test]
+async fn a_hard_gate_refuses_an_answer_it_never_offered() {
+    // The only mechanism that makes "cannot be remembered" real (invariant 5): `once_only()`
+    // drops the two remembered options, and the kernel refuses an answer outside the offer list,
+    // so a buggy or hostile frontend cannot turn a one-off permission into a standing rule.
+    let provider = ScriptedProvider::new(vec![
+        ScriptedProvider::tool_round("call-1", "write_file", json!({"path": "~/.ssh/config"})),
+        ScriptedProvider::text_round("left alone"),
+    ]);
+    let tools = ScriptedToolHost::new()
+        .advertising(&["write_file"])
+        .requiring_approval_with(
+            ApprovalRequest::new(
+                "write_file",
+                "write ~/.ssh/config",
+                RiskLevel::WritesOutside,
+            )
+            .once_only(),
+        )
+        .answering("write_file", ToolOutput::text("wrote ~/.ssh/config"));
+    let harness = Harness::new(
+        provider,
+        tools,
+        MemoryHistory::empty(),
+        TurnLimits::default(),
+    );
+    harness.prompt("write it").await;
+
+    let events = harness
+        .sink
+        .wait_for("the approval request", |event| {
+            matches!(event, KernelEvent::ApprovalNeeded { .. })
+        })
+        .await;
+    let (request_id, offers) = match events.last().expect("the request") {
+        KernelEvent::ApprovalNeeded {
+            request_id,
+            request,
+        } => {
+            assert!(request.risk.is_hard_gate(), "the risky path is the gate");
+            (*request_id, request.options.clone())
+        }
+        other => panic!("expected an approval request, got {other:?}"),
+    };
+    assert_eq!(
+        offers,
+        vec![ApprovalOption::AllowOnce, ApprovalOption::Deny],
+        "a hard gate offers nothing that can be remembered"
+    );
+
+    // The answer a frontend that ignored the offer list would send, then one it may send. Both
+    // travel the same ordered command channel, so the second cannot overtake the first.
+    harness
+        .handle
+        .submit(AgentCommand::decide(
+            request_id,
+            ApprovalOption::AllowAlways,
+        ))
+        .await
+        .expect("the agent is running");
+    harness
+        .handle
+        .submit(AgentCommand::decide(request_id, ApprovalOption::Deny))
+        .await
+        .expect("the agent is running");
+    let events = harness.finish().await;
+
+    assert!(
+        harness.tools.call_names().is_empty(),
+        "the unoffered answer was refused, so the call never reached the tool"
+    );
+    assert_eq!(
+        tool_result_texts(&events),
+        vec!["the user denied this call to `write_file`; do not repeat it".to_owned()],
+        "what settled the wait was the offered answer"
+    );
+    let statuses: Vec<ToolStatus> = finished_items(&events)
+        .iter()
+        .filter_map(|item| match &item.kind {
+            ItemKind::ToolCall(call) => Some(call.status),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(statuses, vec![ToolStatus::Denied], "denied, not completed");
     assert_eq!(reason(&events), Some(StopReason::ModelDone));
 }
 

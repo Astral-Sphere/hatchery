@@ -86,13 +86,26 @@ impl ScriptedToolHost {
     /// Makes this tool need approval before it runs.
     #[must_use]
     pub fn requiring_approval(self, name: &str, risk: RiskLevel) -> Self {
+        self.requiring_approval_with(ApprovalRequest::new(
+            name,
+            format!("{name} (scripted)"),
+            risk,
+        ))
+    }
+
+    /// Makes this tool need approval, offering exactly what `request` offers.
+    ///
+    /// [`Self::requiring_approval`] builds its request with [`ApprovalRequest::new`], whose offer
+    /// list is always the full four, so it cannot express a hard gate: `once_only()` is what
+    /// narrows the list, and the kernel's refusal of an answer outside it — the only mechanism
+    /// that makes "cannot be remembered" real — is unreachable through a request that offers
+    /// everything.
+    #[must_use]
+    pub fn requiring_approval_with(self, request: ApprovalRequest) -> Self {
         self.approvals
             .lock()
             .expect("the mutex is never poisoned")
-            .insert(
-                name.to_owned(),
-                ApprovalRequest::new(name, format!("{name} (scripted)"), risk),
-            );
+            .insert(request.tool.clone(), request);
         self
     }
 
