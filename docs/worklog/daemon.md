@@ -68,7 +68,9 @@
 
 **3. `prompt/render` 对活着的 runtime 返回冻结的那一份**（`SessionManager::rendered_prompt`；agent 已停的 runtime 视为不存在，因为下一个 prompt 会重组装并重渲染）。这不是锦上添花：D15 把不变量 2 里 system prompt 的那一半交给这个方法钉，它若返回重新渲染的结果，「模型看到了什么」在日期翻页或覆盖文件被改之后就会说谎。
 
-**实测推翻了 D15 的理由①，并暴露一个真缺陷。** 规划时写的「模式切换与 config 变更本来就 bump generation 并重组装」不成立：`session/set_config`（CLI 的 `/model` `/effort` 走的就是它）只改库里的行并发 `SessionUpdated`，`config/set` 只改 `LayeredConfig` 本身，而全仓库唯一的卸载路径是空闲清扫（`sweep_after` → `unload`）。provider adapter、`ChatOptions` 与 prompt 都在 `assemble` 里绑死，所以三者一律**下次装配才生效**——用户敲完 `/model x`，下一轮请求仍然发给旧模型，且没有任何提示。prompt 冻结与之一致、不是它引入的问题，但这条记为 design/daemon.md **开放问题 5**：Phase 3 的 `session/set_mode` 必须先回答它（换模式要换工具表、审批策略与 prompt 变体，非重组装不可），而解法不能是「`set_config` 里调 `unload`」——`unload` 对被 watch 的会话直接拒绝，改配置的恰恰是附着中的前端。
+**实测推翻了 D15 的理由①，并暴露一个真缺陷。** 规划时写的「模式切换与 config 变更本来就 bump generation 并重组装」不成立：`session/set_config`（CLI 的 `/model` `/effort` 走的就是它）只改库里的行并发 `SessionUpdated`，`config/set` 只改 `LayeredConfig` 本身，而全仓库唯一的卸载路径是空闲清扫（`sweep_after` → `unload`）。provider adapter、`ChatOptions` 与 prompt 都在 `assemble` 里绑死，所以 `/model` 的变更**下次装配才生效**——用户敲完 `/model x`，下一轮请求仍然发给旧模型，且没有任何提示。
+
+**同日的 live 验收又量到更糟的一层：`/effort` 永远不生效，不是「下次装配才生效」。** `session/set_config` 把 effort 写进 `session.config_patch`（manager.rs:391），而 `config_patch` 在 daemon 侧**没有任何读者**——读它的只有 CLI，用来画状态栏（chat.rs:91、tui/mod.rs:506）。provider 配置里的 `reasoning.reasoning_effort`（builtin 给 deepseek 与 qwen 都是 High）同样不进 turn：`runtime.rs:415` 用 `ChatOptions::new(model)`，`reasoning_effort` 恒为 `None`（message.rs:287），`translate.rs:75` 的 `apply_effort` 遇 `None` 直接 return；全仓库唯一喂 effort 的生产代码是 `doctor.rs:272`。实测：`/effort off` 之后状态栏确实变成 `effort off`，下一轮推理照旧流式出现。后果是 llm 侧 `ReasoningWire` 的三种拼法（`Effort` / `QwenThinking` / `ThinkingSwitch`，都已实现且有单测）在正常 turn 上从未被触发过——**与 system prompt 同一类的第四处「机制建好了没接线」**，Phase 0 的勘察没扫到它，因为勘察是沿着 prompt 走的，不是沿着 effort 走的。prompt 冻结与之一致、不是它引入的问题，但这条记为 design/daemon.md **开放问题 5**：Phase 3 的 `session/set_mode` 必须先回答它（换模式要换工具表、审批策略与 prompt 变体，非重组装不可），而解法不能是「`set_config` 里调 `unload`」——`unload` 对被 watch 的会话直接拒绝，改配置的恰恰是附着中的前端。
 
 **死依赖边删除**：daemon → `hatchery-acp`（源码零引用，crate 本体只有文档注释）从 Cargo.toml 去掉，Cargo.lock 同步少一行，`cargo xtask layering` 仍全绿。
 

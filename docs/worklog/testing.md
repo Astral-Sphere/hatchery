@@ -92,6 +92,27 @@
 
 ## 变更日志
 
+### 2026-10-07 · M1 live 验收执行：三项部分通过，跑出五个清单外缺陷
+
+用真密钥（`.keys/`，只 `source` 不读值）跑完 Phase 5 留下的六项清单。**跑法**：为不碰用户自己在跑的那个 daemon（pid 58947，14:38 起，是 Phase 0 之前的代码），整轮验收在一个隔离世界里做——`XDG_DATA_HOME=/tmp/hatchery-live/data` + `XDG_STATE_HOME=/tmp/hatchery-live/state`（两个变量 `default_data_dir` 与 `StateDir::detect` 都认），TUI 用 tmux 起真 pty（`tmux new-session -d -x 200 -y 45`，驱动脚本 `source` 密钥文件，密钥因此不出现在任何进程的 argv 里），`capture-pane` 取屏。结束时 `daemon stop` + `kill-session`，用户自己的 daemon 未被触碰。
+
+**通过的三项，以及一处意料之外的强证据**：
+
+- doctor 两个 provider 各两轮全 ok（deepseek 默认轮 100 字符推理、off 轮 0；qwen 93/0；finish 都是 `Stop`，usage 的 prompt/completion/reasoning 三项齐全）。
+- `exec` 纯文本退出码 0；`--json` 每行一个事件，类型齐全（`generation_bumped`/`item_started`/`item_finished`/`reasoning_delta`/`text_delta`/`turn_finished`），逐 token 的时间戳递增，是真流式不是收尾一次吐。
+- resume 与回放命中：`exec --session <id>` 以 "attached" 接上，第二轮准确复述了我上一轮的原话与它自己上一条回答的要点；后续追问里它引用了**更早轮次读过的文件行号**（`docs/glossary.md:49`、`docs/architecture.md:148`、ADR-0006/0012），无上下文丢失。
+- **Phase 0 的 prompt 注入在真实 provider 上被证实**（这不是清单项，是意外的收获）：模型自述「我是 Hatchery…这里是只读的聊天模式——我能看、能说清楚该怎么改，但不能替你写文件或执行命令」，并只调 `grep`/`glob`/`read_file`（带行号区间）；被问「你现在处于什么模式」时答「Chat」。这些全部来自 system prompt 的 identity/tool_discipline/safety_gate 三节——注入之前模型无从知道自己是谁、在什么模式、有哪些工具。多轮工具循环（round 1 grep+glob → round 2 read_file ×2 → 终答）也在真实 provider 上跑通了。
+
+**五个清单外缺陷（都带实测证据，不是读码推测）**：
+
+1. **`/effort` 从不进入请求**。TUI 里 `/effort off` 后状态栏变成 `effort off`，紧接着的一轮推理照旧流式出现、工具照旧调用。机制：effort 写进 `session.config_patch`（manager.rs:391），而 daemon 侧**没有任何读者**（读它的只有 CLI 的状态栏：chat.rs:91、tui/mod.rs:506）；`runtime.rs:415` 用 `ChatOptions::new(model)`，`reasoning_effort` 恒为 `None`（message.rs:287），`translate.rs:75` 的 `apply_effort` 遇 `None` 直接 return；provider 配置里的 `reasoning.reasoning_effort`（builtin 给两家都是 High）同样不进 turn。全仓库唯一喂过 effort 的生产代码是 `doctor.rs:272`。**后果**：llm 侧 `ReasoningWire` 的三种拼法（`Effort`/`QwenThinking`/`ThinkingSwitch`，都已实现且有单测）在正常 turn 上从未被触发过。这是与 system prompt 同类的第四处「机制建好了没接线」，Phase 0 的勘察没扫到，因为勘察沿 prompt 走而不是沿 effort 走。
+2. **TUI 不投影历史**。`hatchery chat --session <id>` 接上一个已有两轮的会话，transcript 全空。`SessionLoadResult` 是带 `items: Vec<Item>`（active 分支、oldest first）与 `next_cursor` 的，而 chat.rs:79 的 `SessionView` 只反序列化 `session`——items 从未被读。于是「模型看得到历史、人看不到」。
+3. **TUI 不投影其他客户端的用户消息**。A（tmux TUI）与 B（`exec --session`）同挂一个会话，B prompt 之后 A 屏幕上出现了 B 那轮的回答（`◆ Chat`）与工具事件，但**没有** B 的用户消息。`tui::push_event` 的 `ItemFinished` 分支只处理 `ToolCall`，`UserMessage` 被忽略；本地输入是靠 `push_user` 自己上屏的。所以「两边消息流一致」不成立。缺陷 2 与 3 是同一个缺失机制：**TUI 没有 item 投影路径**，只渲染 delta 加自己的输入。
+4. **`/prompt` 在 TUI 里什么都不显示**。`submit_line` 对 `Effort`/`Model`/`Prompt` 三种命令一律 `call_raw` 发完就丢响应（chat.rs:487-492）；`/prompt` 的全部意义就是把装配出来的 prompt 给人看，而它连一行都不输出。（`/effort`、`/model` 因为状态栏会跟着 `SessionUpdated` 变，还算有反馈。）Phase 0 让这个方法的答案变得可信了（它现在返回 runtime 冻结的那一份），前端却把它扔了。
+5. **detached daemon 的致命启动错误不进日志**。数据库被另一个进程锁住时，`exec` 报 "the daemon did not become ready within 15s; its log is at /tmp/hatchery-live/logs"，而那个 log 是 **0 字节**；同一条错误（`store: database: Locking error: Failed locking file … File is locked by another process`）只有前台 `daemon run` 才打印得出来。ADR-0009 要 fail-loud，这里 fail 了但没 loud——排障的人被指向一个空文件。
+
+**清单本身有一处措辞错误**：「reasoning 默认折叠」与 shipped 默认相反（`ui.show_reasoning` builtin 为 `true`，chat.rs 的兜底也是 `unwrap_or(true)`，而 tui 的单测 `reasoning_folds_and_ctrl_r_expands` 测的是 toggle 机制、不测默认值）。要么改清单措辞、要么改默认值，待裁决。
+
 ### 2026-10-07 · M2 Phase 0：门禁诚实化与不变量 2 的边界
 
 **门禁**：`scripts/ci.sh` 现在有 `invariants` 步（`--profile invariants`，在 `tests` 之后），`check_i18n` 从「返回成功的空操作」变成脚本末尾一行明示未设门禁；`--help` 的步骤表照实写。五条映射到不变量却缺前缀的测试已改名，改完实测 profile 选中 13 条全绿。`hatchery-tools` 进了覆盖率表（85%，实测 95.6%）。`clippy.toml` 补齐 `tokio::fs` 孪生项与四个漏掉的 `std::fs` 项，逐条用 scratch 模块实测过（解析不到的路径是静默忽略，打错字等于留洞）；`tokio::process` 那组故意没加，理由写在 clippy.toml 头部。
@@ -163,13 +184,15 @@ roadmap 的 M2 段重写为 Phase 0–8（依据是那一节的「勘察更正�
 
 **本轮实测计数**（`cargo nextest run --workspace`，2026-10-01）：默认组 **458** 项全绿（另有 1 项崩溃重入入口 skipped）——protocol 109、store 73、daemon 60、llm 50、kernel 47、tools 30、cli 24、capabilities 22、xtask 24、testkit 11、tests 8；invariants 组 8 项。`cargo xtask layering`：13 members、32 build edges + 8 dev edges。
 
-**M1 手动 live 验收清单（评审⑤前由用户执行，结果记本文件）**：
-- [ ] `hatchery doctor --provider deepseek` / `--provider qwen`：两轮探测（默认出推理 / 关掉推理）均 ok；
-- [ ] `hatchery exec "你好，介绍一下你自己"`（真实模型）：流式纯文本、退出码 0；`--json` 每行 item 级事件、含 reasoning；
-- [ ] TUI：`hatchery chat` 发起对话，reasoning 默认折叠、Ctrl+R 展开；`/effort off` 后下一条不再出现推理；
-- [ ] resume：`hatchery exec --session <id> "继续"`（关掉先前终端重开），第二 turn 正常续上历史；
-- [ ] 双前端扇出：两个终端同时 attach 同一会话，一边 prompt，两边消息流一致；
-- [ ] 真实 provider 的回放命中：TUI 中对同一会话追问一轮，观察无上下文丢失（逐字节断言的 mock 已覆盖，live 侧以对话连贯性佐证）。
+**M1 手动 live 验收清单（2026-10-07 执行，deepseek + qwen 真密钥；细节见本日变更日志）**：
+- [x] `hatchery doctor --provider deepseek` / `--provider qwen`：两轮探测（默认出推理 / 关掉推理）均 ok；
+- [x] `hatchery exec "你好，介绍一下你自己"`（真实模型）：流式纯文本、退出码 0；`--json` 每行 item 级事件、含 reasoning；
+- [~] TUI：`hatchery chat` 发起对话，~~reasoning 默认折叠~~、Ctrl+R 展开；~~`/effort off` 后下一条不再出现推理~~ → **两处不成立**：折叠默认是**展开**（`ui.show_reasoning` builtin 为 `true`，chat.rs 的兜底也是 `unwrap_or(true)`），Ctrl+R 两个方向都对；`/effort off` 只改状态栏，推理照旧（缺陷 1）；
+- [~] resume：`hatchery exec --session <id> "继续"`（关掉先前终端重开），第二 turn 正常续上历史 → **模型侧通过、前端侧不通过**：`exec` 以 attached 接上并准确复述上一轮，但 `hatchery chat --session <id>` 的 transcript 是空的（缺陷 2）；
+- [~] 双前端扇出：两个终端同时 attach 同一会话，一边 prompt，两边消息流一致 → **扇出通、消息流不一致**：观察端收到了 prompt 端的 `TextDelta` 与工具事件，但收不到对方的用户消息（缺陷 3）；
+- [x] 真实 provider 的回放命中：TUI 中对同一会话追问一轮，观察无上下文丢失（逐字节断言的 mock 已覆盖，live 侧以对话连贯性佐证）。
+
+**结论：M1 暂不关闭。** 六项里三项部分通过，跑出四个清单外的 M1 缺陷（`/effort` 从不进请求、TUI 不投影历史、TUI 不投影他人的用户消息、`/prompt` 的响应被丢弃）加一条运维缺陷（detached daemon 的致命启动错误不进日志）。修复范围待裁决；裁决与修复记入后续变更日志。
 
 ### 2026-10-01 · M1 Phase 3（daemon 的测试面）
 
