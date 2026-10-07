@@ -35,7 +35,8 @@ usage() {
         "" \
         "  --quick    fmt + clippy + build only" \
         "" \
-        "Steps: toolchain fmt clippy build tests doctests determinism i18n" \
+        "Steps: toolchain fmt clippy build tests invariants doctests determinism" \
+        "Not gated yet: i18n — fluent extraction lands in M4." \
         "Skip locally with SKIP_STEPS=\"doctests determinism\"."
 }
 
@@ -118,11 +119,6 @@ check_determinism() {
     fi
 }
 
-check_i18n() {
-    # Extraction lands in M4 together with the po/ workflow (docs/worklog/platform.md).
-    printf 'i18n extraction check lands in M4 — nothing to verify yet\n'
-}
-
 GATE_START=$(date +%s)
 
 run_step toolchain check_toolchain
@@ -132,9 +128,16 @@ run_step build cargo build --workspace
 
 if [ "$QUICK" != "1" ]; then
     run_step tests cargo nextest run --workspace --profile ci
+    # The invariant suite runs a second time under its own profile, on purpose: `ci` inherits
+    # `default` and so happens to include it, which is how the profile stayed dead configuration
+    # while the tests still ran. A named step is what makes the suite separately reportable — and
+    # what fails if the `invariant_` prefix convention drifts and the filter selects nothing.
+    run_step invariants cargo nextest run --workspace --profile invariants
     run_step doctests cargo test --workspace --doc
     run_step determinism check_determinism
-    run_step i18n check_i18n
+    # Not a gate. Extraction lands in M4 with the po/ workflow (docs/worklog/platform.md); printed
+    # rather than passed, so the absence stays visible instead of counting as a check that ran.
+    printf '\n--- i18n: not gated yet (extraction lands in M4)\n'
 fi
 
 printf '\n======================================================\n'

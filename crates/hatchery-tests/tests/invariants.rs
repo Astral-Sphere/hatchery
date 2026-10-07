@@ -210,7 +210,7 @@ fn invariant_single_instance_race_admits_exactly_one_winner() {
 /// assembling (or the submit has landed but the kernel has not opened the turn yet). Exactly one
 /// is accepted, and the loser's text never reaches the store as a second turn.
 #[tokio::test(flavor = "multi_thread")]
-async fn two_concurrent_prompts_yield_exactly_one_turn() {
+async fn invariant_two_concurrent_prompts_yield_exactly_one_turn() {
     // Five seconds of provider silence: the winner's turn stays open for the whole race.
     let wire = MockWire::replay_sse_after(support::SSE_REASONING_OK, Duration::from_secs(5)).await;
     let daemon = support::daemon_at(&wire).await;
@@ -307,7 +307,7 @@ async fn two_concurrent_prompts_yield_exactly_one_turn() {
 /// results are in the store — killing work because the last frontend blinked would throw away a
 /// paid-for turn.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_turn_with_no_subscriber_runs_to_completion_and_persists() {
+async fn invariant_an_unwatched_turn_runs_to_completion_and_persists() {
     let wire = MockWire::replay_sse(support::SSE_REASONING_OK).await;
     let daemon = support::daemon_at(&wire).await;
     let creator = ClientProbe::attach(&daemon).await;

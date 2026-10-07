@@ -162,7 +162,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn events_below_the_session_generation_are_dropped() {
+    async fn invariant_events_below_the_session_generation_are_dropped() {
         // Invariant 1's server half: after a reassembly bumps the generation, a publish that was
         // already in flight from the old runtime must not interleave into the new stream.
         let hub = LiveHub::new();

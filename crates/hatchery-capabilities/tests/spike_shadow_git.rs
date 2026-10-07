@@ -461,7 +461,7 @@ fn invariant_shadow_git_never_touches_user_repo() {
 /// tree. Planting one in the user's workspace would corrupt a non-git workspace and collide with a
 /// real `.git` directory, so this pins the `set_workdir(.., false)` route instead.
 #[test]
-fn no_gitlink_is_planted_in_the_user_workspace() {
+fn invariant_no_gitlink_is_planted_in_the_user_workspace() {
     let plain = Sandbox::new(false);
     assert!(!plain.workspace.join(".git").exists());
     plain.snapshot("checkpoint");
@@ -538,7 +538,7 @@ fn restore_rolls_back_tracked_files_and_leaves_never_tracked_ones_alone() {
 /// The `--purge` half of `RestoreOptions`: explicit, approval-gated, and it does remove files that
 /// no checkpoint ever tracked.
 #[test]
-fn purge_restore_also_removes_never_tracked_files() {
+fn invariant_purge_restore_also_removes_never_tracked_files() {
     let sandbox = Sandbox::new(false);
     sandbox.write("file.txt", "version 1\n");
     let first = sandbox.snapshot("checkpoint 1");

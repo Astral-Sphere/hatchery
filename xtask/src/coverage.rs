@@ -3,7 +3,7 @@
 //!
 //! llvm-cov reports per *file*; the mapping back to crates is by path prefix
 //! (`crates/<name>/…`), and a crate's number is its executable lines summed, not an average of
-//! file percentages. Enforced crates are the product core (kernel/store/llm/capabilities at
+//! file percentages. Enforced crates are the product core (kernel/store/llm/capabilities/tools at
 //! ≥ 85%, protocol/daemon at ≥ 80%, cli at ≥ 60%); gui is exempt this milestone and dev-only
 //! crates (testkit, hatchery-tests, xtask) are not gates. Coverage is a metric, not a goal —
 //! `--report-only` prints the table and skips the refusals.
@@ -19,6 +19,9 @@ pub const THRESHOLDS: &[(&str, u8)] = &[
     ("hatchery-store", 85),
     ("hatchery-llm", 85),
     ("hatchery-capabilities", 85),
+    // M2's four new tools all land here, and the seam ban that keeps them honest is compile-time
+    // only: what a tool *does* with an approved call is checked by these tests.
+    ("hatchery-tools", 85),
     ("hatchery-protocol", 80),
     ("hatchery-daemon", 80),
     ("hatchery-cli", 60),
@@ -280,7 +283,7 @@ mod tests {
     }
 
     #[test]
-    fn the_threshold_table_covers_the_seven_gated_crates() {
+    fn the_threshold_table_covers_the_gated_crates() {
         let names: Vec<&str> = THRESHOLDS.iter().map(|(name, _)| *name).collect();
         assert_eq!(
             names,
@@ -289,6 +292,7 @@ mod tests {
                 "hatchery-store",
                 "hatchery-llm",
                 "hatchery-capabilities",
+                "hatchery-tools",
                 "hatchery-protocol",
                 "hatchery-daemon",
                 "hatchery-cli",
