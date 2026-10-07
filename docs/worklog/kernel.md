@@ -8,25 +8,47 @@
 
 **M0b 完成（2026-09-28），评审后的两轮修复已入库（2026-09-29 / 2026-09-30）**：trait 全家、Turn 状态机、item 提交与审批往返全部落地；契约缺口（状态机的边、启动期取消、失败 turn 的 usage、审批答复校验）与两处「结构上不可能失败」的测试都已修完，工具进度与 delta 热路径的实现缺陷也已处理。设计文档 `docs/design/kernel.md` 已按实现重写。
 
+**M1 代码完成（2026-10-01），kernel 侧只动了三处**：`RateLimited` 透传（Phase 1）、`TurnInput { turn, content }`（daemon 铸币、kernel 沿用）、`AgentHandle::turn_running()` 信号。**状态机、审批往返、取消语义、`ToolStatus` 全部是 M0b 的既有实现，M1 未改**：四个终态由 kernel 写入（`Failed`/`Completed`/`Denied`/`Cancelled`，agent.rs:610/622/629/635-637），`await_approval`（agent.rs:721，未被提供的答复在 :761 被拒并记 warning）校验答复必须是被提供过的选项之一，所以硬门的 `once_only()` 不可能被 `AllowAlways` 答复放行。**这条检查在生产代码里在，但我没找到钉住它的测试**（2026-10-07 勘察：全仓库 `once_only`/`is_hard_gate` 零生产消费者，`ScriptedToolHost::approval_for`（testkit/src/tools.rs:175）返回测试自己注册的请求，而没有一个 kernel 测试注册过收窄了 `options` 的请求）——M2 Phase 2 的硬门工作要一并补。
+
+**M2 对 kernel 的增量只有一处**（Phase 1，**D13**）：`ToolInvocation` 带出工具收集到的检查点，kernel 在 ToolResult item **之前**追加 Checkpoint item。上下文组装的 token 预算 v1 与 `ToolOutput::Spilled` 都排 **Phase 4**（同一个问题的两半）。两个原标「M2 决定 / M2 定」的开放问题已在本里程碑内裁决完毕（1 = 不做，4 = 顺延 M5，见「开放问题」），**决定本身即交付**。
+
 ## 待办
 
 - [x] (M0) 解开 L0↔L1 依赖环：kernel 只暴露窄接口 **`ToolHost`**；`Tool`/`ToolCtx`/`FsBackend`/`TerminalBackend`/`ApprovalGate` 归 capabilities
 - [x] (M0b) trait 全家定义（LlmProvider/ToolHost/HistorySource/EventSink）+ StreamEvent/ChatOptions/Message 类型
 - [x] (M0b) Turn 状态机实现 + fake provider 脚本化单测（含 Interrupt 在各状态的行为矩阵）
 - [x] (M0b) Turn Tool Snapshot 最小版：turn 开始时 `snapshot()` 冻结一次（完整语义 M2）
-- [ ] (M2) 上下文组装 v1（token 预算最简版：估算 + 最旧 round 裁剪）——`HistorySource::view` 已给出接缝（2026-10-03 由 M1 改标 M2：M1 装配是纯机械映射、不做预算，见 daemon 的 `StoreHistory`；工具大输出进树后才是刚需）
-- [ ] (M1) max_rounds 熔断与 TurnCompletion 语义在真实对话下验证（脚本化验证已做）
-- [ ] (M2) ToolOutput::Spilled 路径（形状已就位，阈值与落盘未定）
+- [ ] (M2 · Phase 4) 上下文组装 v1（token 预算最简版：估算 + 最旧 round 裁剪）——`HistorySource::view` 已给出接缝（2026-10-03 由 M1 改标 M2：M1 装配是纯机械映射、不做预算，见 daemon 的 `StoreHistory`；工具大输出进树后才是刚需）。**与 `ToolOutput::Spilled` 同排 Phase 4**：两者是「工具输出太大」这同一个问题的两半，来源是 shell 与 web_fetch
+- [ ] (M2 · Phase 0，收口 M1) max_rounds 熔断与 TurnCompletion 语义在真实对话下验证（脚本化验证已做：`the_default_fuse_is_finite_and_generous` state.rs:178、`a_fuse_already_at_its_limit_ends_the_turn_without_a_provider_call` tests/turn_state_machine.rs:1451）
+- [ ] (M2 · Phase 4) ToolOutput::Spilled 路径（形状已就位、**全仓库无人构造**；阈值与落盘位置是 **D12**）
+- [ ] (M2 · Phase 1) **D13**：`ToolInvocation`（tools.rs:22-27）带出工具收集到的检查点，kernel 在 **ToolResult item 之前**追加 Checkpoint item，链变成 `… → ToolCall → Checkpoint → ToolResult`——M1 的 `TurnInput { turn, content }` 之后第一处 kernel 改动
+- [ ] (M2 · Phase 0) **D15**：system prompt 经 `HistorySource::view()` 以 system `Message` 进请求（`ChatOptions` 无 system 字段，message.rs:257-279，也不该有）。**kernel 侧无需改动**——`Message::system`（message.rs:56）与 llm 的 `Role::System => WireMessage::system(text)`（translate.rs:134）都已就位；要动的是 daemon 的 `StoreHistory` 与**不变量 2 的边界**（重划为只管分支历史，system prompt 是可复现的派生态、由 `prompt/render` 的 golden 单独钉）
 - [ ] (M5) compaction 钩子
 
 ## 开放问题
 
-见设计文档末尾 4 条（工具并行、SubAgent 原语归属、compaction 触发、工具级重试上限）。解决过程记录于此：
+见设计文档末尾 4 条（工具并行、SubAgent 原语归属、compaction 触发、工具级重试上限）。**1 与 4 已于 2026-10-07 在 M2 内裁决**（1 = 不做、4 = 顺延 M5，见下），2 与 3 仍开放。解决过程记录于此：
 
+- 2026-10-07 **开放问题 1（一轮多 tool call 并行，原标「M2 决定」）→ 裁决为不做**。原话把「M2 决定」写成了待办，其实**决定本身就是交付物**。七处结构阻碍：① 执行是串行 `for request in requests { … }`（agent.rs:432-443）；② item 链只有单亲指针 `self.tail`、由 `commit()` 推进（agent.rs:901-910），而每个调用提交两个 item，并行提交要么需要确定性排序、要么需要同父多子——后者与「一次只开一个 item，树保持为链」的纪律（agent.rs:810-813 的注释、design/kernel.md §7）直接冲突；③ `AwaitingApproval { request_id }` 是单槽（state.rs:30-33）；④ `self.commands.recv()` 任一时刻只有一个消费者（stream / tool / approval 三个 select 互斥）；⑤ 每次 `invoke_tool` 独占自己的进度通道与 select，含「返回前排空」那个特例（agent.rs:659-707）；⑥ 三条测试会被打破——`two_calls_in_one_round_are_each_approved_separately`（tests/turn_state_machine.rs:641）钉住结果顺序与精确状态序列，`the_documented_event_sequence_is_emitted_exactly`（:1044）与 `the_same_script_produces_the_same_event_sequence_twice`（:1299）钉住精确事件序列；⑦ `ToolHost`（tools.rs:51-89）不带 `parallel_safe` 一类的元数据，**决策的输入本身也不存在**。收益是延迟，代价是重做提交序与确定性纪律——不划算。
+- 2026-10-07 **开放问题 4（`max_tool_retries`）→ 顺延 M5**。全仓库 grep `max_tool_retries` 只命中 `docs/design/kernel.md` 的开放问题 4 与 roadmap 的顺延表（外加这两条记录本身）；「可重试的工具失败」既没有语义也没有第一个消费者，正是 ADR-0009 反预拆分刹车的适用场景。`TurnLimits` 今天只有 `max_rounds: u32`（默认 100，`with_max_rounds` 构造器，state.rs:63-80），由 `the_default_fuse_is_finite_and_generous`（state.rs:178）与 `a_fuse_already_at_its_limit_ends_the_turn_without_a_provider_call`（tests/turn_state_machine.rs:1451）钉住。
 - 2026-09-28 `ToolCtx` 的归属问题（原设计让 kernel 引用 capabilities 的 trait，脚手架一建就撞出环）→ 用 `ToolHost` 窄接口解决。附带好处：kernel 的测试不需要任何 backend fake，只要一个 `ScriptedToolHost`（testkit 已交付）。
 - 2026-09-28 M0b 落地时又定了几处（设计文档 §5/§7 有完整理由）：`ToolHost::summarize`（摘要需要工具语义，kernel 不该解析参数）、`ToolInvocation { output, is_error }`（「跑失败」与「没跑成」是两件事）、进度改走 **mpsc 通道**（同步回调和「await 工具的同时转发进度」不可兼得，同一 select 循环也让中断能取消工具）、审批改由 **kernel 发起 / daemon 应答**的 id 往返（capabilities.md 的 `ApprovalOutcome` 并入 `ApprovalOption`）。
 
 ## 变更日志
+
+### 2026-10-07 · M2 重新规划对账
+
+roadmap 的 M2 段按一次全仓库勘察重写为 Phase 0–8，本 worklog 随之对账。**kernel 在 M2 只改一处**（Phase 1，D13）：`ToolInvocation`（tools.rs:22-27）带出 `LocalFs` 写前收集的检查点，kernel 在 ToolResult item **之前**追加 Checkpoint item。理由是它已经在造 ToolCall/ToolResult item，用同一套机器顺序天然正确，而链变成 `… → ToolCall → Checkpoint → ToolResult` 是安全的——工具结果靠 `ToolResult.call: ItemId` 与其调用配对，不靠父子关系（design/kernel.md §7 的「一次只开一个 item」纪律不受影响，Checkpoint item 是在 ToolResult 之前**串行**提交的完整 item）。这是自 M1 的 `TurnInput { turn, content }` 以来第一次动 kernel 的公开形状。
+
+**两个开放问题在 M2 内裁决完毕**（原话写「M2 决定」/「M2 与工具层一起定」，所以决定本身即交付）：一轮多 tool call 并行 → **不做**（七处结构阻碍见「开放问题」）；`max_tool_retries` → **顺延 M5**（「可重试失败」没有语义也没有第一个消费者，ADR-0009 反预拆分）。design/kernel.md 的开放问题 1/4 与 §5 的「`parallel_safe` 只读工具的并行是 M2+ 优化」一句已按此改写。
+
+**待办重新挂到 Phase**：上下文组装 v1 与 `ToolOutput::Spilled` 同排 **Phase 4**（2026-10-03 的改标只说了「M2」；roadmap 把两者放在一起，因为它们是「工具大输出」这同一个问题的两半，来源是 shell 与 web_fetch）；max_rounds 熔断的真实对话验证归 **Phase 0**（M1 收口）。
+
+**一处此前没记进本 worklog 的事实**：审批答复校验（agent.rs:761「答复必须是被提供过的选项之一」，2026-09-30 那条修复加的）**没有测试钉住它**——`once_only`/`is_hard_gate` 全仓库零生产消费者，kernel 的测试也没有一个注册过收窄 `options` 的 `ApprovalRequest`。roadmap 的更正 7 把这件事挂在 capabilities/daemon 侧（路径硬门 + `invariant_project_config_cannot_disable_hard_gates`），但缺的那条用例形状上是 kernel 的（答复校验住在 `await_approval` 里）。
+
+**根因比「没人写这条测试」更硬一层（2026-10-07 复核）**：`ScriptedToolHost::requiring_approval(name, risk)`（testkit/src/tools.rs:88-94）内部用 `ApprovalRequest::new(name, …, risk)` 造请求，而 `new` 恒取 `ApprovalOption::ALL`（protocol/src/approval.rs:101，其中 :106 是 `options: ApprovalOption::ALL.to_vec()`）——**这个 fake 在 API 层面就表达不出一个收窄了 `options` 的请求**。所以那条分支不是「暂时没测」，是**结构性不可测**：想测它必须先给 `ScriptedToolHost` 加一个能接收现成 `ApprovalRequest`（或选项表）的构造器。这也解释了为什么 2026-09-30 那轮「先写复现测试再修」的纪律在这条上没兑现——fake 造不出复现形状，而当时没有人为它扩 API。
+
+排在 **Phase 0**（不是 Phase 2）：项目纪律 #3 是「Bug 修复必附回归测试」，这条修复违反了它；而硬门整个压在「答复必须是提供过的选项之一」上（`once_only()` 之所以不可绕过，全靠这条检查），一个承重且不可测的分支与「从未被调用的 `invariants` profile」是同一类问题——门禁在宣称它没有保证的东西。改动很小：testkit 加一个构造器 + kernel 加一条用例（注册 `once_only()` 请求 → 以 `AllowAlways` 答复 → 断言被忽略且 turn 仍在等）。Phase 2 的路径硬门与 `invariant_project_config_cannot_disable_hard_gates` 建在这条之上。
 
 ### 2026-10-01 · TurnInput 携带调用方 TurnId（评审⑤自查轮）
 

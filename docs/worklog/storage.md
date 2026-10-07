@@ -8,6 +8,12 @@
 
 **M0b 完成（2026-09-28），评审后的两轮修复已入库（2026-09-29 / 2026-09-30）**：schema v1 迁移、writer actor、`SessionStore` 全量实现（含分支操作与 JSONL 导出）、属性测试与 kill -9 崩溃恢复测试全部落地；评审发现的契约缺口（错误分类、事务边界、导出原子性、迁移死支）与测试可信度问题已修完。设计文档 `docs/design/storage.md` 已按实现重写。
 
+**M1 期间 trait 又长了两个方法**：`bump_generation`（2026-10-01，Phase 3）与 `open_turns`（2026-10-03，de8b743；daemon 启动时把没人再跑的 turn 行收成失败，manager.rs:113，store 侧直接测试 `open_turns_lists_only_open_turns_across_sessions`）。`open_turns` 此前**没有变更日志条目**，2026-10-07 对账时补记。设计文档 §1 的 trait 代码块与 §3 的 `StoreCmd` 列表都只列到 M0b 的形状，本次已补齐。
+
+**分支三原语是 M0b 的交付物，不是 M2 的增量**：`edit_fork`（actor.rs:744-769）、`switch_branch`（:771-785）、`delete_branch`（:787-841）、`branch_tree` 全部实现，有专测 + 属性测试对拍独立 `ReferenceTree` + kill -9 探针。M2 在 store 侧的增量是：rewind 三 scope 的**组合逻辑**（Phase 3）、`checkpoints` 与 `approval_rules` 两张表的 **API 层**（Phase 1 / Phase 2）、以及级联删除驱动的**影子 git commit GC**（Phase 1）。
+
+**`checkpoints` 与 `approval_rules` 两张表零 Rust 代码**（2026-10-07 勘察）：无 `StoreCmd` 变体、无 trait 方法、无 `sql.rs` 行转换，**也没有一行测试写入过它们**——引擎 spike 只断言两张表存在（spike_engine.rs:276-277）与 checkpoint 随 item 级联删除（`delete_branch_cascades_and_refuses_while_head_is_inside`，:395 起，断言在 :440-444）。两张表都在 v1 schema 里，schema 版本仍是 1、`MIGRATIONS`（migrations.rs:17）只有一项，所以 **M2 不需要新迁移**，缺的只是 API 层。读路径今天仍全部串行经单写者 actor（正确优先）；只读连接池 2026-10-03 已由 M1 改标 **M3**。
+
 ## 待办
 
 - [x] (M0) **引擎 spike（实测，勿靠文档推断）**：turso 0.7.2 全门槛实测 → 选中；结论落 ADR-0010，测试沉淀为常驻回归（见下「实测记录」）
@@ -17,8 +23,14 @@
 - [x] (M0b) EditFork / SwitchBranch / DeleteBranch（内存 BFS 收子树 + active_head 校验 + 级联删 + **数量交叉校验**）
 - [x] (M0b) kill -9 崩溃测试（**测试二进制自重入**，不新增 target；五种 StoreCmd 各一次 + 恢复后仍可用）
 - [x] (M0b) ExportJsonl（从 M2 提前：逃生通道成本低、测试便宜）
-- [ ] (M3) 只读连接池与 spawn_blocking 读路径接线（2026-10-03 由 M1 改标 M3：M1 未排期此项，读一直走单写者 actor；等读吞吐成为实测瓶颈再做）
-- [ ] (M2) checkpoints 表与 CheckpointStore 联动（级联删除时 GC；checkpoint 的级联已由引擎门槛测试锁定）
+- [ ] (M3) 只读连接池与 spawn_blocking 读路径接线（2026-10-03 由 M1 改标 M3：M1 未排期此项，读一直走单写者 actor；等读吞吐成为实测瓶颈再做）。**design/storage.md §3 与开放问题 6 此前仍写 M1，2026-10-07 已改为 M3**
+- [ ] (M2 · Phase 1) checkpoints 表与 CheckpointStore 联动（级联删除时 GC；checkpoint **行**随 session/item 级联删已由引擎门槛测试锁定，但影子仓库里的 **commit 对象不会自己消失**，删分支要显式驱动 git 侧 GC）
+- [ ] (M2 · Phase 1) `checkpoints` 表的 API 层：记录一行 + 按 workspace 列举（供跨会话的预算核算与 GC）。表已在 v1 schema 里，**M2 不需要新迁移**
+- [ ] (M2 · Phase 1) 孤儿影子仓库 GC（设计文档开放问题 3，「会话删了但影子仓库残留」）。可行是因为 checkpoint 行随会话级联删——「workspace X 还有行吗？」就是那个判据
+- [ ] (M2 · Phase 1) **D9**：检查点超预算时的行为（GC 最旧 vs 拒写）
+- [ ] (M2 · Phase 2) `approval_rules` 的读写 API，随 **D8** 定的 scope/matcher/decision 文法与求值顺序。表只有 `id/scope/matcher/decision/created_at`——**无排序列、无 enabled 列、`scope` 是裸 TEXT、无 session 外键**，所以求值顺序与匹配语义必须由 D8 定义，不能指望从 schema 读出来
+- [ ] (M2 · Phase 3) rewind 三 scope 的组合逻辑（store 侧今天只有原语）：`Both` 的顺序是**先 restore 代码、成功再移 head**（restore 失败绝不能已经把历史移走）；restore 前的安全快照记进 `checkpoints` 表、`item_id = NULL`、**不建 item**（它是 undo-of-undo，不属于对话历史——该列可空正是为此留的）
+- [ ] (M2 · Phase 7) `bump_generation` 在 store crate 内的直接测试（现仅 daemon 侧调用方覆盖：manager.rs:529 / :732）
 - [ ] (M5) compaction 的 span 解析：`ItemIdRange` 是**位置**语义，要在树遍历里按链定位两端点（protocol 侧不提供 `contains`，理由见 worklog/protocol.md 2026-09-30 条）
 - [ ] (M5) 导入
 
@@ -74,11 +86,26 @@ API 怪癖（写 store 实现时一定会踩）：
 
 ## 开放问题
 
-见设计文档末尾 5 条（payload 二级索引、孤儿仓库 GC、断电级 durability 无证据、10k items 加载策略）。选型问题已关闭。解决过程记录于此：
+见设计文档末尾**仍开放的 5 条**（payload 二级索引、孤儿影子仓库 GC、断电级 durability 无证据、10k items 加载策略、只读连接池）。选型问题已关闭。解决过程记录于此：
 
+- 2026-10-07 **孤儿影子仓库 GC（开放问题 3）→ 排定 M2 Phase 1**，并确认它**可判**：`checkpoints.session_id` 带 `ON DELETE CASCADE`（v1.sql:55-63），删会话后该会话的行一行不剩，所以「`workspace = X` 还有行吗？」就是「这个影子仓库还有没有主」的判据，不必在文件系统上反向扫描去猜。
+- 2026-10-07 **只读连接池（开放问题 6）→ M3**：2026-10-03 已把待办由 M1 改标 M3，但设计文档 §3 的「M1 才接只读连接池」与开放问题 6 的「worklog 排在 M1」当时没跟上，本次一并改为 M3。读全部串行经 writer actor，正确优先。
+- 2026-10-07 **`checkpoints` 表不是 rewind 的主索引**（此前文档把它写得像主索引）。rewind 定位 commit 走 item 链：`ItemKind::Checkpoint { commit_id, kind }` 自己带着 commit id，`rebuild_chain` → 定位 `target_item` → **向后**扫第一个 Checkpoint item → 读 `commit_id` → restore。表的职责只剩**跨会话的预算核算与 GC**；`item_id` 可空（v1.sql:58）是为了让 restore 前的安全快照能记进去而不建 item。完整理由见 design/storage.md §5。
 - 2026-09-28 选型关闭：候选优先级 turso > libsql(`features=["core"]`) > rusqlite(bundled)。turso 首轮门槛全过（唯一缺口 `WITH RECURSIVE` 有廉价绕法），故未评估后两者。**libsql 0.9.30 保留为第一顺位替代**——若 turso 出现阻塞性回归就切回，并把 ADR-0010 标 superseded。选 turso 的决定性理由之一是纯 Rust：CI 三平台（含 windows MSYS2 ucrt64 + `x86_64-pc-windows-gnu`）不必背 mingw。
 
 ## 变更日志
+
+### 2026-10-07 · M2 重新规划对账
+
+roadmap 的 M2 段按一次全仓库勘察重写为 Phase 0–8，本 worklog 与 design/storage.md 随之对账。四件事：
+
+**① 补记一个从没进过变更日志的方法。** `open_turns`（store.rs:123）是 2026-10-03 的 de8b743「List the turns a crash left open」加的：daemon 启动时一次读出所有还没收尾的 turn 行，`recover_crashed_sessions`（manager.rs:112）逐条按失败关掉——重启后一行「还在跑」的 turn 描述的是没人在做的工作。一次读全是刻意的：恢复跑在任何 runtime 存在之前，答案不会在它脚下变。store 侧有直接测试 `open_turns_lists_only_open_turns_across_sessions`（tests/session_store.rs:920）。设计文档 §1 的 trait 代码块此前既没有它也没有 `bump_generation`，本次补齐；§3 的 `StoreCmd` 注释列表同样缺 `OpenTurns` 与 `BumpGeneration`，也补齐。
+
+**② 设计更正：rewind 不靠 `checkpoints` 表定位 commit。** 文档此前把那张表写得像 rewind 的主索引，实际不需要：`ItemKind::Checkpoint { commit_id, kind }` 自己带着 commit id，而 `ItemKind::is_conversation()`（protocol/src/item.rs:175-185）**不含** Checkpoint，所以检查点 item 永远不会进模型请求。Code scope 的实现是「`rebuild_chain(session, old_head)` → 定位 `target_item` → **向后**扫第一个 Checkpoint item → 读它的 `commit_id` → restore」。这条规则的正确性靠一件事：pre-write 快照恰好等于 target_item 时刻的工作区状态，所以**扫不到就是 target_item 之后没有写过东西，Code rewind 是 no-op**。`checkpoints` 表的职责因此只剩跨会话的预算核算与 GC；`item_id` 可空正是为了让 restore 前的安全快照记进表里而**不建 item**（它是 undo-of-undo，不属于对话历史）。
+
+**③ D13 定案：检查点怎么成为 item。** `ToolCtx` 加一个检查点收集器，`LocalFs` 在写之前 push；`ToolInvocation`（kernel 类型）把收集到的 `Vec<Checkpoint>` 带出来；**kernel 在 ToolResult item 之前追加 Checkpoint item**，链变成 `… → ToolCall → Checkpoint → ToolResult`。这样做安全，是因为工具结果靠 `ToolResult.call: ItemId` 与其调用配对，不靠父子关系。daemon 的 HubSink 在 Checkpoint item 落库后补写 `checkpoints` 行；**行写失败只记日志**——item 里已经有 commit_id，rewind 可以回退到走链。store 在这一阶段只出「记一行 + 按 workspace 列举」的 API。
+
+**④ 里程碑与措辞更正。** 只读连接池：待办 2026-10-03 已由 M1 改标 M3，但设计文档 §3 的「M1 才接只读连接池」与开放问题 6 的「worklog 排在 M1」没跟上，本次都改成 M3。孤儿影子仓库 GC（开放问题 3）排定 M2 Phase 1。级联删分支要**同时驱动影子 git 的 commit GC**——原待办「checkpoints 表与 CheckpointStore 联动（级联删除时 GC）」留在 M2 Phase 1，措辞改明确：数据库的级联已由引擎门槛测试锁定，git 侧的对象不会自己消失。**两张表 M2 都不需要新迁移**（schema 版本仍是 1，`MIGRATIONS`（migrations.rs:17）只有一项）。
 
 ### 2026-10-01 · `bump_generation`（M1 Phase 3）
 

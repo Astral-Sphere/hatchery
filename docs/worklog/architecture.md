@@ -6,9 +6,11 @@
 
 ## 当前状态
 
-**M1 代码完成（2026-10-01）**：Phase 1–5 全部落地（llm adapter + 能力表、capabilities/tools、daemon 全栈、cli TUI/exec、e2e 与不变量收口），评审⑤自查轮的加固已入库；本地 `./scripts/ci.sh` 全绿、覆盖率门槛全过（数字见 worklog/testing.md 日期化条目）。待评审⑤与手动 live 验收后收口；三平台 CI 自 M0 收口后尚未见过新代码（push 由用户执行）。M0 历史结论：M0b 三 crate + testkit 于 2026-09-28 落地、评审后两轮修复（09-29/09-30）入库，M0 DoD 达成（门禁三平台绿 + kill -9 崩溃恢复 + 三 spike 落档），细节见下文变更日志。
+**M1 代码完成（2026-10-01）**：Phase 1–5 全部落地（llm adapter + 能力表、capabilities/tools、daemon 全栈、cli TUI/exec、e2e 与不变量收口），评审⑤自查轮的加固已入库；本地 `./scripts/ci.sh` 全绿、覆盖率门槛全过（数字见 worklog/testing.md 日期化条目）。手动 live 验收进行中——已产出 2026-10-04/10-05 三轮 TUI 修正，worklog/testing.md 的六项清单尚未勾选；**M1 的收口归入 M2 Phase 0**。三平台 CI 自 M0 收口后尚未见过新代码（push 由用户执行）。M0 历史结论：M0b 三 crate + testkit 于 2026-09-28 落地、评审后两轮修复（09-29/09-30）入库，M0 DoD 达成（门禁三平台绿 + kill -9 崩溃恢复 + 三 spike 落档），细节见下文变更日志。
 
-仓库现状：`crates/`（11 crate，其中 3 个已实现）+ `xtask/` + `scripts/ci.sh` + `.github/workflows/{pr,nightly}.yml` + `docs/`。
+**M2 已于 2026-10-07 重新规划**（见 [../roadmap.md](../roadmap.md) 的 M2 节）：一次三路并行的全仓库勘察发现原 M2 段是按 M0/M1 的自述写成的，与代码有 16 处不符，阶段划分重写为 Phase 0–8，跨方向的更正记在本文件下面的日期条目里。
+
+仓库现状：`crates/`（12 个 crate = 10 个产品 crate + dev-only 的 `hatchery-testkit` 与 `hatchery-tests`）+ `xtask/` + `scripts/ci.sh` + `.github/workflows/{pr,nightly}.yml` + `docs/`。产品 crate 里 8 个已实现（protocol / kernel / store / llm / capabilities / tools / daemon / cli），`hatchery-acp` 与 `hatchery-gui` 仍是骨架（各只有文档注释，实现分别排 M3 与 M4）。（原文写「11 crate，其中 3 个已实现」是 M0b 时点的快照，2026-10-07 更正。）
 
 ## 待办
 
@@ -34,6 +36,28 @@
 3. ~~references/ 目录的 license 与体积~~ → **已由用户自行解决**：`.gitignore` 里的 `/references` 使其不入库，只保留 `references.md` 的分析结论。
 
 ## 变更日志
+
+### 2026-10-07 · M2 重新规划：跨方向的勘察更正
+
+M2 开工前做了一次全仓库勘察（三路并行：capabilities/tools、kernel/store、daemon/cli/protocol/tests），逐条对着代码复核后重写了 roadmap 的 M2 段（Phase 0–8 + 决策点 D8–D18 + 顺延表）。方向内的细节在各自的 worklog，这里只记跨方向的部分。
+
+**门禁有两处口径不实（Phase 0 修）。** ① roadmap 的 M0 DoD 写「nextest 默认组与 **invariants 组**」，而 `--profile invariants` 在 `scripts/ci.sh`、`pr.yml`、`nightly.yml` 里**从未被调用过**——ci.sh:134 只跑 `--profile ci`，nightly 只跑 slow 与 gui。不变量测试确实进了 PR 门禁（`ci` 继承 `default`，过滤器只排除 live/slow/gui），但那是巧合而不是设计：没有一个可单独报告或阻塞的门禁，而 testing.md §5 映射到不变量、却没有 `invariant_` 前缀的 5 条测试（含 `two_concurrent_prompts_yield_exactly_one_turn`）一旦真去跑那个 profile 就会被静默丢掉。② `check_i18n`（ci.sh:121-124）是一条 `printf` 空操作（"i18n extraction check lands in M4 — nothing to verify yet"），一直被算作通过的门禁步骤。
+
+**两条不变量的实际状态与文档不符。** 不变量 4 的编译期门禁有洞：`clippy.toml` 禁了 `std::fs::*` 与 `std::process::Command`，**没禁 `tokio::fs::*` 与 `tokio::process::*`**——而 hatchery-tools 依赖 tokio、`LocalFs` 自己就用 tokio::fs，所以工具里写一句 `tokio::fs::write` 就绕过了整条纪律（另漏 `std::fs::{remove_dir, read_link, hard_link, set_permissions}`）。不变量 5 则**在任何形态下都没有测试**：testing.md 点名的 `invariant_project_config_cannot_disable_hard_gates` 全仓库零命中，唯一沾边的是 `RiskLevel::is_hard_gate()` 这个值类型谓词的两条单测，生产代码无人调用它——而「硬门测试全绿」正是 M2 的 DoD 之一。
+
+**`hatchery-acp` 是死依赖边。** `crates/hatchery-daemon/Cargo.toml:21` 声明了它，daemon 源码零引用（`hatchery_acp` 在 `src/` 下零命中），crate 本体是 13 行文档注释 + 「implementation lands in M3」。`cargo xtask layering` 把它算作一条 build edge，于是分层契约在替一个不存在的接线背书。Phase 0 摘掉这条边（M3 真接线时再加回来）；这与 ADR-0009 的反预拆分刹车一致——依赖边也是预拆分。
+
+**同类问题：三处文档在宣称不存在的东西。** daemon 的 `src/lib.rs:10` 与 Cargo `description` 都写「profile-based assembly」，而 `Profile` 类型不存在（grep 只命中那一条文档注释），design/daemon.md §3.1 的四个 profile 一个都没实现；`crates/hatchery-capabilities/README.md` 宣称有影子 Git 检查点与注册句柄；`crates/hatchery-tools/README.md` 列了七个工具（实际三个）。Phase 0 一并更正——「README 比代码乐观」是接手者最贵的那种误导。
+
+**ADR-0006 的枚举拼写与协议不一致，按约定不改 ADR。** ADR-0006 写 `RewindScope::{Conversation, Code, ConversationAndCode}`，协议的实际变体是 `{Conversation, Code, Both}`（`hatchery-protocol/src/session.rs:289-300`，ADR-0003 与 design/protocol.md 的修正表用的也是 `Both`）。ADR 一经 accepted 不修改，**以协议为准**，此处留痕。
+
+**文档计数纪律照 2026-09-30 的裁决执行：删数字，不改数字。** design/protocol.md §6、design/testing.md §3.1 与 worklog/protocol.md 里写的 fixture 数「62」已经过期（实数是 79），但按裁决这类数字本就不该出现在散文里——所以是把计数删掉，而不是更新成一个新的、下次照样过期的数。
+
+**分层图在 M2 不变。** M2 不新增 crate（反预拆分刹车：`CheckpointStore` 住 capabilities，`DaemonApproval` 住 capabilities，工具住 tools，模式装配住 daemon，都是既有归属）。新增的外部依赖待各自决策点定：`portable-pty`（D10，spike 提前到 Phase 1 并行做；证据是 codex 用 `portable-pty = "0.9.0"` 且在 Windows 侧额外挂 `winapi` 的 jobapi2/Job Object 才能保证杀进程不留孤儿——那正是 windows-gnu CI 上「cancel 后无孤儿进程」的坑）、diff 库（D11，atomcode 用 `similar = "2"`）、web_fetch 的 HTTP client 与 HTML→Markdown（D17，注意 `wiremock` 是 testkit 专属、明确「never of a product crate」）。`git2` 已在 workspace 与 capabilities 的依赖里，只是 `src/` 下零使用——spike 的 11 项门槛是唯一消费者，Phase 1 转正。
+
+**kernel 在 M2 只改一处。** `ToolInvocation { output, is_error }` 增加携带检查点的能力，kernel 在 ToolResult item **之前**追加 Checkpoint item（决策点 D13，理由与链形状见 worklog/kernel.md 与 design/storage.md）。这是自 M1 的 `TurnInput { turn, content }` 以来第一次动 kernel 的公开形状。另两个「M2 决定」的开放问题在本里程碑内**裁决为不做**：一轮多 tool call 并行（7 处结构阻碍 + 会打破三条确定性/审批测试）与 `max_tool_retries`（「可重试失败」还没有第一个消费者）。
+
+**两处顺延（用户裁决）。** hub coalescing + replay window → M3：`is_coalescable` 只含 text/reasoning delta，而 M2 新增的事件量主要来自 `ToolCallProgress`（不可合并），coalescing 治不了 M2 的病；replay window 已被 `session/load` + `replay_from` 取代且有 e2e 覆盖。M2 只保留一次「Code 会话事件量测量」，那正是 `hub.rs:4` 原本要的东西。`SessionLease` 跨进程文件锁 → 多 daemon 形态出现时：`--embedded` 全仓库无实现，CLI 只有 attach-or-spawn，单实例 `daemon.lock` 已挡跨进程双 runtime，会话内由 turn 闸门 + 在途 CAS 标记承担且有不变量测试；跨会话共享影子仓库要的是 daemon 内 per-workspace 互斥（ADR-0006 已写明），不是文件锁。glossary 的 lease 条目随此更正。
 
 ### 2026-10-03 · CI 编译 flags 裁决收口 + worklog 对账
 

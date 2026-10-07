@@ -7,7 +7,9 @@
 
 ## 当前状态
 
-M1 Phase 1 代码完成：ChatCompletions adapter、能力表 v1、重试/退避、注册表、录制工具与测试基建全部落地，`./scripts/ci.sh` 全绿。**待真实录制与 live 探测**（需在 shell 中导出两家 key），D3 决策随之定案。
+M1 Phase 1 代码完成：ChatCompletions adapter、能力表 v1、重试/退避、注册表、录制工具与测试基建全部落地，`./scripts/ci.sh` 全绿。真实录制与 live 探测**已完成**（2026-09-30 的 `doctor --provider` 两家双轮实测、2026-10-01 的八条真实 fixture 重录与 toolcall 分片补录，见下面两个日期条目），**D3 随之定案：ChatCompletions 不需要缓冲一个事件**。（原「待真实录制与 live 探测，D3 决策随之定案」的现状句已过期，2026-10-07 更正。）
+
+M2 侧本方向有两项，都排在 **Phase 5**（2026-10-07 重新规划）：Responses adapter 与多模态 image 输入。该阶段与 Phase 1–4（检查点/写路径/工具/审批/会话级方法）**无依赖**，可并行或任意插位。
 
 ## 待办
 
@@ -17,11 +19,11 @@ M1 Phase 1 代码完成：ChatCompletions adapter、能力表 v1、重试/退避
 - [x] (M1) reasoning 逐字节回放（`reasoning_content` 按能力表 echo/drop；签名块无 Chat Completions 线上字段，Responses adapter 落地时再补存储表示——开放问题 1 保持开放）
 - [x] (M1) 重试/退避/429 + RateLimited 事件（kernel 新增 `StreamEvent::RateLimited` 透传通道；见 kernel.md 2026-09-30 条目）
 - [x] (M1) fixture 录制工具（xtask record-fixtures：原始字节 + provenance sidecar + 脱敏扫描）
-- [x] (M1) deepseek/qwen 真实探测录制（2026-10-01 首轮：两家 text/reasoning/401 共六流 + 双 401 错误体；**toolcall 流待重录**——首轮模型拒绝调用，录制器已改为 `tool_choice` 强制并加 `must_contain` 字节校验，待 `--force` 重跑）
+- [x] (M1) deepseek/qwen 真实探测录制（2026-10-01 首轮：两家 text/reasoning/401 共六流 + 双 401 错误体；toolcall 流首轮被模型拒绝，录制器改为 `tool_choice` 强制 + `must_contain` 字节校验后**同日第二轮重录成功**，见下面「重录后的 toolcall 分片」条。原框内「待重录」已过期，2026-10-07 更正）
 - [x] (M1) `hatchery doctor --provider` 实测子命令（2026-09-30 随 CLI Phase 4 落地；两家双轮实测留痕见 worklog/cli.md 与本文件「模型世代校准」条）
 - [x] (M1) D3：ReasoningDone 是否需缓冲一个事件（**2026-10-01 定案：ChatCompletions 不需要**——实测两家 reasoning 值都严格先于 content 值，且该 wire 无签名块，迟到签名无从发生；adapter 在 reasoning→text 值边界补发 `ReasoningDone`。风险整体移交给 Responses wire 的 M2 adapter。流在 reasoning 中途结束则不发 Done，kernel 的 `close_open` 收尾——无签名可丢，等价）
-- [ ] (M2) Responses adapter
-- [ ] (M2) 多模态 image 输入
+- [ ] (M2, Phase 5) **Responses adapter**：`wire = "responses"` 目前是 fatal 拒绝（2026-10-01 修的，此前配置被静默无视），所以拒绝本身是诚实的。落地时一并关闭**开放问题 1**（`encrypted_content`/签名块的统一存储表示）——ChatCompletions 线上没有签名块字段，D3 把「晚到签名」的风险整体移交给了这里；`ReasoningDone { signature }` 与 `SignatureBlock { scheme, data }` 的形状已在协议里，缺的是 Responses wire 到它的翻译与逐字节回放。
+- [ ] (M2, Phase 5) **多模态 image 输入**：协议侧 `ContentPart::Image { mime_type, data }` 已在，缺的是本 crate 到 wire 的翻译 **加** CLI 侧的图片输入路径（frontends 开放问题 3，同排 Phase 5/6）。**两半必须一起做**：只做输入路径会让图片进得了库却发不出去，只做翻译则没有任何前端能喂进来。
 
 ## 开放问题
 
@@ -31,6 +33,16 @@ M1 Phase 1 代码完成：ChatCompletions adapter、能力表 v1、重试/退避
 - **wiremock 连接池竞态（2026-09-30 发现）**：keep-alive 连接被服务端关闭恰逢重试复用时，reqwest 报 `SendError`（分类为可重试，行为正确），但会让「恰好 N 个请求」的断言差一。测试一律用 `pool_max_idle_per_host(0)` 的客户端规避（adapter.rs helper 内注释）；真实部署保留连接池。
 
 ## 变更日志
+
+### 2026-10-07 · M2 重新规划对账
+
+M2 全仓库勘察后重排（见 [../roadmap.md](../roadmap.md) 的 M2 节）。本方向的两项 M2 待办**保留在 M2**（用户裁决：worklog 里标了 M2 的全留），落到新的 **Phase 5**——该阶段与 Phase 1–4（检查点/写路径/工具与审批/会话级方法）无依赖，可并行或任意插位。
+
+两处过期文字更正：① 现状句还写着「待真实录制与 live 探测，D3 决策随之定案」，而两件事都已在 2026-09-30/10-01 做完、D3 也已定案；② 录制那条框里还挂着「toolcall 流待重录」，而同日第二轮已用 `tool_choice` 强制重录成功（本文件下面那条记录就是它）。
+
+**与 Phase 0 的交叉影响（记在这里免得两边都以为对方管）**：Phase 0 要把 system prompt 真正注入请求（M1 只交付了 `prompt/render` 的透明性，装配结果从未进过一次请求）。本 crate 侧**无需改动**——`translate.rs:134` 的 `Role::System => WireMessage::system(text)` 早已就位，adapter 只是多翻译一条消息；llm 层的测试各自构造自己的 `messages`，也不受影响。受影响的是 `hatchery-tests` 那条对第二 turn 请求体做整表逐字节比对的 e2e 断言，归 daemon/testing 方向更新。
+
+**多模态的耦合要在排期上体现**：协议侧 `ContentPart::Image` 已在，但「llm 侧翻译」与「CLI 侧图片输入路径」（frontends 开放问题 3）必须同批落地——只做一半的两种失败形态都是静默的（图片存得进库发不出去，或者根本没有前端能喂进来）。
 
 ### 2026-10-01 · 评审⑤自查轮（llm）
 

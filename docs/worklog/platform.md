@@ -6,7 +6,9 @@
 
 ## 当前状态
 
-**M1 交付（2026-10-01）**：分层配置加载与 prompt 管线 v1 已落地（代码在 `hatchery-daemon`，细节与测试见 worklog/daemon.md）；AGENTS.md 发现与注入随决策记录排 M2（见待办）。**i18n 方案已实测定型（fluent，ADR-0011）**，落地在 M4。
+**M1 交付（2026-10-01）**：分层配置加载与 prompt 管线 v1 已落地（代码在 `hatchery-daemon`，细节与测试见 worklog/daemon.md）；AGENTS.md 发现与注入随决策记录排 **M2 Phase 2**（见待办）。**i18n 方案已实测定型（fluent，ADR-0011）**，落地在 M4。
+
+**口径限定（2026-10-07，M2 重新规划）**：「prompt 管线 v1 已落地」指的是**装配 + 透明性**——四节有序装配、`{{var}}` 插值、per-section 来源标注、`prompt/render` 与 CLI `/prompt` 可查看；**不含注入到任何一次 turn**。`render_chat`（prompt.rs:57）的唯一非测试调用方是服务 `prompt/render` 的 `DaemonCore::render_prompt`（core.rs:227），`ChatOptions` 无 system prompt 字段、`StoreHistory::view()` 不产 system 消息，且 runtime.rs:618 有一条测试主动断言消息里没有 `Role::System`。注入随 **M2 Phase 0**（决策点 **D15**），实证与理由记在 worklog/daemon.md 的 2026-10-07 条目。
 
 代码归属已定：配置加载与 prompt 装配都落在 `hatchery-daemon`（唯一消费者——前端一律经 `config/get|set`、`prompt/render` 协议访问），**不新建 `hatchery-platform` 或 `hatchery-prompts` crate**（ADR-0009 反预拆分刹车）。
 
@@ -16,13 +18,16 @@
 - [x] (M0) prompts 存放位置定案：各 crate 自己的 `prompts/` 目录 + `include_str!`，不新建 crate
 - [x] (M0) 配置 schema 校验失败降级策略定案：逐 key 忽略 + warning（安全 key 取最严格默认值并升 error 日志）
 - [x] (M1) 分层配置加载 + per-key origins + 项目级安全边界（覆盖硬门时忽略 + warning）（2026-10-01 落地，见 worklog/daemon.md）
-- [x] (M1) prompt 管线 v1：identity/mode_variant/environment/safety_gate 四 section + `{{var}}` 插值 + PRECEDENCE 声明（2026-10-01 落地，见 worklog/daemon.md）
+- [x] (M1) prompt 管线 v1：identity/mode_variant/environment/safety_gate 四 section + `{{var}}` 插值 + PRECEDENCE 声明（2026-10-01 落地，见 worklog/daemon.md）——**交付范围限定（2026-10-07 勘察）**：交付的是**装配与透明性，不是注入**。实际发出的节序是 `["identity", "mode_chat", "environment", "safety_gate"]`，由 `all_four_sections_assemble_in_order`（prompt.rs:181）与 dispatch 级的 `prompt_render_lists_four_sections`（core.rs:527）钉住；design/platform.md §2.1 列的 **7 节里只有这 4 节存在**，嵌入文件是 `crates/hatchery-daemon/prompts/{identity,mode-chat,environment,safety-gate}.md`——**没有 `mode-code.md`**
 - [x] (M1) `prompt/render` + CLI `/prompt`（随 daemon Phase 3 / cli Phase 4）
-- [ ] (M2) AGENTS.md 发现与注入（层级向上发现 + project_context section + 来源标注 + 发现 golden 测试）——决策已定（2026-10-01）：**AGENTS.md 为主文件名、HATCHERY.md 兼容认读**，并存时 AGENTS.md 优先并 warning 一次（design/platform.md 开放问题 1 的决策记录）
-- [x] (M1) **environment 节只准用 git plumbing 命令**：实测 `git status` 会重写用户的 `.git/index`（worklog/capabilities.md），prompt 装配属于后台行为，绝不能有这种副作用（git2 `statuses()` 落地，不碰用户 index）
+- [ ] (M2 Phase 0) **把装配结果注入 turn**（+ **D15**）：由 daemon 的 `HistorySource` 实现在 `view()` 里前置一条 system `Message`，`ChatOptions` 不加 system 字段；D15 的两条建议是「runtime 装配时渲染一次并冻结整个 runtime 生命周期」（每轮重渲染会让 environment 节的日期/cwd 破坏前缀稳定性，那正是 KV cache 友好性反复强调的东西；模式切换与 config 变更本来就 bump generation 重组装）与「不变量 2 只管分支历史，system prompt 是可复现派生态、由 `prompt/render` golden 单独钉」。细节与实证见 worklog/daemon.md
+- [ ] (M2 Phase 2) AGENTS.md 发现与注入（层级向上发现 + project_context section + 来源标注 + 发现 golden 测试）——决策已定（2026-10-01）：**AGENTS.md 为主文件名、HATCHERY.md 兼容认读**，并存时 AGENTS.md 优先并 warning 一次（design/platform.md 开放问题 1 的决策记录）；实现在 **M2 Phase 2**
+- [ ] (M2 Phase 2) **`tool_discipline` 节**（§2.1 第 6 节，按 Turn Tool Snapshot 生成）——本文件此前完全没有这一项；它与 `safety_gate` 同样**不接受用户覆盖**，而 §2.1 那句「`safety_gate` 与 `tool_discipline` 不接受覆盖」今天只对前者有代码（后者连节都不存在）
+- [ ] (M2 Phase 2) **`mode-code.md`** 提示词文件 + Code 变体纪律段（ADR-0005 的 mode_variant 在 Code 侧）——嵌入文件今天只有 chat 变体，`render_chat` 也只装配 `mode_chat`；Code 节要随 Phase 2 的模式装配（`assemble(mode, backends)`）一起才有意义，否则渲染出来的 Code prompt 没有消费者
+- [x] (M1) **environment 节只准用 git plumbing 命令**：实测 `git status` 会重写用户的 `.git/index`（worklog/capabilities.md），prompt 装配属于后台行为，绝不能有这种副作用（git2 `statuses()` 落地，不碰用户 index）——实现是 `git_summary`（prompt.rs:129）：`git2::Repository::discover` + `statuses()`，符合 ADR-0012
 - [x] (M1) docs/glossary.md 术语表初版（2026-10-01）
-- [ ] (M2) user_override section（`~/.config/hatchery/prompts/`）+ 覆盖不可越权测试
-- [ ] (M2) `hatchery config schema` 导出 JSON Schema
+- [ ] (M2) **`user_override` 作为 §2.1 的第 3 节**——**先把两件被混为一谈的事分开（2026-10-07 对账）**：① **per-section 覆盖机制已在 M1 落地**：`render_chat` 的 `override_dir` 参数（prompt.rs:57）逐节读 `<id>.md`、命中则来源标为 `user:prompts/<id>.md`（prompt.rs:59-84），`safety_gate` 的覆盖被**拒绝并 `tracing::warn!`**（prompt.rs:85-91），由 `the_safety_gate_cannot_be_overridden`（prompt.rs:230）钉住——所以「覆盖不可越权测试」这半句已经是既成事实，不该继续挂在未勾选的框里；② **没落地的是 `user_override` 作为节序里的一个编号节**：`render_chat` 发出的四节里没有它，覆盖是「替换某一节的来源」而不是「追加一节用户内容」，§2.1 的 7 节序因此对不上代码。此外还有一处未接线：生产调用方传的 `override_dir` 是 `None`（core.rs:227），且全仓库无任何地方构造 `~/.config/hatchery/prompts` 这个路径（只有 prompt.rs:5 的模块文档提到它）——**用户覆盖目录今天从不被读取**，接线随本节。附带要定的命名口径：覆盖查找用 `{id}.md`，而节 id 是 `mode_chat`（下划线），§2.2 举的例子却写 `mode-code.md`（连字符），二者对不上，加 Code 变体时一并统一
+- [ ] (M2 Phase 7) `hatchery config schema` 导出 JSON Schema（roadmap 把它排在 Phase 7；前置是 Phase 2 的 `STRICT_KEYS` 接线与 `[modes.*]`/`[approval_rules]`/工具策略/检查点预算四类 key 进 schema——今天这些 key 一个都不存在，导出的 schema 会缺 M2 的整个安全面）
 - [ ] (M4) fluent catalog 落地（FTL 嵌入 + 用户级覆盖）+ `xtask i18n-extract`（id 对账 + 未包裹字符串 lint）+ zh/en 两语 + RTL 冒烟
 
 ## 实测记录（2026-09-28，Linux x86_64）
@@ -61,6 +66,16 @@
 - 2026-09-28 prompts 存放 → 各 crate `prompts/` 目录，不新建 crate。
 
 ## 变更日志
+
+### 2026-10-07 · M2 重新规划对账
+
+roadmap 的 M2 段被一次全仓库勘察重写（Phase 0–8 + 决策点 D8–D18），本方向按它重新对账。三件事：
+
+1. **「prompt 管线 v1 已落地」被限定为装配 + 透明性**。勘察发现装配结果从未进过任何一次模型请求：`render_chat`（prompt.rs:57）的唯一非测试调用方是服务 `prompt/render` 的 `DaemonCore::render_prompt`（core.rs:227），`ChatOptions`（kernel/src/message.rs:257-279）没有 system prompt 字段，`StoreHistory::view()` 不产 system 消息，而 `checkpoints_are_not_provider_visible` 在 runtime.rs:618 主动断言消息里没有 `Role::System`。注入归 **M2 Phase 0**、由 **D15** 定渲染时机（建议：runtime 装配时渲染一次并冻结——每轮重渲染会让 environment 节的日期/cwd 破坏前缀稳定性，那正是 KV cache 友好性要的东西；不变量 2 只管分支历史，system prompt 由 `prompt/render` golden 单独钉）。完整实证记在 worklog/daemon.md 的同日条目，本文件不重复。
+2. **§2.1 的 7 节里只有 4 节存在**，本文件的待办因此补两项：`tool_discipline`（第 6 节，按 Turn Tool Snapshot 生成；它与 `safety_gate` 一样不接受覆盖，但今天连节都没有）与 `mode-code.md`（嵌入文件今天只有 `identity`/`mode-chat`/`environment`/`safety-gate` 四个）。`project_context`（第 4 节，AGENTS.md 层级发现）本来就在待办里，阶段明确为 **Phase 2**——开放问题 1 的决策 2026-10-01 已定，此前只写「排 M2」，不含阶段。
+3. **`user_override` 的文档/代码分歧被拆开**：覆盖**机制**是 M1 既成事实（prompt.rs:59-84 逐节读覆盖文件并标注来源；`safety_gate` 覆盖被拒 + `tracing::warn!`，prompt.rs:85-91，`the_safety_gate_cannot_be_overridden` 钉住），没落地的是它作为 §2.1 节序里的**一个编号节**。顺带查出两处未接线：生产调用方传的 `override_dir` 是 `None`（core.rs:227）、全仓库无处构造 `~/.config/hatchery/prompts`（只有 prompt.rs:5 的文档提到），所以**用户覆盖目录今天从不被读取**；以及覆盖文件名用节 id（`mode_chat.md`，下划线）而 §2.2 的例子写 `mode-code.md`（连字符），加 Code 变体时要一并统一。
+
+另：`hatchery config schema` 按 roadmap 改挂 **Phase 7**，并注明它的前置是 Phase 2 的 `STRICT_KEYS` 接线与四类新 key 进 schema（`[modes.*]`、`[approval_rules]`、工具策略、检查点预算今天都不存在于 `is_known_key`）。
 
 ### 2026-09-28
 - 初稿。prompt 系统合成三家经验：dsh section 注册表 + atomcode PRECEDENCE/安全门不可覆盖（含测试）+ qwen-code AGENTS.md 层级发现；透明性（可查看/导出最终 prompt）是用户明确需求。

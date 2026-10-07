@@ -6,11 +6,17 @@
 
 ## 当前状态
 
-**M1 Phase 3 代码完成（2026-10-01，评审③）**：配置分层、prompt 管线、单实例发现、UDS 传输、SessionManager、LiveHub、方法接线、审计与 disposer 全部落地；TestDaemon/ClientProbe 经真实 socket 的双前端扇出测试通过。`./scripts/ci.sh` 全绿（除两个**有意修改**的 protocol fixture 未提交导致的 determinism 步骤——提交后恢复）。
+**M1 Phase 3 代码完成（2026-10-01，评审③）**：配置分层、prompt 管线（**只到装配与透明性，装配结果未进过模型请求**——见下 2026-10-07 对账）、单实例发现、UDS 传输、SessionManager、LiveHub、方法接线、审计与 disposer 全部落地；TestDaemon/ClientProbe 经真实 socket 的双前端扇出测试通过。`./scripts/ci.sh` 全绿（除**有意修改**的 protocol fixture 未提交导致的 determinism 步骤——提交后恢复）。
 
 **M1 Phase 4 补齐（2026-09-30，评审④）**：生产入口 `entry`（audit → 锁 → store → serve → 信号驱动的逆序 teardown）、stdio 监听（连接循环泛化出传输）、tracing 落盘轮转（日轮转 + 14 天保留）、空闲 sweep 调度、`doctor` 探测模块。CLI 半边见 `worklog/cli.md`。
 
 **M1 Phase 5 收口（2026-10-01，评审⑤）**：四处行为修正（见变更日志）+ e2e 场景与不变量组落地（hatchery-tests，测试面记录见 `worklog/testing.md`）。
+
+**对账口径（2026-10-07，M2 重新规划）**：本文件此前把三处现状写得比实际宽，逐条更正——
+
+1. **prompt 管线不通到模型**。`render_chat`（prompt.rs:57）的**唯一非测试调用方**是 `DaemonCore::render_prompt`（core.rs:227，服务 `prompt/render`），另外四处调用是 prompt.rs 自己的单测（:182/:190/:214/:234）；`ChatOptions`（kernel/src/message.rs:257-279）字段是 `model / reasoning_effort / temperature / max_output_tokens / tool_defs / extra`，**没有 system prompt 字段**；`StoreHistory::view()`（runtime.rs:64）只造 user/assistant/tool_result 三种消息，从不产 system；`checkpoints_are_not_provider_visible`（runtime.rs:611）还在 :618 主动断言 `view.messages` 里没有 `Role::System`。旁证：`render_prompt` 解析出会话的 model 之后直接丢掉（`let _ = model;`，core.rs:226）。**下游管道是就绪的**——`Message::system`（message.rs:56）在，`translate.rs:134` 已把 `Role::System` 翻成 wire 的 system 消息，缺的只是 daemon 这一侧的注入。随 **M2 Phase 0**（决策点 D15），不当作 M1 阻塞项。
+2. **协议 20 个方法只服务 10 个**。`SERVED_METHODS`（core.rs:26-37）= daemon/hello、session/{new,load,list,prompt,cancel,set_config}、config/{get,set}、prompt/render；路由是 `DaemonCore::handle`（core.rs:106）里一个 `match request.method.as_str()`（:108），MethodNotFound 有真兜底（:189-192，全 crate 无 `todo!()`）。余下 10 个随 **M2 Phase 3**，其中 `session/rewind` 与 `approval/respond` 被 core.rs:594/:596 显式断言为「is M2」，届时翻转。daemon 也**不服务任何 notification**（server.rs:161："a `{}` notification arrived; M1 serves none"）。
+3. **不存在 profile 类型**。design/daemon.md §3.1 的四个 profile（`local`/`headless`/`acp-stdio`/`acp-standalone`）无任何实现，`hatchery-daemon` 里 `profile` 只命中 src/lib.rs:10 的一句文档注释（"Assembly is profile-based and audited at startup"），Cargo.toml 的 `description` 同样写着 profile-based——两处都是愿景。M2 只交付「**按会话来源选后端的 `Backends` 装配点**」（今天 `Backends` 在 manager.rs:622 内联构造，无选择逻辑），四个命名 profile 顺延到出现第二个消费者（ACP 两行属 M3）。
 
 ## 待办
 
@@ -26,8 +32,21 @@
 - [x] (M1) stdio 监听 + tracing 落盘轮转 + 生产入口 `entry`（2026-09-30：`serve_connection` 对读写半泛型，duplex 测试证明管道与 socket 同核；日志日轮转 + 启动时按日期字符串修剪，`RUST_LOG` 过滤）
 - [x] (M1) 空闲卸载的后台 sweep 任务（`entry` 内 60s 间隔 tick `sweep_idle`，D2 判定仍在 sweep 内）
 - [x] (M1) `doctor` provider 实测探测模块（`doctor::probe_provider` 走真实 `LlmProvider` 轮次；离线 wiremock 验证；真实两家探测由 CLI 触发，留痕见 `worklog/cli.md`）
-- [ ] (M2) hub coalescing（16ms 窗）+ replay window
-- [ ] (M2) SessionLease 文件锁（当前单 daemon 内 HashMap 槽位已防同会话双 runtime；跨进程租约随 M2 检查点一起）
+- [ ] (M2 Phase 0) **把 system prompt 真正接进 turn**：装配结果经 daemon 的 `HistorySource` 实现进入请求——`StoreHistory::view()`（runtime.rs:64）在分支历史前**前置一条 system `Message`**；`ChatOptions` **不加** system 字段（它的 `tool_defs` 每轮被 kernel 用冻结的 tool snapshot 覆写，是 knobs 不是内容载体）。渲染时机与不变量 2 的边界由 **D15** 定：① 建议 **runtime 装配时渲染一次并冻结整个 runtime 生命周期**——模式切换与 config 变更本来就 bump generation 重组装，而每轮重渲染会让 environment 节的日期/cwd 破坏前缀稳定性，那正是本项目为 KV cache 反复强调的东西；② 建议**不变量 2 只管分支历史**，system prompt 是可复现的派生态，由 `prompt/render` 的 golden 单独钉。随之必须更新 `invariant_minimal_chat_replays_reasoning_byte_exact`（hatchery-tests/tests/scenario1.rs:14）——它把 turn 2 请求体的 `messages` 数组当作整个 `serde_json::Value` 与手写期望比对，system 消息一出现就对不上。
+- [ ] (M2 Phase 0) 删掉 daemon → `hatchery-acp` 的**死依赖边**：Cargo.toml:21 声明、daemon 源码零引用、crate 本体只有文档注释（结尾自述 "Status: M0 skeleton; implementation lands in M3"），而 `cargo xtask layering` 把它算作一条 build edge。删边（或显式标注为 M3 接缝）
+- [ ] (M2 Phase 1) HubSink 在 **Checkpoint item 落库后补写 `checkpoints` 行**：D13 已定「kernel 在 ToolResult item 之前追加 Checkpoint item」，链成 `… → ToolCall → Checkpoint → ToolResult`；daemon 侧沿用 `ItemFinished` 现有的「先 commit 再 publish、commit 失败扣发」顺序（runtime.rs:232-245），补写行失败**只记日志**（item 里已带 `commit_id`，可回退重建）。该表只服务跨会话的预算核算与 GC，不是 rewind 的主索引
+- [ ] (M2 Phase 1/2) `Backends` 增审批与检查点字段（今天只有 `fs`/`terminal`，capabilities/src/registry.rs:25），并把 manager.rs:622 内联构造的 backends 提成**按会话来源选择的装配点**——这是 M2→M3 接缝里唯一可机器验证的 daemon 半边（另一半是 `FsBackend`/`TerminalBackend`/`ApprovalGate` 的契约测试套件，见 worklog/capabilities.md）；绑定表的 ACP 三行留作有文档的接缝，真验证在 M3
+- [ ] (M2 Phase 2) **`DaemonApproval` 的 daemon 半边**：pending 请求注册表（request_id → session/runtime）+ `approval/respond` 路由到 `AgentCommand::decide`（kernel/src/command.rs:65）+ **fail-closed 超时（住在 gate，不在 kernel）**。今天上游齐、下游空：`ToolHost::approval_for`（kernel/src/tools.rs:69，registry 实现 capabilities/src/registry.rs:89）存在但**没有任何工具返回 `Some`**（read_file.rs:65 注释明写 Code 模式的越界审批随 M2 的 registry 接线）；`KernelEvent::ApprovalNeeded`（kernel/src/sink.rs:82，agent.rs:732 发出、:755 等待）→ `TurnState::AwaitingApproval` → `SessionStatus::WaitingApproval`（runtime.rs:194）→ `ServerEvent::ApprovalRequested`（runtime.rs:256-262）一路通到前端，而 daemon 里 `ApprovalDecision`/`decide(` **零命中**、server.rs 里 `approval` **零命中**、`impl ApprovalGate` **全仓库零命中**（`DaemonApproval` 不存在）。净结果：审批事件今天出得去、答不回来，且没有工具会触发它。同阶段还要 `approval_rules` 表的读写 API 与 **D8** 求值语义（该表现有列只有 `id/scope/matcher/decision/created_at`——无排序列、无 enabled 列、scope 是裸 TEXT、无 session 外键）
+- [ ] (M2 Phase 2) **模式装配**：`ToolPolicy` + `assemble(mode, backends)` + `builtin(spec, &backends)` 取代 manager.rs:612 硬编码的 `chat_tools()` 循环——它**从不读 `session.mode`**，所以 code 会话今天拿到的是与 chat 完全相同的三个只读工具 + `NoTerminal`
+- [ ] (M2 Phase 2) **`STRICT_KEYS` 接线**：config.rs:154 现在是空表，:148-153 的注释直说「接进 `filter_keys` 与 typed reader 是 M2 的任务」，唯一被钉住的行为就是「它是空的」。同时补配置 schema：`[modes.*]`、审批规则、工具策略、检查点预算四类 key **今天一个都没有**（已知 key 只有 `ui.{show_reasoning,theme,language,response_language}`、`daemon.idle_timeout_min` 与 `providers.<id>.*` 子树，见 `is_known_key`），capabilities.md §4 的 `ToolPolicy` 与 §2 的 `Budget` 在 schema 里无任何表示
+- [ ] (M2 Phase 3) **接通余下 10 个未路由方法**（会话级四项之外还有 `session/set_mode`、`session/delete`、`session/rename`、`store/export_jsonl`；M2 收尾时协议方法面应全部接通），并翻转两条断言：`an_unknown_method_is_method_not_found`（core.rs:466，拿 `session/rewind` 当未知方法示例）与 `server_constants_name_what_m1_serves`（core.rs:592，:594 断言 rewind "is M2"、:596 断言 approvals "are M2"）
+- [ ] (M2 Phase 3) **rewind 三 scope**：store 侧的 `branch_tree`/`edit_fork`/`switch_branch`/`delete_branch`/`delete_session` **M0 就实现且有专测**（store/src/actor.rs:710/744/771/787/534），`export_jsonl` 亦然（store.rs:365），而 daemon 侧 grep **零调用点**——本项主要是接线与组合逻辑，唯独 rewind 的 Code 半边要等 Phase 1 的 `CheckpointStore`（rewind 靠 `ItemKind::Checkpoint{commit_id,..}` 定位 commit，不查 `checkpoints` 表）。`RewindScope::Both` 的顺序是**先 restore 代码、成功再移 head**（restore 失败绝不能已经把历史移走）；restore 前的安全快照记进 `checkpoints` 表、`item_id = NULL`、**不建 item**——它是 undo-of-undo，不属于对话历史，该列可空正是为此留的
+- [ ] (M2 Phase 3) **模式切换语义**：ADR-0005 的「切到 Chat 时进行中的写工具调用需先完成或取消」今天无代码；`daemon/hello` 的能力表（core.rs:68-71）只广告 `modes: vec![SessionModeId::chat()]`，`SessionModeId::code()` 在 hatchery-daemon 里从未被构造；`ModeSwitched` 需真正发出
+- [ ] (M2 Phase 3) **`SessionLoadResult.pending_approvals`**：给尚无 fixture、尚无消费者的 `PendingApproval`（protocol/src/method.rs:498）一个落点，让重连的前端能重画审批弹层
+- [ ] (M2 Phase 3) **历史移动后的前端重建约定：不加新事件**（新增事件 `type` 属协议 major bump）——`SessionUpdated.state.active_branch_head` 已在广播里，前端发现它不是自己已投影 head 的后继就 `session/load` 重建；发起方本来就能在自己的回复里拿到新 Session。daemon 侧要保证的只是：rewind/切分支/编辑分叉之后，落库的 Session 行与广播出去的 `active_branch_head` 一致
+- [ ] (M2 只测量) **记档一次 Code 会话的事件量**到本文件——hub.rs:4-6 的原意就是「这些测量决定 M2 策略」；这是 M2 在 hub 上唯一的动作，实现见下条
+- [ ] (M3) hub coalescing（16ms 窗）+ replay window —— **2026-10-07 由 M2 顺延（用户裁决）**：`ServerEvent::is_coalescable`（protocol/src/event.rs:195）只覆盖 `text_delta`/`reasoning_delta`，而 M2 新增的事件量主要来自 `ToolCallProgress`，**它不可合并**——coalescing 治不了 M2 的病；replay window 则已被 `session/load` + `replay_from` 取代且有 e2e 覆盖
+- [ ] (多 daemon 形态出现时) SessionLease 跨进程文件锁 —— **2026-10-07 由 M2 顺延（用户裁决），不挂 M2**：`--embedded` 全仓库无实现（CLI 唯一路径是 attach-or-spawn），单实例 `daemon.lock`（fs2，discover.rs:123）已经挡住两个 daemon；单 daemon 内「一会话一 turn」由 per-session turn 闸门（`let _lease = gate.lock().await`，manager.rs:303）+ 在途 CAS 标记（runtime.rs:385/391/400 的 `begin_turn`/`end_turn`/`is_busy`，HubSink 在 `KernelEvent::TurnEnded` 时清除）承担，并由 `invariant_session_lease_blocks_second_runtime`（tests/invariants.rs:95）与 `two_concurrent_prompts_yield_exactly_one_turn`（:213）钉住。跨会话共享一个影子仓库要的是 **daemon 内 per-workspace 互斥**（ADR-0006 已写明），不是文件锁。（`docs/glossary.md` 的 "lease" 条带同一句旧口径「随 M2 检查点一起」，另行更正。）
 
 ## 开放问题
 
@@ -35,8 +54,21 @@
 
 - **Phase 4 实测备注（2026-09-30）**：`pid_is_alive` 的「自述 pid = 陈旧文件」判定与 TestDaemon 的进程内 daemon 冲突（测试发布者就是测试进程）。生产语义保留不动，测试改走 `discover()`（不做存活过滤）+ `attach_to()`（跳过发现的直接握手接缝）。
 - **Phase 4 实测备注（2026-09-30）**：单进程内的两次 `acquire_instance`：fs2 走 flock(LOCK_EX|LOCK_NB)，同进程异 fd 同样冲突（`a_second_start` 集成测试钉住）。
+- **2026-10-07 对账**：第 3 条（检查点预算核算频率）仍属 M2，落 **Phase 1**、即决策点 **D9**（超预算时 GC 最旧 vs 拒写 + 核算频率；数据来自 §5 新增的 `checkpoints` 行）。同条的锁粒度半问已有答案——**daemon 内 per-workspace 互斥**（ADR-0006），不是跨进程文件锁（见待办的顺延项）。另：第 1/2/4 条在 M1 已定案（D1 = CLI spawn 分离进程、D2 = 无订阅者跑完为止、D4 = 每次启动换 boot token，见下 2026-10-01 Phase 3 条目），但 design/daemon.md 的对应三条仍写成「M1 定」的未决形态，尚未回填。
 
 ## 变更日志
+
+### 2026-10-07 · M2 重新规划对账
+
+一次全仓库勘察重写了 roadmap 的 M2 段（Phase 0–8 + 决策点 D8–D18 + 顺延表），本文件按它重新对账：待办重挂阶段、补上遗漏项、更正「当前状态」里三处比实际宽的口径（见该节）。本方向最重要的发现与两条顺延裁决记在这里。
+
+**发现：prompt 管线从未到达模型（载荷性缺陷，归 M2 Phase 0，不作为 M1 阻塞项）。** M1 自述「prompt 管线落地」，实际落地的只有**装配 + 透明性**——四条实证：① `render_chat`（prompt.rs:57）的**唯一非测试调用方**是 `DaemonCore::render_prompt`（core.rs:227），它服务 `prompt/render` 协议方法，另外四处调用是 prompt.rs 自己的单测（:182/:190/:214/:234）；② `ChatOptions`（kernel/src/message.rs:257-279）**没有 system prompt 字段**，只有 `model / reasoning_effort / temperature / max_output_tokens / tool_defs / extra`；③ `StoreHistory::view()`（runtime.rs:64）只造 user/assistant/tool_result，从不产 system 消息，而 `checkpoints_are_not_provider_visible` 在 runtime.rs:618 **主动断言** `view.messages` 里没有 `Role::System`——也就是说这不是漏接，是被测试钉住的现状；④ 旁证：`render_prompt` 取出会话的 model 之后 `let _ = model;` 丢掉（core.rs:226），因为它渲染出来的东西不与任何一次请求相关。下游其实已就绪（`Message::system` 在 message.rs:56，`translate.rs:134` 已映射 `Role::System => WireMessage::system(text)`），缺的只是 daemon 这一侧把 system 消息前置进 `view()`。注入方式与时机由 **D15** 定（两条建议见待办里的 Phase 0 条目），e2e 的 `invariant_minimal_chat_replays_reasoning_byte_exact`（tests/scenario1.rs:14）期望请求体必须同步更新。
+
+**顺延裁决一：hub coalescing + replay window 由 M2 改挂 M3。** 理由是 coalescing 治不了 M2 的病：`ServerEvent::is_coalescable`（protocol/src/event.rs:195）只覆盖 `text_delta`/`reasoning_delta`，而 M2 新增的事件量主要来自 `ToolCallProgress`，**它不可合并**；replay window 则已被 `session/load` + `replay_from` 取代且有 e2e 覆盖，再建一套缓冲是重复机制。M2 只保留一件测量任务：跑一次 Code 会话、把事件量记进本文件——这正是 hub.rs:4-6 当初写下的意思（"the measurements this produces decide the M2 strategy"），测量先于策略。
+
+**顺延裁决二：`SessionLease` 跨进程文件锁改挂「多 daemon 形态出现时」，不挂 M2。** 三层理由：① `--embedded` 全仓库无实现，CLI 唯一路径是 attach-or-spawn，所以单实例 `daemon.lock`（fs2，discover.rs:123）已经挡住了两个 daemon 同时存在；② 单 daemon 内「一会话一 turn」由 per-session turn 闸门（manager.rs:303）+ 在途 CAS 标记（runtime.rs:385/391/400，HubSink 在 `TurnEnded` 时清除）承担，且已有 `invariant_session_lease_blocks_second_runtime` 与 `two_concurrent_prompts_yield_exactly_one_turn` 钉住——文件锁在这里没有新增任何保证；③ M2 真正会碰到的共享是**跨会话共用一个影子仓库**，那要的是 daemon 内的 per-workspace 互斥（ADR-0006 已写明），进程内互斥用文件锁表达是错的工具。
+
+**顺带更正的两处本方向文档错**：design/daemon.md §3.1 的四个 profile 无任何实现（`hatchery-daemon` 里 `profile` 只命中 lib.rs:10 的文档注释），已改标为目标形态；`hatchery-acp` 是死依赖边（Cargo.toml:21 声明、源码零引用、crate 本体只有文档注释），M2 Phase 0 删边。
 
 ### 2026-10-01 · 评审⑤自查轮（并发正确性与传输层）
 
