@@ -53,7 +53,7 @@ crossterm = { version = "0.29.0", features = ["event-stream"] }
 # line landed, which scroll offsets and message jumps need); minimad already depends on it.
 unicode-width = "0.2.2"
 # Layered configuration files (platform.md §1): TOML in, per-key validated.
-toml = "1.1.6+spec-1.1.0"
+toml = "1.1.6"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 thiserror = "2.0"
