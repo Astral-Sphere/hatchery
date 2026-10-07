@@ -100,7 +100,7 @@ jobs:
       - name: Check the workspace on the MSRV
         run: cargo +1.90.0 check --workspace --all-targets --locked
 
-      # TODO(M2): cargo-fuzz short runs, 10min per target (docs/design/testing.md §6)
-      # TODO(M2+): criterion baseline comparison, flag >20% regressions (§7)
-      # TODO(M2+): cargo-mutants limited to hatchery-store and hatchery-kernel (§8)
+      # TODO(M2 Phase 7): cargo-fuzz short runs, 10min per target (docs/design/testing.md §6)
+      # TODO(M2 Phase 7): criterion baseline comparison, flag >20% regressions (§7)
+      # TODO(M2 Phase 7): cargo-mutants limited to hatchery-store and hatchery-kernel (§8)
       # TODO(M4): run the gui group inside a GNOME SDK container with xvfb-run (§3.9)
