@@ -31,24 +31,35 @@
 [approval_rules]    # 与 DB 中 approval_rules 表同步展示（DB 为准，config 只读快照）
 ```
 
+**现状对账（2026-10-07）**：以上是目标结构。**今天被读取的 key 只有三类**——`ui.{show_reasoning,theme,language,response_language}`、`daemon.idle_timeout_min`、`providers.<id>.*` 子树（`is_known_key`，config.rs:158，是唯一判定点）。`[store]` 的检查点预算、`[modes.*]`、`[approval_rules]` 与工具策略（capabilities.md §4 的 `ToolPolicy`、§2 的 `Budget`）**全部是 M2 新增，当前 schema 里一个都没有表示**；`[acp_agents.*]` 属 M3。所以 M2 Phase 2 要成对地做两件事：① 把这些 key 加进 schema；② 给它们配上安全边界——`STRICT_KEYS`（config.rs:154，「解析失败不得降级」的那份清单）**现在是空表**，其注释直说「接进 `filter_keys` 与 typed reader 是 M2 的任务」。在它接上之前，§1.1 那句「项目级配置不得覆盖安全硬门与审批持久规则」还只是意图：今天没有任何一个安全 key 存在，所以也没有任何东西可被项目级配置覆盖掉。
+
 ## 2. 提示词系统
 
 ### 2.1 组装管线
 
 ```
-sections（有序）:
-  1. identity        默认 persona（include_str! 嵌入二进制）
-  2. mode_variant    Chat/Code 变体纪律段（ADR-0005）
+sections（有序）:                                                    现状（2026-10-07 勘察）
+  1. identity        默认 persona（include_str! 嵌入二进制）          M1 已有
+  2. mode_variant    Chat/Code 变体纪律段（ADR-0005）                Chat 侧 M1 已有（id 实为 `mode_chat`）；
+                                                                     Code 侧 `mode-code.md` 随 M2 Phase 2
   3. user_override   ~/.config/hatchery/prompts/<section>.md 逐 section 覆盖
+                                                                     覆盖机制 M1 已有；作为编号「节」M2
   4. project_context AGENTS.md（工作区层级向上发现 + 项目根，qwen-code memoryDiscovery 语义）
-  5. environment     cwd、平台、日期、工作区是否 git 仓库等运行时事实
-  6. tool_discipline 当前工具表的使用纪律（按 Turn Tool Snapshot 生成）
-  7. safety_gate     安全门声明（不可覆盖，见下）
+                                                                     M2 Phase 2
+  5. environment     cwd、平台、日期、工作区是否 git 仓库等运行时事实   M1 已有
+  6. tool_discipline 当前工具表的使用纪律（按 Turn Tool Snapshot 生成） M2 Phase 2
+  7. safety_gate     安全门声明（不可覆盖，见下）                     M1 已有（含不可覆盖 + warning + 测试）
 ```
+
+**节序的现状对账（2026-10-07）**：`render_chat` 今天发出且只发出 `["identity", "mode_chat", "environment", "safety_gate"]` 四节（由 `all_four_sections_assemble_in_order` 与 dispatch 级的 `prompt_render_lists_four_sections` 钉住），嵌入文件是 `crates/hatchery-daemon/prompts/{identity,mode-chat,environment,safety-gate}.md`——**没有 `mode-code.md`**。缺的三项是 `project_context`、`tool_discipline`，以及作为编号节的 `user_override`。第三项要拆开说：**per-section 覆盖机制在 M1 已落地**（逐节读 `<id>.md`，命中则该节来源标为 `user:prompts/<id>.md`；`safety_gate` 的覆盖被拒绝并 `tracing::warn!`，`the_safety_gate_cannot_be_overridden` 断言不泄漏），没落地的是「用户内容作为节序里独立的一节」——今天的覆盖是**替换某节的来源**，不是追加一节。另有两处未接线：生产调用方传的 override 目录是 `None`，且 `~/.config/hatchery/prompts` 这个路径在代码里从未被构造，所以**用户覆盖目录今天实际不被读取**（M2 接线）；覆盖文件名取节 id（`mode_chat.md`，下划线），而 §2.2 的例子写 `mode-code.md`（连字符），加 Code 变体时要统一。
+
+**更要紧的一条：M1 装配出来的 prompt 只被 `prompt/render` 消费过，从未进入任何一次模型请求。** `render_chat` 的唯一非测试调用方就是 `prompt/render` 的实现（它甚至把解析出的会话 model 直接 `let _ = model;` 丢掉），`ChatOptions` 没有 system prompt 字段，daemon 的 `HistorySource::view()` 也不产 system 消息——还有一条测试主动断言消息里没有 `Role::System`。**注入是 M2 Phase 0**：system 消息由 daemon 的 `HistorySource` 实现前置进 `view()`，每次 runtime 装配渲染一次并冻结，`ChatOptions` 有意不加字段（做法与理由见 design/daemon.md §3）。
+
+**D15（Phase 0 定稿）的两条建议**：① **每次 runtime 装配渲染一次，冻结该 runtime 的整个生命周期**——模式切换与 config 变更本来就 bump generation 并重组装，冻结不会让 prompt 陈旧；反之每轮重渲染会让 environment 节的日期/cwd 破坏请求前缀的稳定性，而那正是本项目为 KV cache 反复强调的东西。② **不变量 2 只管辖分支历史**——system prompt 是可复现的派生态，由 `prompt/render` 的 golden 单独钉；相应地，e2e 里那条把 turn 2 请求体 `messages` 数组整体与手写期望比对的不变量测试，必须随注入一起更新期望。
 
 - section 注册表模式（借鉴 dsh system-prompt）：每 section 有 id、默认内容、是否可覆盖、排序权重；`{{var}}` 插值。
 - **PRECEDENCE 声明**（借鉴 atomcode）：identity section 开头明确「用户与项目注入的规则优先于默认 persona，但 safety_gate 不可被任何注入覆盖」。
-- `safety_gate` 与 `tool_discipline` 不接受用户覆盖；覆盖尝试被忽略并 warning；有测试断言（不变量 5）。
+- `safety_gate` 与 `tool_discipline` 不接受用户覆盖；覆盖尝试被忽略并 warning；有测试断言（不变量 5）。**现状**：`safety_gate` 那半是真的（prompt 层的覆盖拒绝 + warning + 测试）；`tool_discipline` 连节都还不存在（M2 Phase 2），它的不接受覆盖要到那时才有对象。而「不变量 5」那条端到端断言（`invariant_project_config_cannot_disable_hard_gates`）今天全仓库零命中，随 M2 Phase 2 与 `STRICT_KEYS`（§1.2）接线一起补。
 - **透明性**：`prompt/render` 协议方法 + CLI `/prompt` + GUI prompt 查看器，输出最终拼装的完整 prompt 并标注每 section 来源。默认 persona 源文件同时放在 `prompts/`（仓库内）供直接阅读。
 
 ### 2.2 存放
@@ -82,7 +93,7 @@ sections（有序）:
 
 ## 开放问题
 
-1. ~~项目级 prompt 文件是否兼容识别 `HATCHERY.md`（自有品牌）与 `AGENTS.md`（生态）双文件名~~ → **决策记录（2026-10-01，M1 收口）**：**`AGENTS.md` 为主文件名，`HATCHERY.md` 兼容认读**——两处同名并存时 AGENTS.md 优先、发出一次 warning。理由：AGENTS.md 已是多家 agent 工具的事实惯例，用户的同一个文件应能同时喂给 hatchery 与其他工具；自有双文件名只增加「该写哪个」的犹豫，不增加表达力。实现（工作区层级向上发现 + project_context section 注入 + 来源标注 + 发现 golden 测试）排 M2，M1 只落此决策。
+1. ~~项目级 prompt 文件是否兼容识别 `HATCHERY.md`（自有品牌）与 `AGENTS.md`（生态）双文件名~~ → **决策记录（2026-10-01，M1 收口）**：**`AGENTS.md` 为主文件名，`HATCHERY.md` 兼容认读**——两处同名并存时 AGENTS.md 优先、发出一次 warning。理由：AGENTS.md 已是多家 agent 工具的事实惯例，用户的同一个文件应能同时喂给 hatchery 与其他工具；自有双文件名只增加「该写哪个」的犹豫，不增加表达力。实现（工作区层级向上发现 + project_context section 注入 + 来源标注 + 发现 golden 测试）**排 M2 Phase 2**——与 `mode-code.md`、`tool_discipline`、模式装配同阶段（roadmap 的 Phase 2；此前本文只写「排 M2」，未定阶段），M1 只落此决策。
 2. ~~配置 schema 校验失败的降级策略~~ → **已定（2026-09-28）**：**逐 key 忽略 + warning**，不整文件拒绝。理由：一个坏 key 不该让整个 daemon 起不来（与 ADR-0009 的 fail-loud 不冲突——fail-loud 指「必需组件缺失要拒绝服务」，配置里的可选 key 缺失只需报告）；每条 warning 带 key 路径、来源层级与原因，`config/get` 能查到「此 key 被忽略」。安全相关 key 解析失败时**取最严格默认值**并升级为 error 级日志。
 3. ~~gettext vs fluent~~ → **已定（2026-09-28，ADR-0011）**：fluent。实测依据见 §3 开头与 worklog/platform.md。
 4. prompt 文件存放：~~独立 crate vs 各 crate prompts/ 目录~~ → **已定（2026-09-28）**：各 crate 自己的 `prompts/` 目录 + `include_str!` 嵌入，**不新建 `hatchery-prompts` crate**——prompt 装配的唯一消费者是 daemon（前端经 `prompt/render` 协议查看），按 ADR-0009 的反预拆分刹车，第二个消费者出现前不拆。

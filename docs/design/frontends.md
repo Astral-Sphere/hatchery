@@ -20,10 +20,10 @@ impl DaemonClient {
 ### 2.1 形态
 
 - `hatchery`：默认进 ratatui TUI。
-- `hatchery exec "task"`：headless，stdout 人类可读或 `--json` JSONL（脚本/CI/SDK 场景，借鉴 codex exec）。
-- `hatchery acp`：ACP server 入口（design/acp.md）。
+- `hatchery exec "task"`：headless，stdout 人类可读或 `--json` JSONL（脚本/CI/SDK 场景，借鉴 codex exec）。**Code 模式下的行为待定：D16，见 §2.3。**
+- `hatchery acp`：ACP server 入口（design/acp.md）。**尚未存在**（`Command` 今天只有 `Chat | Exec | Daemon | Doctor | Help | Version`，`usage()` 也没列它），随 **M3** 交付。
 - `hatchery daemon {start|stop|status}`；`hatchery doctor [--provider X]`（llm.md §7 实测探测）。
-- `hatchery sessions {list|resume|export|delete}`。
+- `hatchery sessions {list|resume|export|delete}`：**尚未存在**，M2 Phase 6 加（`Command` 变体 + `usage()` 一并列出）。
 
 ### 2.2 TUI 布局（ratatui）
 
@@ -46,13 +46,15 @@ impl DaemonClient {
 └────────────────────────────────────────────┘
 ```
 
-- 渲染原则：TUI 是事件流的投影（view projection），无本地状态机复制；所有动作发协议方法。`draw(&Model, Frame)` 是纯函数，TestBackend 黄金帧验证；widget 层（`tui/widgets/`）每个表面一个模块：transcript / composer / status / indicator / toasts / scrollbar。
+- 渲染原则：TUI 是事件流的投影（view projection），无本地状态机复制；所有动作发协议方法。`draw(&Model, Frame)` 是纯函数，TestBackend 黄金帧验证；widget 层（`tui/widgets/`）每个表面一个模块：transcript / composer / status / indicator / toasts / scrollbar。**这条纪律与 M2 的弹层需求正面冲突，Phase 6 必须先裁决 D18**：审批弹层、`/branch`、`/rewind` 本质是交互式选择器（选目标 item、选 scope、`confirm: true` 确认破坏性删除），需要 pending 请求字段、选项表与选择游标、模态键分支。要么把模态态严格定义成「协议状态的投影」（pending 审批来自事件、分支列表来自 `session/branch/list` 的回复，游标只是纯 UI 位置），要么显式承认存在一类受约束的本地 UI 状态——**不能让它悄悄长出第二套状态机**，那正是 ADR-0001 要规避的双接线。
 - **滚动是 UI 级的**：TUI 占用 alternate screen，终端回滚不参与；transcript 自绘换行（unicode-width，词边界断开、宽字符之间可断、仅超宽词硬断）并缓存换行后的行表（`Model::relayout`，模型或宽度变化时重建），滚动偏移与消息跳转地址化真实渲染行。follow 态骑在尾部；任何上滚打破 follow，`End` 或滚回尾部恢复。
 - **滚动条与鼠标**：transcript 最右列是常驻预留的 gutter（换行按 `width − 1`；bar 显隐不改换行宽度，缓存不在滚动中途重排——与 qwen-code `VirtualizedList`「列常驻、不 reflow」同裁决）。有溢出时画比例滚动条：thumb `█`、track `│`，`thumb = track² / total`，位置随 offset 成比例。滚轮每 notch 3 行（qwen-code 的 `WHEEL_LINES_PER_TICK`）；bar 上左键按下/拖拽按 track 行绝对定位窗口，拖到底行回 follow（sticky-bottom 同 qwen-code）。左键单击工具/思考单元格逐格展开/折叠其内容：单格覆盖（`Cell.expanded`）优先于默认（reasoning 跟 Ctrl+R 全局折叠，tool 默认展开），Ctrl+R 翻转全局折叠并清除全部单格覆盖——主开关一动，例外归零。与 qwen-code 的差异：bar 常显而非空闲自动隐藏——常驻的轨是「上面还有历史」的 affordance。鼠标捕获开启期间，终端自带的文本选择需 Shift。
 - 主题：语义色层（accent/text/dim/faint/success/warn/error/code/tool/thinking）× dark/light 两套调色板；`ui.theme = auto|dark|light`（配置播种）+ `/theme` 前端本地切换；`auto` 用 OSC 11 背景查询探测（150ms 上限），回退 `$COLORFGBG`，再回退 dark。
 - 动画：250ms tick 驱动 braille spinner、turn 秒数与吐司过期；仅 turn 活跃或工具 in-flight 时 tick 才脏化重排。
-- 斜杠命令：`/mode /effort /model /theme /prompt(查看导出) /rewind /branch(list|switch|delete) /edit(选择历史消息编辑) /approval(规则管理) /export /clear /quit`。
-- 审批 UI：内联弹层展示 ApprovalRequest（含 diff/命令预览），快捷键 1-4 对应四个 option（M2）。
+- 斜杠命令：`/mode /effort /model /theme /prompt(查看导出) /rewind /branch(list|switch|delete) /edit(选择历史消息编辑) /approval(规则管理) /export /clear /quit`。**今天存在的只有 `/mode /effort /model /theme /prompt /quit`**，其余六个随 M2 Phase 6。每条新命令要动六处（`SlashCommand` 变体、`parse` 的名字匹配臂、参数解析器、`actions()` 臂、`local_reply()` 的用法臂、`submit_line` 的 match），且 `/rewind` `/branch` 还要求改掉 `actions()` 的 fire-and-forget 形状：`submit_line` 今天把每个回复都丢掉，而 `session/branch/list` 返回的 `Vec<BranchNode>` 必须渲染成节点表、`session/rewind` 返回的 `RewindReport` 用户必须看见。
+- 审批 UI：内联弹层展示 ApprovalRequest（含 diff/命令预览），快捷键 1-4 对应四个 option（M2 Phase 6）。预览载荷的形状由 **D14** 在 Phase 2 定（建议给 `ApprovalRequest` 加可选的结构化 preview，而不是新开一个 `approval/details` 方法——ACP 的 `request_permission` 要同一份内容，放请求里一次到位）。今天的地基是空的：`Model::push_event` 的 `ApprovalRequested` 臂只把状态栏文字改成 `awaiting approval`，`request_id` 与整个 `ApprovalRequest` 都丢弃；`CellKind` 没有 Approval 变体；`layout()` 返回固定的六行分割、没有弹层槽，`draw()` 也没有 z-order/`Clear` 通道；`key_input` 没有模态分支，`1`-`4` 会被 composer 当普通字符吃掉；`Esc` 硬接 `session/cancel`，而代码注释已把「审批等待期间弹层拥有 Esc、空闲 Esc 是误触」写成约定，交接未实现。绘制本身不需要新依赖：ratatui 0.30 的 `Clear` 在默认 feature 里，居中弹层 = 一次后置的 `Clear` + widget pass（或 `layout()` 的第七个约束，取决于 D18）。
+- diff 视图（M2 Phase 6，**D11 已裁决**）：用 `similar` 计算 hunk，用**现有主题语义角色**渲染（`+` 行 / `-` 行 / hunk 头 / 文件名各自映射到一个语义角色，具体配色随实现定），**不引 syntect**。理由：① diff 视图要的是 +/- 着色与 gutter，不是 token 着色，语义色层已经在；② syntect 重（一个 regex 后端 + syntax sets），而 D5 否掉 termimad 的理由之一正是这种依赖耦合；③ 房内先例——atomcode 用 `similar = "2"`（`references/atomcode/Cargo.toml`）。代码块的语法高亮是**另一个决定**，继续后排（开放问题 1）。`markdown.rs` 记的那笔表格列对齐欠账随本条一起还：它当初卡住的正是「列宽对齐需要视口宽，与单元格换行缓存的宽度无关性冲突」。
+- **分支移动后的历史重建：不加新事件**。`/rewind` 与 `/branch switch` 会把活动分支头移到一个不是当前投影后继的位置。**不为此新增事件类型**（新增事件 `type` 属协议 major bump）：`SessionUpdated.state.active_branch_head` 已经在广播里，前端发现自己投影的 head 不是它的后继，就发 `session/load` 重建 transcript；发起方本来就在自己那次调用的回复里拿到新 Session，不需要额外通知。
 - reasoning 展示：默认折叠为「∴ Thought for n chars (click or Ctrl+R to expand)」(M1 决策：按字符计数，逐字节纪律优先于估算)，`Ctrl+R` 展开或点击该单元格展开；尊重配置 `ui.show_reasoning`。
 
 键位与鼠标（M1 定稿，2026-10-05）：
@@ -67,7 +69,7 @@ impl DaemonClient {
 | 滚轮上 / 滚轮下 | 上/下滚 3 行（打破 follow；滚回尾部恢复） |
 | 滚动条左键按下 / 拖拽 | 按 track 行绝对定位窗口；拖到底行恢复 follow |
 | 左键单击工具 / 思考单元格 | 展开/折叠该单元格内容（单格覆盖；Ctrl+R 为 reasoning 全局开关并清除覆盖） |
-| `Esc` | turn 进行中发 `session/cancel`（空闲为误触，无副作用） |
+| `Esc` | turn 进行中发 `session/cancel`（空闲为误触，无副作用）。**M2 Phase 6 起交接**：有审批等待时 Esc 归弹层（具体语义随 D18 定），不再直接发 cancel |
 | `Ctrl+C` | 退出 TUI |
 
 - 键位与交互细节在 M1 实现中定稿；TUI 文案全部走 gettext catalog（platform.md，M4 落地）。
@@ -75,7 +77,9 @@ impl DaemonClient {
 ### 2.3 headless exec
 
 - 无 TTY 时自动降级为流式纯文本输出。
-- `--json`：逐行输出协议事件子集（item 级），供 SDK/脚本消费；退出码区分 completed/failed/cancelled。
+- `--json`：逐行输出协议事件子集（item 级），供 SDK/脚本消费；退出码区分 completed/failed/cancelled（`Outcome` = 0/1/2；Ctrl-C 经 `session/cancel` 落到 cancelled）。
+- **Code 模式：M2 Phase 6 必须裁决（D16）。** 今天 exec 只能跑 Chat 会话——`open_subscribed` 硬编码 `SessionModeId::chat()`，`ExecArgs` 只有 `prompt / json / session / workspace / model / state_dir`：没有 `--mode`，没有任何审批策略标志（`--approve`/`--deny` 一类），也没有从 stdin 读 prompt 的路径。而 `ApprovalRequested` **在** `--json` 的转发子集里（item 级），所以脚本会看到审批事件、然后这一轮**永久挂住**（直到下一次调用撞上 120 s `CALL_TIMEOUT`，或事件流结束）。二选一：① 加 `--mode` + 审批策略标志，策略要能表达 allow-once / allow-always / deny 与超时行为（fail-closed 是审批管线本身的纪律，exec 不能例外）；② 明确「exec 拒绝 Code 会话」——被要求以 code 模式起会话时报错退出，而不是挂住。两者都比现状好：现状是最坏的一种失败形态（静默、无退出码、脚本只能等超时）。
+- 审批进了 exec 之后，退出码矩阵要不要为「审批被拒」单开一档（testing.md §3.8 已预留这一格），随 D16 一起定。
 
 ## 3. GTK 桌面端（hatchery-gui）
 
@@ -123,7 +127,7 @@ GTK 主循环: 收事件 → 更新 gio::ListStore / AdwExpanderRow 等模型 �
 
 ## 开放问题
 
-1. ~~TUI 的 markdown/diff 渲染库选型（termimad? syntect 自绘?）~~ **已裁决（2026-09-30，D5）**：ratatui + minimad 自绘。实证记录见 `docs/worklog/cli.md`；syntect（代码块/diff 高亮）推迟 M2。
+1. ~~TUI 的 markdown/diff 渲染库选型（termimad? syntect 自绘?）~~ **已裁决（2026-09-30，D5）**：ratatui + minimad 自绘。实证记录见 `docs/worklog/cli.md`；syntect（代码块/diff 高亮）推迟 M2。**2026-10-07 更新（D11）**：M2 的 diff 视图又重新评估了一次 syntect，**在 diff 这一项上否决**——改用 `similar` 算 hunk + 现有主题语义角色渲染（§2.2，理由三条记在那里）。于是 syntect 只剩下「代码块语法高亮」这一个用途，作为一个**独立的后续决定**继续挂着，不在 M2 范围内。
 2. GTK 消息列表在超长会话（10k items）下的虚拟化与增量渲染性能——M4 用 fixture 压测。
-3. 图片附件的输入路径（粘贴/拖拽/文件引用）CLI 与 GUI 的一致性——M2。
+3. 图片附件的输入路径（粘贴/拖拽/文件引用）CLI 与 GUI 的一致性——**M2（2026-10-07 用户裁决保留在 M2）**，且与 llm 侧的多模态工作（Phase 5）耦合：协议侧 `ContentPart::Image { mime_type, data }` 已经在，缺的是 llm 侧到 wire 的翻译 + CLI 侧的图片输入路径。**两半必须一起落**，否则图片进得了库却发不出去。GUI 侧的一致性仍随 M4。
 4. CLI 是否需要 REPL 极简模式（无 TUI 依赖，SSH 友好）——倾向 M1 顺手做（exec 已覆盖大半）。

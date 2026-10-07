@@ -6,9 +6,10 @@
 
 - **active branch head（活动分支头）**：会话当前指向的 item；`rebuild_chain` 从它向根回溯。编辑分叉、切换分支改的都是它（ADR-0003，design/storage.md §4）。
 - **branch（分支）**：共享祖先的 item 链。编辑历史消息产生分叉，旧分支保留；同一时刻只有活动分支对模型可见。
+- **checkpoint item（检查点 item）**：`ItemKind::Checkpoint { commit_id, kind }`——树里携带影子 Git commit id 的那条记录。它**不进模型请求**（`is_conversation()` 不含 Checkpoint），只负责把一次快照定位在历史的某个位置上：Code scope 的 rewind 就是「从 target_item 沿旧活动分支向后扫第一个 checkpoint item，恢复到它的 commit」。`checkpoints` **表**（`item_id` 可空）不是这条查询的路径，它服务跨会话的预算核算与 GC（ADR-0006，design/storage.md）。
 - **generation（代际号）**：runtime 装配序号，落在会话行上。新 runtime 组装前先 `bump_generation`，其事件都带此号；客户端丢弃低于已知代际的事件（不变量 1，protocol.md）。
 - **item**：会话树上的一条记录（用户消息、推理块、助手消息、工具调用/结果、检查点等 9 种，`ItemKind`）。append-only，永不改写（不变量 3）。
-- **lease（会话租约）**：「一个会话同一时刻至多一个在跑 turn」的守卫。M1 的实现是 manager 的 runtime 槽位 + `turn_running` 信号，在途第二 prompt 拒绝 `TurnInProgress`；跨进程文件租约随 M2 检查点（worklog/daemon.md）。
+- **lease（会话租约）**：「一个会话同一时刻至多一个在跑 turn」的守卫。实现是 manager 的 per-session turn 闸门 + runtime 上的在途 CAS 标记 + `turn_running` 信号，在途第二 prompt 拒绝 `TurnInProgress`。**跨进程文件租约不做**（2026-10-07 裁决，此前文档写「随 M2 检查点」）：`--embedded` 无实现、CLI 只有 attach-or-spawn，单实例 `daemon.lock` 已经挡住跨进程双 runtime；跨会话共享一个影子仓库要的是 daemon 内 per-workspace 互斥（ADR-0006），不是文件锁。文件租约等多 daemon 形态真出现时再引入。
 - **replay_from**：`session/load` 的补差游标——返回活动分支上该 item **之后**的部分；游标不在活动分支上则拒绝。重连前端用它补上断线期间错过的事。
 - **session / turn / runtime**：会话是持久实体（store 里的一行 + item 树）；turn 是一次 prompt 驱动的多轮模型-工具循环（kernel 状态机）；runtime 是某一代际下装配起来的运行物（provider+tools+history+sink），可空闲卸载、再次 prompt 时重组。
 - **resume**：关掉前端再回来：`session/load` 重建视图，下一个 prompt 从 store 重建上下文继续——模型可见的历史与断线前逐字节一致（不变量 2）。
@@ -28,7 +29,7 @@
 - **DaemonClient / EventStream**：前端唯一的数据通道（ADR-0001 瘦客户端）：调用连接按 id 路由回复；事件连接单独一条，订阅调用（`session/new`/`session/load`）在它上面发出。
 - **disposer**：逆序执行的 teardown 步骤栈（ADR-0009）；一步 panic 不阻断其余步骤。
 - **fail-loud 审计**：启动时把所有缺件（provider 缺 key、目录不可写……）一次列全再退出，拒绝半可用的 daemon。
-- **LiveHub**：per-session broadcast 扇出（容量 4096）。M1 无 coalescing、无 replay window——重连靠 `session/load` 重建，这是文档化的形状而非缺口。
+- **LiveHub**：per-session broadcast 扇出（容量 4096）。无 coalescing、无 replay window——重连靠 `session/load` 重建，这是文档化的形状而非缺口；两者顺延 M3（2026-10-07 裁决）：`is_coalescable` 只含 text/reasoning delta，而 Code 模式新增的事件量主要来自**不可合并**的 `ToolCallProgress`，coalescing 治不了它。
 - **stdio 监听**：与 UDS 同一条 `serve_connection` 循环的 stdin/stdout 实例，嵌入方用。
 
 ## llm 与能力
@@ -36,6 +37,7 @@
 - **capability table（能力表）**：模型族 → wire 行为（reasoning 旋钮、echo、签名）的数据行；`ProviderConfig::capability_table()` 是 built-in + config 覆盖的唯一折算点，adapter 与 daemon 的历史回填读同一份。
 - **echo_reasoning**：是否把已存的推理块回填进后续请求。DeepSeek/Qwen 当前行是 false（provider 自生推理）；打开时**逐字节**回传（ADR-0007，不 trim 不改写——那点空白就是 provider 的缓存键）。
 - **effort / ReasoningEffort**：推理力度档位（off–max），按能力表映射成各家的 wire 字段（`reasoning_effort`、`thinking:{type}`、`enable_thinking`+budget）。
+- **hard gate（硬门）**：不可被项目级配置、规则表或 prompt 注入放行的审批门（不变量 5）——`~/.ssh`、`~/.config/hatchery`、`.git/hooks`、`.env*` 这类路径的写入。**表达方式是 `ApprovalRequest::once_only()`**（不提供 `AllowAlways`/`DenyAlways` 两个可记忆选项）+ kernel 拒绝任何未被提供的答复，而**不是**新增 `RiskLevel` 变体：新增枚举值属协议 major bump，而 `RiskLevel::is_hard_gate()` 只认 `WritesOutside`，表达不了工作区**内**的 `.env*` 与 `.git/hooks`。**注意这条承重的校验目前没有测试钉住**，且 testkit 的 fake 在 API 层面造不出收窄选项的请求（结构性不可测）——M2 Phase 0 补，见 worklog/kernel.md。
 - **hybrid model（混合推理模型）**：默认带推理、可用参数关闭的单模型世代（2026-09-30 校准：`deepseek-flash`、`qwen3.8-flash`），区别于旧「off 换模型」的 ModelSwitch 行。
 - **MockWire**：testkit 的 wiremock 装配——按 fixture 回放 SSE 字节并记录收到的请求体；不变量 2 的「实际请求」一端由它供给。
 - **thinking switch**：DeepSeek 家族的推理开关（`thinking:{enabled|disabled}`），模型不换。

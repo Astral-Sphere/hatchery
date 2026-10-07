@@ -1,6 +1,6 @@
 # 设计：Wire 协议与数据模型（hatchery-protocol）
 
-> 状态：**已实现（M0b）**。依赖 ADR-0001（全协议化）、ADR-0003（分叉模型）。本文档的代码块已与 `crates/hatchery-protocol` 的实际类型对齐——落地过程中有若干草图被修正，逐条记在下面的「M0b 修正」节。
+> 状态：**已实现（M0b）**。依赖 ADR-0001（全协议化）、ADR-0003（分叉模型）。本文档的代码块已与 `crates/hatchery-protocol` 的实际类型对齐——落地过程中有若干草图被修正，逐条记在下面的「M0b 修正」节。标了 **M2 Phase N** 的形状（§2.1 的四项加性扩展、§4 的历史重建约定）是**目标态、尚未实现**。
 
 ## 1. 定位
 
@@ -95,9 +95,34 @@ pub enum StopReason { ModelDone, MaxRounds, MaxTokens, Interrupted }
 
 **`Content` 与 `Message` 的分工**：`Content` 是 wire 与存储的形态；kernel 另有自己的 `Message`（含 role/reasoning/tool_calls），由 daemon 侧的装配器从 item 链构造（kernel.md §6）。
 
+### 2.1 M2 的加性扩展（目标态，尚未实现）
+
+四项都是**加字段或加类型**，因此落在 §6「方法/字段只增不改语义」里、major 1 内合法；**没有一项需要新枚举值或新事件 `type`**——那两样在 major 内是冻结的。
+
+**① diff 载荷类型（Phase 1）**。协议今天没有任何 diff 类型（`UnifiedDiff`/`DiffHunk`/`FileDiff` 全仓库零命中），而三处要同一份内容：TUI 的 diff 预览、审批弹层的 preview、M4 GUI 的 diff 视图；`CheckpointStore::diff(from, to)`（capabilities.md §2 的草图）也需要一个**存在的**返回类型。约束是它必须**结构化而不是一个 unified diff 字符串**：前端要按语义给 `+`/`-` 着色并折叠上下文（D11），传字符串等于把解析责任推给每一个前端。字段形状在 Phase 1 与 `CheckpointStore::diff` 一起定稿。
+
+**② `ApprovalRequest` 的结构化 preview（Phase 2 · D14）**。`args_digest` 是一行摘要，它自己的文档写着「Not the raw JSON: the user must be able to decide in seconds, and raw arguments can be megabytes」——所以它**装不下** diff，也装不下一条完整命令。裁决是加一个可选字段而不是新开 `approval/details` 方法：M3 的 ACP `session/request_permission` 要把同一份内容放进 `ToolCallContent`，放请求里一次到位，不必为看预览多一次往返。
+
+```rust
+pub struct ApprovalRequest {
+    pub tool: String, pub args_digest: String, pub risk: RiskLevel,
+    pub options: Vec<ApprovalOption>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview: Option<ApprovalPreview>,      // M2 Phase 2（D14）
+}
+
+pub enum ApprovalPreview { Diff(UnifiedDiff), Command { argv: Vec<String>, cwd: PathBuf }, Excerpt(String) }
+```
+
+**③ 审批规则的 list / delete 方法（Phase 2）**。今天一条已持久化的规则**既看不见也撤不掉**：一条误存的 `DenyAlways` 会永久废掉一个工具，除了直接改数据库没有补救。`approval_rules` 表没有排序列也没有 enabled 列（storage.md §2），所以 scope/matcher/decision 的文法与求值顺序由 **D8** 定义，协议只负责把它们列举出来、删掉。
+
+**④ `SessionLoadResult.pending_approvals`（Phase 3）**。`PendingApproval` 今天零 fixture、零消费者；重连的前端拿不到「有一个审批正等着我」，弹层就重画不出来。
+
+**硬门不靠新增 `RiskLevel` 变体表达。** `RiskLevel::is_hard_gate()` 只认 `WritesOutside`，而 design/capabilities.md §5 把**工作区内**的 `.env*` 与 `.git/hooks` 也列为硬门——两者对不上。补一个变体是错的方向：新增枚举值属 major bump，而「未知枚举值一律硬失败」是刻意设计（§6），加一个值就要所有前端同步升级。已有的机制够用：`ApprovalRequest::once_only()` 用「不提供 `AllowAlways`/`DenyAlways`」表达「不可记忆」，而 kernel 会拒绝一个没被提供过的答复（kernel/src/agent.rs 的 `await_approval`）。所以路径门要做的只是为工作区内的敏感路径**强制 `once_only`**，协议零改动。
+
 ## 3. 方法（client → daemon）
 
-命名沿用 ACP 风格（`session/*`），便于 ACP 适配层直译。方法名的**单一真相**是 `method.rs` 的 20 个常量（`method::SESSION_PROMPT` 等），单元测试把它与本文档的列表逐条对账。
+命名沿用 ACP 风格（`session/*`），便于 ACP 适配层直译。方法名的**单一真相**是 `method.rs` 的 20 个常量（`method::SESSION_PROMPT` 等），单元测试把它与本文档的列表逐条对账——所以**下表只列已接通的**；M2 要加的审批规则 list/delete 方法见 §2.1 ③，加进来时表与常量表一起动。
 
 | 方法 | 参数 / 结果类型 | 说明 |
 |---|---|---|
@@ -160,8 +185,9 @@ pub enum DaemonEvent { DaemonShuttingDown { reason: String } }   // 非会话级
 规则：
 
 - 事件顺序保证：同一 session 内严格有序（UDS 单连接 FIFO + daemon 内 per-session 广播队列）。
-- 只有 `TextDelta`/`ReasoningDelta` 允许 daemon 侧合并（`ServerEvent::is_coalescable`）；控制事件不合并、不乱序。
+- 只有 `TextDelta`/`ReasoningDelta` 允许 daemon 侧合并（`ServerEvent::is_coalescable`）；控制事件不合并、不乱序。合并**策略**本身排 M3：M2 新增的事件量主要来自 `ToolCallProgress`，而它不可合并，所以调这个窗口治不了 M2 的病。
 - 迟加入的前端：`session/load` 返回 active 分支 items（或 `replay_from` 之后的增量），随后接实时流。
+- **历史移动不加新事件**（M2 Phase 3 的约定）：`session/rewind`、`branch/switch`、`edit_item` 都会让前端已投影的链失效，但新增事件 `type` 属 major bump（§6），所以不为它开变体。`SessionUpdated.state.active_branch_head` **已经在广播里**：前端发现新 head 不是自己已投影 head 的后继，就发 `session/load` 重建；发起方本来就能在自己的回复里拿到新 Session，不需要事件。
 - 终止事件唯一：`TurnFinished` 或 `TurnFailed`（`ServerEvent::ends_turn`）。
 
 ## 5. 错误模型
@@ -208,7 +234,7 @@ pub enum ErrorCode {                   // 数值一旦发布不可变（golden �
 
 ## 开放问题
 
-1. 事件 coalescing 的具体策略（按帧时间窗还是按 delta 数）——M1 实测后定。`is_coalescable` 已就位。
+1. 事件 coalescing 的具体策略（按帧时间窗还是按 delta 数）——**顺延 M3**（2026-10-07 裁决，原挂 M2）。`is_coalescable` 已就位，但它只覆盖 `TextDelta`/`ReasoningDelta`，而 M2 新增的事件量主要来自**不可合并**的 `ToolCallProgress`：调这个窗口治不了 M2 的病。M2 只产出一次 Code 会话的事件量测量，作为 M3 定策略的依据。
 2. 是否需要 `session/watch`（观察他人会话而不注入）与 `session/takeover`（多前端抢占输入权）——倾向 M4 GTK 多窗口时再设计。
 3. ~~ItemId 用 ULID 还是自增 + session 前缀~~ → **已定（2026-09-28）：UUIDv7**（`uuid` crate 的 `v7` + `serde` feature，wire 上是小写带连字符的 36 字符字符串）。理由：时间有序（字典序 = 时间序）、无需协调、生态工具（SQL/JSON/日志）都认 UUID；ULID 的 26 字符可读性优势不足以抵消「引入第二种 id 格式」的成本。M0b 实测 `Uuid::now_v7()` 产出 v7 且文本序与时间序一致。
-4. 大工具输出（如 shell 日志 >1MB）是否走「存库 + 事件带引用」而非内联——倾向带引用（借鉴 dsh spill），**形状已就位**（`ToolOutput::spilled`），M2 定阈值与落盘路径。
+4. 大工具输出（如 shell 日志 >1MB）是否走「存库 + 事件带引用」而非内联——倾向带引用（借鉴 dsh spill），**形状已就位**（`ToolOutput::spilled`，但今天没有任何产品路径构造过它），阈值与落盘路径是 M2 **Phase 4** 的 **D12**，与 kernel 的上下文 token 预算 v1 同排——两者是「工具输出太大」这同一个问题的两半。同阶段还裁定**凭据脱敏发生在接缝处**（工具输出离开 backend 时）而不是入库时：入库内容若与模型实际看到的不同，不变量 2 的「重建 == 实际请求体」就被破坏。对本文档的含意是——`ToolOutput` 里存的必须就是模型看到的那一份。

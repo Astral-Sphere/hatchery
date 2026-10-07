@@ -1,6 +1,6 @@
 # 设计：Agent 循环（hatchery-kernel）
 
-> 状态：**已实现（M0b）**。依赖 ADR-0004、0005、0007、0009。layer **L1**：kernel 依赖 protocol 的共享词汇表，但仍**不得**依赖 capabilities（否则成环，architecture.md §3）。
+> 状态：**已实现（M0b）**，M1 增补两处（`TurnInput { turn, content }`、`AgentHandle::turn_running`）。文中标了 **M2 Phase N** 的形状是目标态、尚未实现。依赖 ADR-0004、0005、0007、0009。layer **L1**：kernel 依赖 protocol 的共享词汇表，但仍**不得**依赖 capabilities（否则成环，architecture.md §3）。
 
 ## 1. 职责边界
 
@@ -33,7 +33,7 @@ impl Agent {
 }
 
 pub enum AgentCommand {
-    TurnInput(Content),                                   // 仅在 idle 时有效
+    TurnInput { turn: TurnId, content: Content },          // 仅在 idle 时有效；turn id 由调用方铸币
     Interrupt,
     ApprovalDecision { request_id: ApprovalId, option: ApprovalOption },
 }
@@ -46,6 +46,8 @@ pub enum TurnCompletion {
 ```
 
 `session` 只出现在 builder 里，因为 item 要带它；除此之外 kernel 对「会话」一无所知。`ChatOptions` 的 `tool_defs` 每轮由 kernel 用冻结快照覆盖，调用者无法故意或无意地让「模型看到的表」与「调用派发的表」不一致。
+
+**`turn` 随命令进来、不由 kernel 自造**：`session/prompt` 的回复必须报出与后续每个事件、每个 item 同一个 TurnId，而回复是 daemon 写的——所以 daemon 铸币、kernel 沿用。（`AgentCommand::prompt` 构造器仍自己铸币，给不关心 id 的调用方；带 id 的是 `prompt_with_turn`。）
 
 ## 3. Turn 状态机
 
@@ -134,7 +136,11 @@ pub trait ToolHost: Send + Sync {
     ) -> Result<ToolInvocation, KernelError>;
 }
 
-pub struct ToolInvocation { pub output: ToolOutput, pub is_error: bool }
+pub struct ToolInvocation {
+    pub output: ToolOutput,
+    pub is_error: bool,
+    pub checkpoints: Vec<Checkpoint>,   // M2 Phase 1（D13）：这次调用写前打的影子 git 检查点
+}
 ```
 
 相对 M0a 草图的四处加/改，都有实测或结构性理由：
@@ -144,7 +150,9 @@ pub struct ToolInvocation { pub output: ToolOutput, pub is_error: bool }
 3. **进度走通道而不是 `Arc<dyn Fn>`**：kernel 必须在 await 工具的同时异步转发进度，同步回调做不到；同一个 select 循环也正是「中断能取消工具」的实现方式。工具**返回的那一刻**还排在通道里的进度要先排空再收尾：biased select 先 poll 进度通道、再 poll invoke，所以「一次 poll 内发进度并返回」的工具，它最后那条进度会留在通道里被丢掉（`progress_sent_as_the_tool_finishes_still_reaches_the_sink` 钉住；带 gate 的测试看不见这个窗口）。中断路径不排空——那次调用正要被记成 `Cancelled`，事后再冒出来的进度会描述一件记录上说没做完的事。
 4. **Turn Tool Snapshot**：turn 开始时冻结 `snapshot()`，整轮（包括多轮往返）都用同一份 `tool_defs`；注册表的 `replace()` 是整表原子替换（ADR-0009 纪律 3），进行中的 turn 不受影响。
 
-工具并行：同一 round 的多个 tool call 目前**串行**执行（输出顺序确定性利于回放）；`parallel_safe` 只读工具的并行是 M2+ 优化。
+**检查点为什么由 kernel 提交成 item（M2 Phase 1 · D13）**：`ToolCtx` 带一个收集器，`LocalFs` 在写之前 push，`ToolInvocation` 把收集到的检查点带出来，然后 **kernel 在 ToolResult item 之前追加 Checkpoint item**，链变成 `… → ToolCall → Checkpoint → ToolResult`。kernel 是这件事的正确归属：它已经在造 ToolCall/ToolResult item、用的是同一套提交机器，顺序天然正确。而这个顺序是安全的，因为工具结果靠 `ToolResult.call: ItemId` 与其调用配对、**不靠父子关系**——§7「一次只开一个 item、树保持为链」的纪律不受影响。检查点因此对模型不可见（`ItemKind::is_conversation()` 不含 Checkpoint），却对 rewind 可见（`ItemKind::Checkpoint` 自己带着 `commit_id`，见 storage.md §5）。
+
+**工具并行：同一 round 的多个 tool call 串行执行，这是设计而不是待优化项**（M2 裁决，原开放问题 1）。输出顺序确定性利于回放只是最表面的理由；真正的原因是把并行做对要重做提交序与确定性纪律，而收益只有延迟。七处结构阻碍记在 worklog/kernel.md 的 2026-10-07 条（item 链的单亲指针 `self.tail`、`AwaitingApproval` 的单槽、命令通道的单消费者、每次 `invoke_tool` 独占的进度通道与 select，加上 `ToolHost` 根本不带 `parallel_safe` 一类的元数据——**决策的输入本身也不存在**）。
 
 ## 6. 上下文组装
 
@@ -159,9 +167,12 @@ pub trait HistorySource { async fn view(&self) -> Result<HistoryView, KernelErro
 
 - 按 provider 能力表过滤/保留 reasoning 块（ADR-0007）；
 - compaction item 替换其覆盖区间；
-- token 预算裁剪（最旧 round 优先，工具结果先于消息裁剪）。
+- token 预算裁剪（最旧 round 优先，工具结果先于消息裁剪）——**M2 Phase 4**，与 `ToolOutput::Spilled`（D12）同排：两者是「工具输出太大」这同一个问题的两半，来源是 shell 与 web_fetch；
+- **system prompt 作为一条 `Role::System` 的 `Message` 排在最前**（M2 Phase 0 · D15）。
 
 store 只返回**有序 item 链**（storage.md §4），这些过滤都在 daemon——它们需要 provider 能力表，而 store 没有也不该有。
+
+**system prompt 不走 `ChatOptions`**：`ChatOptions` 是「中立旋钮」（§4），没有也不该有 system 字段——prompt 是一条**消息**，不是一个旋钮。它由 daemon 的 `HistorySource::view()` 产出，接缝已经够用（`Message::system` 与 llm 侧 `Role::System => WireMessage::system(text)` 的翻译都在），**kernel 无需改动**。渲染时机由 D15 定：建议在 runtime 装配时渲染一次、冻结整个 runtime 生命周期——模式切换与 config 变更本来就 bump generation 重组装，而每轮重渲染会让 environment 节的日期/cwd 破坏前缀稳定性，那正是项目为 KV cache 反复强调的东西。**不变量 2（重建 == 实际请求体）的边界随之重划为只管分支历史**：system prompt 是可复现的派生态，由 `prompt/render` 的 golden 单独钉住，而不是逐字节混进请求体断言里。
 
 kernel 自己只做两件事：把本轮用户输入作为 item 提交（保证「模型可见 = 已记录」），并把工具结果作为 `Message` 回填给下一轮。
 
@@ -198,7 +209,7 @@ pub enum KernelEvent {
 
 ## 开放问题
 
-1. 多 tool call 并行的启用条件与顺序保证——M2 决定。
+1. ~~多 tool call 并行的启用条件与顺序保证~~ → **已裁决（2026-10-07，M2）：不做**。串行是设计而不是待优化项；理由与七处结构阻碍见 §5 与 worklog/kernel.md 同日条目。
 2. kernel 是否需要 `SubAgent` 原语（spawn 子 Agent）还是由 daemon 层做多 runtime 编排——倾向后者（kernel 保持单纯），M3 ACP client 时验证。
 3. compaction 触发策略（token 阈值 vs round 阈值）与 side-query 摘要实现——M5。
-4. 工具级重试上限（草图里的 `max_tool_retries`）暂未实现：先要有「可重试失败」的语义（哪些工具失败值得重试），M2 与工具层一起定；`TurnLimits` 现在只有 `max_rounds`。
+4. 工具级重试上限（草图里的 `max_tool_retries`）→ **顺延 M5**（2026-10-07 裁决）：全仓库只有本节与 roadmap 的顺延表提及它，「可重试的工具失败」既没有语义也没有第一个消费者，正是 ADR-0009 反预拆分刹车的适用场景。`TurnLimits` 只有 `max_rounds`（默认 100）。
