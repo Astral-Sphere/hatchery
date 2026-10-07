@@ -172,6 +172,8 @@ pub trait HistorySource { async fn view(&self) -> Result<HistoryView, KernelErro
 
 store 只返回**有序 item 链**（storage.md §4），这些过滤都在 daemon——它们需要 provider 能力表，而 store 没有也不该有。
 
+**per-turn 旋钮（D19，2026-10-07）**：`AgentCommand::TurnInput` 带一个 `options: Option<ChatOptions>`，kernel 用它覆盖装配时那份，`None` 就用装配时的。这让 daemon 能把「跟着 turn 走」的配置（model、reasoning effort）在 submit 时解析好交进来，而不必为了一个 effort 字段重组装 runtime。**唯一的例外是 `tool_defs`**：它始终取自冻结的 `ToolHost::snapshot`（显式字段写在 spread 之前，所以调用方给的工具表会被覆盖掉），一轮可以换模型换 effort，但绝不能让「模型被广告的工具表」与「调用被派发到的工具表」不是同一张。kernel 依旧不解释任何旋钮的含义。
+
 **system prompt 不走 `ChatOptions`**：`ChatOptions` 是「中立旋钮」（§4），没有也不该有 system 字段——prompt 是一条**消息**，不是一个旋钮。它由 daemon 的 `HistorySource::view()` 产出，接缝已经够用（`Message::system` 与 llm 侧 `Role::System => WireMessage::system(text)` 的翻译都在），**kernel 一行未改**——落地时核对过：`Message::system` 此前零消费者，现在是这一个；llm 的 `translate.rs` 也未改。
 
 渲染时机由 **D15 定稿**：在 runtime 装配时渲染一次、冻结整个 runtime 生命周期。理由**不是**规划时写的「模式切换与 config 变更本来就 bump generation 重组装」——实测不成立：全仓库唯一的卸载路径是空闲清扫，`session/set_config` 与 `config/set` 都不重组装活着的 runtime（daemon.md 开放问题 5）。真正的理由是每轮重渲染会让 environment 节的日期/cwd 破坏请求前缀的稳定性，那正是项目为 KV cache 反复强调的东西；而 model 与 effort 本来就同样是「下次装配才生效」，冻结让 prompt 与它们一致。

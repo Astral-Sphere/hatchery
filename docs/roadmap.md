@@ -1,6 +1,6 @@
 # 路线图（M0–M5）
 
-> 每个里程碑的完成定义（DoD）都包含：`cargo test`/`clippy` 全绿 + 列出的端到端验证 + worklog 更新。测试分层、CI 门禁与「不变量 → 测试」映射见 [design/testing.md](design/testing.md)；各里程碑的测试交付物已列入其范围与 [worklog/testing.md](worklog/testing.md)。当前进度：**M0 完成**；**M1 代码完成**（2026-10-01，Phase 1–5 全部落地：llm adapter + 能力表、capabilities/tools、daemon 全栈、cli TUI/exec、e2e 与不变量收口，`./scripts/ci.sh` 本地全绿），手动 live 验收进行中（已产出 2026-10-04/10-05 三轮 TUI 修正：widget 层与双主题、滚动条与滚轮、词级换行与点击折叠），[worklog/testing.md](worklog/testing.md) 的六项清单尚未勾选——**M2 Phase 0 负责收口 M1**。**Phase 0 已于 2026-10-07 完成**（代码、门禁与文档三部分；`./scripts/ci.sh` 全绿）。M1 的手动 live 验收同日执行完毕（deepseek + qwen 真密钥、隔离的 state/data 目录）：六项里三项通过、三项部分通过，并跑出**五个清单外缺陷**——`/effort` 从不进入请求、TUI 不投影历史、TUI 不投影其他客户端的用户消息、`/prompt` 的响应被前端丢弃、detached daemon 的致命启动错误不进日志。**M1 因此暂不关闭**，修复范围待裁决；逐条实测证据见 [worklog/testing.md](worklog/testing.md) 本日条目。
+> 每个里程碑的完成定义（DoD）都包含：`cargo test`/`clippy` 全绿 + 列出的端到端验证 + worklog 更新。测试分层、CI 门禁与「不变量 → 测试」映射见 [design/testing.md](design/testing.md)；各里程碑的测试交付物已列入其范围与 [worklog/testing.md](worklog/testing.md)。当前进度：**M0 完成**；**M1 代码完成**（2026-10-01，Phase 1–5 全部落地：llm adapter + 能力表、capabilities/tools、daemon 全栈、cli TUI/exec、e2e 与不变量收口，`./scripts/ci.sh` 本地全绿），手动 live 验收进行中（已产出 2026-10-04/10-05 三轮 TUI 修正：widget 层与双主题、滚动条与滚轮、词级换行与点击折叠），[worklog/testing.md](worklog/testing.md) 的六项清单尚未勾选——**M2 Phase 0 负责收口 M1**。**Phase 0 已于 2026-10-07 完成**，**M1 同日关闭**：live 验收（deepseek + qwen 真密钥、隔离的 state/data 目录）首跑六项里三项通过、三项部分通过，并跑出**五个清单外缺陷**——`/effort` 从不进入请求、TUI 不投影历史、TUI 不投影其他客户端的用户消息、`/prompt` 的响应被前端丢弃、detached daemon 的致命启动错误不进日志。用户裁决五项全修 + reasoning 默认折叠，当日修完并**重跑清单六项全过**；`/effort` 那条催生了 **D19**（哪些配置跟着 turn 走、哪些跟着 runtime 走）。逐条实测证据见 [worklog/testing.md](worklog/testing.md) 本日条目。M2 从 **Phase 1** 起。
 >
 > **M2 已重新规划（2026-10-07）**：原 M2 段基于 M0/M1 的自述写成，一次全仓库勘察发现若干与代码不符之处（详见 M2 节的「勘察更正」），阶段划分因此重写为 Phase 0–8。M2 的体量明显大于 M1（用户裁决保留全部 worklog 标注为 M2 的条目，含 Responses adapter 与多模态输入）；**Phase 4 结束时评估是否把余下部分拆成 M2b**。
 
@@ -29,7 +29,8 @@
 - `hatchery doctor`。
 
 **DoD**：真实 provider 端到端对话（流式 + reasoning 展示与回放命中验证）；关终端重开会话 resume；两前端同时 attach 扇出一致。
-→ **代码侧全绿**（2026-10-01）：mock wire 的 e2e 场景 1/2 与不变量组在 `hatchery-tests`；第二 turn 请求体对已存 reasoning 做了逐字节断言（不变量 2）。**真实 provider 的手动验收清单**见 worklog/testing.md（M1 条目），通过后 M1 收口。
+→ **代码侧全绿**（2026-10-01）：mock wire 的 e2e 场景 1/2 与不变量组在 `hatchery-tests`；第二 turn 请求体对已存 reasoning 做了逐字节断言（不变量 2）。
+→ **DoD 达成、M1 关闭**（2026-10-07）：真实 provider 的手动验收清单六项全过（首跑三项部分通过、跑出五个清单外缺陷，当日修完重跑）。流式与 reasoning 展示/回放命中、resume、双前端扇出一致都有 live 证据；清单与逐条证据见 worklog/testing.md。
 
 ## M2 — Code 模式（工具、审批、回滚、编辑分叉）
 
@@ -68,7 +69,7 @@
 - [x] **删掉 daemon → `hatchery-acp` 的死依赖边**（更正 15）：Cargo.toml 与 Cargo.lock 各一行，`cargo xtask layering` 仍报 strictly downward、无环。
 - [x] **`check_i18n` 改成诚实的非门禁**：函数与 `run_step i18n` 删除，脚本末尾打印 `--- i18n: not gated yet (extraction lands in M4)`，`--help` 的步骤表照实写。
 - [x] **文档对账**（更正 14/16）：两个 crate README 已在前一批提交改对；本批把 platform.md §2.1、kernel.md §6/§7、testing.md §1/§3.5/§3.6/§5/§8、architecture.md §5 里已被实现推翻的口径改成实现后的真相。顺手修了 core.rs 里 `audit` 的文档注释错挂在 `env_key_unusable` 上（rustdoc 因此在错的函数上显示审计说明，而 `audit` 自己没有文档；`missing_docs` 未开所以一直没被发现）。
-- [ ] **M1 关闭 → 暂不关闭**（2026-10-07 live 验收已执行）：清单六项里 doctor、exec（含 `--json`）、回放命中三项通过；TUI、resume、双前端扇出三项**部分通过**，并跑出五个清单外缺陷（见 worklog/testing.md 本日条目与 design/daemon.md 开放问题 5）。Phase 0 自身的代码、门禁、文档三部分已完成，`./scripts/ci.sh` 全绿。**意外收获**：prompt 注入在真实 provider 上被直接证实——模型自述「我是 Hatchery…这里是只读的聊天模式…不能替你写文件或执行命令」，只调 `grep`/`glob`/`read_file`（带行号区间），被问「你现在处于什么模式」时答「Chat」，并跑通了多轮工具循环（round 1 grep+glob → round 2 read_file ×2 → 终答）。kernel 待办里「max_rounds 熔断与 `TurnCompletion` 语义在真实对话下验证」仍未做——live 那几轮都没触到熔断。
+- [x] **M1 关闭**（2026-10-07）：live 验收首跑六项里 doctor、exec（含 `--json`）、回放命中三项通过，TUI、resume、双前端扇出三项**部分通过**，并跑出五个清单外缺陷；用户裁决五项全修 + reasoning 默认折叠，当日修完**重跑六项全过**，`./scripts/ci.sh` 全绿。五项与修法：① `/effort` 从不进请求 → **D19**（effort 与 model 跟着 turn 走，跨 provider 的 `/model` 才重组装）；② TUI 不投影历史 + ③ 不投影他人的用户消息 → 同一个缺失机制，补 `push_history`/`push_live_item`（自己那条按 turn id 去重）；④ `/prompt` 无输出 → `project_reply` + `CellKind::Prompt`，`/effort` `/model` 吐司回报**实际生效**的值；⑤ detached daemon 的致命错误不进日志 → 两个 spawn 点都把子进程 stdout/stderr 追加进 `logs/hatchery-stdio.log`，失败消息点名它。另加 ⑥ reasoning 默认折叠（`ui.show_reasoning` builtin 默认与 CLI 兜底都改成 `false`；清单那句措辞本来就是对的，是 shipped 默认与它相反）。Phase 0 自身的代码、门禁、文档三部分已完成，`./scripts/ci.sh` 全绿。**意外收获**：prompt 注入在真实 provider 上被直接证实——模型自述「我是 Hatchery…这里是只读的聊天模式…不能替你写文件或执行命令」，只调 `grep`/`glob`/`read_file`（带行号区间），被问「你现在处于什么模式」时答「Chat」，并跑通了多轮工具循环（round 1 grep+glob → round 2 read_file ×2 → 终答）。kernel 待办里「max_rounds 熔断与 `TurnCompletion` 语义在真实对话下验证」仍未做——live 那几轮都没触到熔断。
 
 **Phase 1 — 检查点与写路径**（capabilities + store + protocol）→ 评审⑥
 `CheckpointStore` 从 spike 的 `Sandbox` 转正：open 配方（`init_opts` + 手写 `core.worktree`/`core.bare` + `set_workdir(.., false)`）、`harden()` 钉扎、每次打开重放 ignore 规则、`snapshot`/`restore`/`diff`/`gc`、restore 前自动 snapshot、per-workspace 互斥、启动断言影子 git-dir ≠ 用户任何 `.git`。**协议加 diff 载荷类型**（更正 5，必须在此——`diff()` 需要返回类型，且 TUI 与 M4 GUI 共用）。**D13** 落定并按此实现：`ToolCtx` 加检查点收集器（`LocalFs` 写前 push）→ `ToolInvocation` 带出 `Vec<Checkpoint>` → **kernel 在 ToolResult item 之前追加 Checkpoint item**（它已在造 ToolCall/ToolResult item，用同一套机器，顺序天然正确；链变成 `… → ToolCall → Checkpoint → ToolResult`，而工具结果靠 `ToolResult.call` 配对而非父子关系，不受影响）→ daemon 的 HubSink 在 Checkpoint item 落库后补写 `checkpoints` 行（失败只记日志，item 里已有 commit_id 可回退）。`FsBackend` 加写原语（`write_text_file` + `create_dir`/`remove`，purge 与 write_file 都要）；`LocalFs` 写路径写前打检查点；`MemoryFs` 同步。store 的 `checkpoints` 表 API（记录 + 按 workspace 列举，供预算/GC）。**D9** 预算熔断行为（GC 最旧 vs 拒写）+ 孤儿影子仓库 GC（storage 开放问题 3）。`TempWorkspace` 补 git init + 树 DSL；不变量 6 的测试从 `Sandbox` 迁到真 `CheckpointStore`。**D10 的 PTY spike 建议在本阶段并行做**（半天，产 ADR），实现留 Phase 4。
@@ -109,6 +110,7 @@ testing.md §9 的 M2 清单：真工作区改坏 → rewind、审批规则持�
 | D16 | headless exec 在 Code 模式下的审批策略 | Phase 6 |
 | D17 | web_fetch 的 HTTP client 与 HTML→Markdown 选型 | Phase 4 |
 | D18 | TUI 弹层/选择器与「Model 只是事件投影」纪律的和解方式 | Phase 6 |
+| D19 | ~~哪些配置跟着 turn 走、哪些跟着 runtime 走~~ → **已定并实现（2026-10-07）**：model 与 effort 跟着 turn（`turn_options` 在 submit 时解析，随 `TurnInput { options }` 进 kernel；`tool_defs` 例外，始终取冻结的 snapshot），provider adapter/能力表/echo 与 prompt 跟着 runtime，所以跨 provider 的 `/model` 触发重组装并广播 `GenerationBumped`，turn 进行中则拒绝而不是杀 turn。由 live 验收量出的「`/effort` 从不进请求」催生 | Phase 0 ✅ |
 
 kernel 的两个「M2 决定」开放问题在本里程碑内**裁决为不做**（决定本身即交付）：一轮多 tool call 并行——7 处结构阻碍（item 链单指针 `self.tail`、审批状态单槽 `AwaitingApproval{request_id}`、命令通道单消费者、进度通道独占，且 `two_calls_in_one_round_are_each_approved_separately` 与两条确定性测试会被打破），收益是延迟、代价是重做提交序与确定性纪律；`max_tool_retries`——全仓库只有设计文档一处提及，「可重试失败」还没有第一个消费者，正是 ADR-0009 反预拆分刹车的适用场景。
 

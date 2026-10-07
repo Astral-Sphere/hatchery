@@ -36,6 +36,12 @@
 
 ## 变更日志
 
+### 2026-10-07 · D19：`TurnInput` 带上 per-turn 旋钮
+
+`AgentCommand::TurnInput` 多一个 `options: Option<ChatOptions>`（新构造器 `prompt_with_options`，`prompt` 与 `prompt_with_turn` 传 `None`，既有调用点与测试一行未改）。`turn_body` 里那个「每轮构建一次」的 options 变成 `ChatOptions { tool_defs: snapshot, ..turn_options.unwrap_or_else(|| self.options.clone()) }`。
+
+kernel 依旧不解释任何旋钮：它只是把调用方解析好的那份转发给 provider。**承重的是那个例外**——`tool_defs` 是显式字段、写在 spread 之前，所以调用方给的工具表一定被冻结的 `ToolHost::snapshot` 覆盖掉。少了这一条，D19 就给了调用方一个让「模型被广告的工具表」与「调用被派发到的工具表」不一致的口子，而那正是 `the_tool_snapshot_is_frozen_for_the_whole_turn` 存在的原因。新测试 `per_turn_options_override_the_assembly_defaults` 同时断言两面：per-turn 的 model/effort 生效，空的 `tool_defs` 不生效。
+
 ### 2026-10-07 · M2 Phase 0：硬门唯一承重的那条腿终于可测
 
 **kernel 本体一行未改**（D15 的注入住在 daemon 的 `HistorySource` 实现里）。本方向的交付是把 2026-09-30 那条「审批答复必须是提供过的选项之一」的修复真正钉住——它此前**结构性不可测**，因为 fake 造不出收窄选项的请求。

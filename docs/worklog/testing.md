@@ -92,6 +92,29 @@
 
 ## 变更日志
 
+### 2026-10-07 · live 验收重跑：六项全过，M1 关闭
+
+五项缺陷修完（① 按 D19、②③④⑤ 在 CLI 侧，见 worklog/cli.md）加上「reasoning 默认折叠」的裁决落地后，用同一套隔离世界（`XDG_DATA_HOME`/`XDG_STATE_HOME` 指到 /tmp、tmux 起真 pty、密钥只 `source` 不进 argv）重跑了失败与部分通过的那几项：
+
+- **② resume 的前端那半**：`chat --session <id>` 打开一个已有一轮的会话，转写里就是那一轮的问题与回答（此前全空白）。
+- **③ 双前端**：A（tmux TUI）与 B（`exec --session`）同挂一个会话，B 发问后 A 上同时出现 **B 的问题**与 B 的回答（此前只有回答）。同一屏还顺带证明了 ⑥：B 那轮的推理格是 `∴ Thought for 5948 chars (click or Ctrl+R to expand)`，**默认折叠**。
+- **①/⑥ `/effort off`**：TUI 里 `/effort off` 现在回一条吐司 `· effort: off`（daemon 实际生效的值，不是用户敲的值），状态栏变 `effort off`；紧接着那轮**没有任何推理格**——问题行与回答行之间空空如也，而同会话上一轮（默认 High）有一个 5948 字符的折叠推理格。wire 级的 A/B 见下条。
+- **④ `/prompt`**：渲染成 `≡ prompt as sent`，逐节 `identity · builtin` 这样的 `id · source` + 正文（此前一行都不输出）。
+- **⑤ detached daemon 的错误**：复现原场景（两个 daemon 抢同一个库），失败消息点名的 `logs/hatchery-stdio.log` 里就是那句 `Locking error: Failed locking file …`；daemon 自己的 `hatchery.log.<date>` 仍是 0 字节，正说明 `entry::run_until` 是**返回**启动错误而不是记录它。
+
+`./scripts/ci.sh` 八步全绿（含 `invariants`）。**M1 到此关闭**，M2 从 Phase 1 起。
+
+**一条排障笔记（不是产品缺陷）**：tmux 的 `send-keys` 把文本与 `Enter` 放在**一次调用**里时，ASCII 串会整段丢失（composer 仍是占位符、也不提交），拆成两次调用则正常；含 CJK 的串恰好相反——合起来发能到、拆开发丢。同一份二进制上两种形态都试过，所以这是 tmux/pty 的投递问题，不是 TUI 的输入路径（真用户逐字符敲的是「拆开」那种形态）。做 TUI 的 live 验收时要按「文本与 Enter 分开发、每步之间留 0.5s 并回读 composer」来驱动，否则会误判成产品缺陷——我在这次验收里就先误判了一轮 `/prompt`。
+
+### 2026-10-07 · D19 的 live A/B：effort 真的到了线上
+
+缺陷 1 的修复（D19：effort 与 model 跟着 turn 走）用真 provider 做了 A/B，因为这条缺陷本来就是 live 量出来的、只有 live 能证明它没了。同一个 prompt（「不要用任何工具，只凭推理回答…」）、同一台机器、各自一套隔离的 `XDG_DATA_HOME`/`XDG_STATE_HOME`，唯一差别是 `$XDG_CONFIG_HOME/hatchery/config.toml` 里有没有 `[providers.deepseek.reasoning] reasoning_effort = "off"`：
+
+- 无该层（builtin 的 High）：`reasoning_delta` 119 条、reasoning item 2 个、`text_delta` 81 条。
+- 有该层（off）：`reasoning_delta` **0** 条、reasoning item **0** 个、`text_delta` 79 条，退出码 0，答案照常给出。
+
+选 provider 配置层而不是 TUI 的 `/effort` 来做这次 A/B，是因为它同时证明了**两条**此前都断掉的路：`session.config_patch.reasoning_effort` 与 `providers.<id>.reasoning.reasoning_effort` 在 D19 之前都没有任何读者，而 `turn_options` 现在按「session patch > provider 默认」的优先级读两者。deepseek 走的是 `ReasoningWire::ThinkingSwitch`，所以 off 落到线上是 `thinking: {"type":"disabled"}`——这也是那三种 wire 拼法第一次被真实 turn 触发（此前只有 doctor 的探测用过）。mock 侧的两条 e2e 见 worklog/daemon.md 的 D19 条目。
+
 ### 2026-10-07 · M1 live 验收执行：三项部分通过，跑出五个清单外缺陷
 
 用真密钥（`.keys/`，只 `source` 不读值）跑完 Phase 5 留下的六项清单。**跑法**：为不碰用户自己在跑的那个 daemon（pid 58947，14:38 起，是 Phase 0 之前的代码），整轮验收在一个隔离世界里做——`XDG_DATA_HOME=/tmp/hatchery-live/data` + `XDG_STATE_HOME=/tmp/hatchery-live/state`（两个变量 `default_data_dir` 与 `StateDir::detect` 都认），TUI 用 tmux 起真 pty（`tmux new-session -d -x 200 -y 45`，驱动脚本 `source` 密钥文件，密钥因此不出现在任何进程的 argv 里），`capture-pane` 取屏。结束时 `daemon stop` + `kill-session`，用户自己的 daemon 未被触碰。
@@ -187,12 +210,12 @@ roadmap 的 M2 段重写为 Phase 0–8（依据是那一节的「勘察更正�
 **M1 手动 live 验收清单（2026-10-07 执行，deepseek + qwen 真密钥；细节见本日变更日志）**：
 - [x] `hatchery doctor --provider deepseek` / `--provider qwen`：两轮探测（默认出推理 / 关掉推理）均 ok；
 - [x] `hatchery exec "你好，介绍一下你自己"`（真实模型）：流式纯文本、退出码 0；`--json` 每行 item 级事件、含 reasoning；
-- [~] TUI：`hatchery chat` 发起对话，~~reasoning 默认折叠~~、Ctrl+R 展开；~~`/effort off` 后下一条不再出现推理~~ → **两处不成立**：折叠默认是**展开**（`ui.show_reasoning` builtin 为 `true`，chat.rs 的兜底也是 `unwrap_or(true)`），Ctrl+R 两个方向都对；`/effort off` 只改状态栏，推理照旧（缺陷 1）；
+- [x] TUI：`hatchery chat` 发起对话，reasoning 默认折叠、Ctrl+R 展开；`/effort off` 后下一条不再出现推理 → 执行时**两处都不成立**（折叠默认是展开、effort 只改状态栏），已分别按裁决修掉：`ui.show_reasoning` 的 builtin 默认与 CLI 兜底都改成折叠，effort 按 **D19** 跟着 turn 走。Ctrl+R 两个方向本来就对。
 - [~] resume：`hatchery exec --session <id> "继续"`（关掉先前终端重开），第二 turn 正常续上历史 → **模型侧通过、前端侧不通过**：`exec` 以 attached 接上并准确复述上一轮，但 `hatchery chat --session <id>` 的 transcript 是空的（缺陷 2）；
 - [~] 双前端扇出：两个终端同时 attach 同一会话，一边 prompt，两边消息流一致 → **扇出通、消息流不一致**：观察端收到了 prompt 端的 `TextDelta` 与工具事件，但收不到对方的用户消息（缺陷 3）；
 - [x] 真实 provider 的回放命中：TUI 中对同一会话追问一轮，观察无上下文丢失（逐字节断言的 mock 已覆盖，live 侧以对话连贯性佐证）。
 
-**结论：M1 暂不关闭。** 六项里三项部分通过，跑出四个清单外的 M1 缺陷（`/effort` 从不进请求、TUI 不投影历史、TUI 不投影他人的用户消息、`/prompt` 的响应被丢弃）加一条运维缺陷（detached daemon 的致命启动错误不进日志）。修复范围待裁决；裁决与修复记入后续变更日志。
+**结论：M1 可以关闭（同日修复后重跑，见下条）。** 六项里三项部分通过，跑出四个清单外的 M1 缺陷（`/effort` 从不进请求、TUI 不投影历史、TUI 不投影他人的用户消息、`/prompt` 的响应被丢弃）加一条运维缺陷（detached daemon 的致命启动错误不进日志）。用户裁决（2026-10-07）：五项全修、作为 M1 收口，另加「reasoning 默认折叠」。已修：`/effort`（D19）与折叠默认；CLI 侧四项同批。修完需重跑本清单的 TUI/resume/双前端三项，并重跑 `./scripts/ci.sh`。
 
 ### 2026-10-01 · M1 Phase 3（daemon 的测试面）
 

@@ -58,6 +58,20 @@
 
 ## 变更日志
 
+### 2026-10-07 · D19：哪些配置跟着 turn 走，哪些跟着 runtime 走
+
+live 验收量出「`/effort` 从不进入请求」（见 design/daemon.md 开放问题 5），用户裁决按 **D19** 修：effort 与 model 跟着 turn 走，其余跟着 runtime。
+
+**跟着 turn 走。** `SessionManager::turn_options(&Session)` 在 `prompt()` 里、拿 turn 闸门**之前**解析一次（session 行本来就在那儿读过了，不多一次 store 往返），随新的 `AgentCommand::prompt_with_options` 交给 kernel。effort 的优先级是 session patch（`/effort` 写的那份）> provider 配置的 `reasoning.reasoning_effort`（builtin 给 deepseek/qwen 都是 High）；patch 里的值解析不出来记 warning 并落回默认，不静默当成「无偏好」。**解析放在闸门之前是有意的**：`/model` 写了一个没有 provider 服务的名字时，`turn_options` 直接回 `ConfigError`，活着的 runtime 一点不动——否则一次拼错的 `/model` 就能把一个有人正在看的会话拆掉。
+
+**跟着 runtime 走。** provider adapter、能力表与 reasoning echo 标志同属一个 provider，不能分开换，所以 `SessionRuntime` 现在记住自己是为哪个 `provider_id` 装配的（`provider_for` 的返回值从二元组换成具名的 `Resolved`）。`ensure_runtime` 比较 session 当前的 provider 与 runtime 记的那个，不同就 `shutdown()` 旧的再装配，`GenerationBumped` 照常广播。**turn 正在跑时不重组装**：那会为了一个 model 字段杀掉一个「没人看着也必须跑完」的 turn（D2），此时 prompt 按 `TurnInProgress` 被拒，切换落在下一轮。
+
+**kernel 侧只多了一个字段**：`TurnInput { turn, content, options }`，`turn_body` 用 `options.unwrap_or_else(|| self.options.clone())`，而 `tool_defs` 因为是显式字段、写在 spread 之前，永远取冻结的 `ToolHost::snapshot`——一轮可以换模型换 effort，但换不到「模型被广告的工具表」与「调用被派发到的工具表」不一致。
+
+**测试**：kernel 侧 `per_turn_options_override_the_assembly_defaults`（同一 harness 两轮，第一轮无 per-turn options 用装配的 model、第二轮带 options，断言 `ScriptedProvider` 记下的两次 `options`，并断言调用方给的空 `tool_defs` 没能盖掉 snapshot）；e2e 侧 `effort_set_mid_session_reaches_the_next_request_without_a_reassembly`（`session/set_config` 打 High，断言第二个请求体里出现 `reasoning_effort`、generation 没动）与 `a_model_on_another_provider_reassembles_and_announces_it`（换到第二个 provider，断言 `GenerationBumped` 出现、其后事件都是新 generation、第二个请求体的 model 换了）。两条 e2e 都做过变异验证：把 submit 换回 `prompt_with_turn`，第一条立刻红在 `left: Null / right: "high"`。
+
+**顺带记一条同类但没修的**：`ConfigPatch.overrides` 既无生产者（CLI 恒发 `None`）也无消费者（daemon 侧无人读），和 effort 曾经一样只是存着。按 ADR-0009 的反预拆分刹车，等有第一个生产者再定它作用于装配还是 turn。
+
 ### 2026-10-07 · M2 Phase 0 落地：prompt 注入、覆盖目录接线、死依赖边删除
 
 「机制建好了却没接线」的三处缺陷，本方向占两处（第三处是 kernel 的审批答复校验，见 worklog/kernel.md）。

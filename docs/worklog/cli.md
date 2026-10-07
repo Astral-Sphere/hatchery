@@ -22,10 +22,10 @@ M1 Phase 4 交付：TUI/exec/daemon 子命令/doctor 全部接线，attach-or-sp
 - [ ] (M2 Phase 6) 审批内联弹层：展示 `ApprovalRequest`（含 diff/命令预览；预览载荷的形状是 Phase 2 的 D14）+ 快捷键 `1`-`4` 对应四个 option + `Esc` 交接。今天 `push_event` 的 `ApprovalRequested` 臂（tui/mod.rs:262-265）只把 `status.state` 改成 `"awaiting approval"`，`request_id` 与整个 `ApprovalRequest` 都丢掉；`Model` 上没有 pending 审批字段、没有选项表、没有选择游标；`key_input`（chat.rs:400-437）没有模态分支，`1`-`4` 会落进 `(_, KeyCode::Char(c)) => model.input.push(c)` 被 composer 吞掉
 - [ ] (M2 Phase 6) diff 视图（**D11 已裁决**：`similar` 算 hunk + 现有主题语义色渲染，**不引 syntect**）。今天一点 diff 渲染都没有——没有解析器、没有 +/- 着色、没有 gutter；要用的主题角色（accent/text/dim/faint/success/warn/error/code/tool/thinking）已在 `theme.rs:56-125`。`markdown.rs:6` 把代码块高亮标为 M2 的 syntect 议题、`markdown.rs:43` 把表格列对齐写成「M2 diff 视图的活」——前者按 D11 另议，后者随本条落地
 - [ ] (M2 Phase 6) 六个缺的斜杠命令：`/rewind`、`/branch(list|switch|delete)`、`/edit`、`/approval`、`/export`、`/clear`（frontends.md §2.2 声明的命令里今天只有 `/effort /model /prompt /mode /theme /quit`）。每条都要动六处：`SlashCommand` 新变体、`parse` 的名字匹配臂、参数解析器（挨着 `effort()`/`model()`/`theme()`）、`actions()` 臂、`local_reply()` 的用法臂、`submit_line` 的 match
-- [ ] (M2 Phase 6) **`actions()` 的 fire-and-forget 形状要改**：`submit_line` 的共享循环是 `for (method, params) in commands::actions(&command, *session) { attached.client.call_raw(method, params).await?; }`——回复被丢弃。而 `session/branch/list` 返回的 `Vec<BranchNode>` 必须渲染、`session/rewind` 返回的 `RewindReport` 用户必须看见
+- [x] (M2 Phase 6 → **2026-10-07 提前做掉**) **`actions()` 的 fire-and-forget 形状要改**：`submit_line` 的共享循环曾把每个回复丢弃，而 `session/branch/list` 返回的 `Vec<BranchNode>` 必须渲染、`session/rewind` 返回的 `RewindReport` 用户必须看见。**结果**：`/prompt` 无输出这条 live 缺陷逼着它提前落地——回复现在交给 `project_reply(command, method, reply) -> Reply`（`Nothing`/`Note`/`Prompt`），`actions()` 本身没动（它仍只负责「发哪些方法」）。Phase 6 的 `/rewind` `/branch` 因此只要给 `Reply` 加变体
 - [ ] (M2 Phase 6) `hatchery sessions {list|resume|export|delete}` 子命令族：`Command`（args.rs:13-27）今天只有 Chat | Exec | Daemon | Doctor | Help | Version，`usage()`（args.rs:96-115）也没列
 - [ ] (M2 Phase 6) **exec 的 Code 模式（D16）**：加 `--mode` + 审批策略标志，或明确「exec 拒绝 Code 会话」。今天 `open_subscribed`（exec.rs:163-206）硬编码 `SessionModeId::chat()`（:187），`ExecArgs`（args.rs:42-56）只有 prompt/json/session/workspace/model/state_dir，也没有 stdin prompt 路径；`ApprovalRequested` 在 `--json` 的转发子集里（`is_item_level`，:230-244），所以脚本看得见审批、然后这一轮永久挂住（直到下一次调用撞上 120s `CALL_TIMEOUT`，或事件流结束）。frontends.md §2.3 对此一字未规定
-- [ ] (M2 Phase 5) 图片输入路径（frontends 开放问题 3，2026-10-07 用户裁决留在 M2）：协议侧 `ContentPart::Image { mime_type, data }` 已在，缺的是 llm 侧到 wire 的翻译（Phase 5）+ 本方向的输入路径；两半必须一起落，否则图片进得了库却发不出去
+- [ ] (M2 Phase 5) 图片输入路径（frontends 开放问题 3，2026-10-07 用户裁决留在 M2）：协议侧 `ContentPart::Image { mime_type, data }` 已在，缺的是 llm 侧到 wire 的翻译（Phase 5）+ 本方向的输入路径；两半必须一起落，否则图片进得了库却发不出去。**还有第三半（2026-10-07 补记）**：TUI 的 item 投影只渲染 `content.text`，`parts` 里的 `Image`/`Resource` 会被丢掉——图片能在库里、能发出去，却看不见
 - [ ] (M3) `hatchery acp` 子命令（attach 与 standalone 两态，design/acp.md）——今天 `Command` 里没有它
 - [ ] (M4) 文案全部进 gettext catalog
 
@@ -43,6 +43,24 @@ M1 Phase 4 交付：TUI/exec/daemon 子命令/doctor 全部接线，attach-or-sp
 - **D11（2026-10-07）M2 的 diff 渲染：`similar` 算 hunk + 现有主题语义色，不引 syntect。** D5 当初把「syntect 高亮（含 M2 diff 视图）」整体推迟，M2 重新规划时又评估了一次，结论是 diff 视图**不要**语法高亮：① 它要的是 +/- 着色与 gutter，不是 token 着色，`theme.rs` 的语义角色（accent/text/dim/faint/success/warn/error/code/tool/thinking）已经够用；② syntect 重（一个 regex 后端 + syntax sets），而 D5 否掉 termimad 的理由之一正是依赖耦合；③ 房内先例：atomcode 用 `similar = "2"`（references/atomcode/Cargo.toml:40）。代码块的语法高亮是**另一个决定**，继续往后排。
 
 ## 变更日志
+
+### 2026-10-07 · M1 收口：TUI 补上 item 投影，斜杠命令的回复不再被丢掉
+
+live 验收（worklog/testing.md 本日条目）量出四个前端缺陷，用户裁决全部当场修。
+
+**投影路径此前完全不存在**：`Model` 只渲染 delta 加自己敲的输入，`ItemFinished` 只认 `ToolCall`。后果是两条清单失败——`chat --session <id>` 打开一个已有历史的会话是**空白**（`SessionLoadResult.items` 被 `chat.rs` 那个只有 `session` 字段的 `SessionView` 丢掉），以及两个前端挂同一会话时，观察端看得到对方的回答却看不到对方的问题。现在 `push_history` 投影加载到的分支（oldest first），`push_live_item` 只投影 delta 表达不了的那一部分（别人的 `UserMessage`；助手正文与推理已经逐 token 在屏幕上，再投影就是每句话双份），自己那条按 **turn id** 去重而不是按文本（两个客户端完全可以发同一句话；`turn` 为 `None` 的 item 永不抑制）。`ToolResult` 折进对应工具格的 tail，`Checkpoint`/`Compaction`/`ModeSwitch`/`BranchNote` 跳过。历史里的 `ToolCall` 没有 `ToolCallSummary`（摘要器在工具注册表后面），所以标题用压缩后的参数并截断。
+
+**`drain_history` 跟随 `next_cursor`**：daemon 今天恒回 `None`（一页给全），所以这条循环在生产里暂不可达——但游标是协议契约不是提示，忽略它的客户端会在 store 长到分页那天**静默截断历史**。每页带上上一页报告的 generation（不变量 1：中途换 runtime 应当被拒，而不是拼出一份撕裂的转写），游标不前进报错而不是挂死。用注入的分页源测（真 daemon 走不到）。
+
+**斜杠命令的回复不再被丢掉**：`submit_line` 对 `/effort` `/model` `/prompt` 一律 `call_raw` 后丢弃回复，于是 `/prompt`——一个存在的意义就是把装配好的 prompt 给人看的命令——**一行都不输出**。现在回复交给 `project_reply`：`/prompt` 渲染成新的 `CellKind::Prompt`（字形 `≡`，逐节 `id · source` + 正文；不可折叠，`toggle_cell` 按 kind 拒绝，点击命中仍然映射到格子所以是「按 kind 拒绝」而不是「点了个空洞」），`/effort` 与 `/model` 吐司回报 daemon **实际生效**的值。渲染的是**分节而不是 join 后的 text**：`prompt::render_result` 的 text 就是这些节拼起来的，两个都印等于每句话印两遍。解码失败的回复报错，不静默吞（ADR-0009）。`/rewind` 与 `/branch` 因此只需要给 `Reply` 加变体，不再要求先改 `actions()` 的形状（design/frontends.md 那段已更正）。
+
+**detached daemon 的致命错误现在有地方落地**：`hatchery exec` 在数据库被别的进程锁住时报「its log is at <logs>」，而那个文件是 0 字节。机制是两层的：`logging::init` 会**预先**创建 `hatchery.log.<date>`（`tracing_appender` 在构造时就开文件），但 `entry::run_until` 是**返回**启动错误而不是记录它，只有前台路径会打印——而 detached 子进程的 stdout/stderr 当时是 `Stdio::null()`。现在两个 spawn 点（`attach.rs` 与 `daemon_cmd.rs`）都经 `child_stdio` 把子进程的两条流**追加**到 `logs/hatchery-stdio.log`（追加而不是覆盖：一次 spawn 不能毁掉还在跑的那个 daemon 的字，也是两个 CLI 竞争 spawn 时唯一能共享的模式），失败消息点名这个文件；文件开不出来就退回 null stdio + 目录提示——**日志写不出来不该成为 daemon 起不来的理由**。live 复现验证过：消息点名的文件里就是那句 `Locking error: Failed locking file …`，而 daemon 自己的 `hatchery.log.<date>` 仍是 0 字节。
+
+**reasoning 默认折叠**：`ui.show_reasoning` 的 builtin 默认与 CLI 兜底都改成 `false`（裁决见 worklog/daemon.md），两边必须一致，因为它们是同一个设置从缺键的两侧看过去的样子。
+
+**顺带修掉的两处浪费/静默**：`open_session` 不再把回复 clone 一份只为读个模型名（resume 的回复带着整条分支）；代价是**畸形回复现在会让打开失败并报出来**（`session/load reply: …`）而不是静默播种默认值——`session/new` 那条路径保留原来的 `.ok()` 兜底。
+
+**未修、已记档**：投影丢掉 `Content.parts` 里的 `Image`/`Resource`（M2 Phase 5 的多模态输入落地时一起补）；订阅与快照之间的窗口会让一条 item 显示两次（daemon 侧问题，design/daemon.md 开放问题 6）。
 
 ### 2026-10-07 · M2 重新规划对账
 
