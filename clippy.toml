@@ -15,8 +15,8 @@
 #
 # The `tokio::process::Command` twins are deliberately absent. No crate enables tokio's `process`
 # feature, so clippy answers every one of those paths with "does not refer to a reachable function"
-# — five warnings sitting in every gate run (measured 2026-10-07: they do not fail `-D warnings`,
-# they are config diagnostics, they just train the eye to skip warnings). They belong here the
+# — one warning per path in every gate run (measured 2026-10-07: they do not fail `-D warnings`,
+# being config diagnostics rather than lints, they just train the eye to skip warnings). They belong here the
 # moment a crate enables that feature; `std::process::Command` is banned meanwhile, and so is the
 # type.
 #

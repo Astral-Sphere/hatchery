@@ -15,7 +15,7 @@
 - [x] (M0) **git spike（实测）**：两轮——CLI git 2.55 与 git2 0.21（vendored libgit2 1.9.7）；最终选 git2，结论落 ADR-0012 + design/capabilities.md §2
 - [x] (M1) trait 定型（M1 只读子集；见 2026-10-01 变更日志的三处有意收窄）+ `ToolRegistry` 实现 kernel 的 `ToolHost`（`snapshot` 排序快照 / `summarize` 委托工具 / `approval_for` 委托 / `invoke` 经 ToolCtx）
 - [x] (M1) LocalFs 只读路径 + read_file/glob/grep 工具（Chat 模式用；`chat_tools()` 装配清单随工具走）
-- [ ] (M2 · Phase 0) **`clippy.toml` 的 tokio 洞**（不变量 4 的编译期门禁，故记在本方向）：现只禁 `std::fs::*` 与 `std::process::Command`（+`abort`、`env::set_var`），**没禁 `tokio::fs::*` / `tokio::process::*`**——而 hatchery-tools 依赖 tokio、`LocalFs` 自己就用 tokio::fs，工具里写一句 `tokio::fs::write` 就整条绕过。另补漏掉的 `std::fs::{remove_dir, read_link, hard_link, set_permissions}`（roadmap 更正 8）
+- [x] (M2 · Phase 0，2026-10-07 完成) **`clippy.toml` 的 tokio 洞**（不变量 4 的编译期门禁，故记在本方向）：现只禁 `std::fs::*` 与 `std::process::Command`（+`abort`、`env::set_var`），**没禁 `tokio::fs::*` / `tokio::process::*`**——而 hatchery-tools 依赖 tokio、`LocalFs` 自己就用 tokio::fs，工具里写一句 `tokio::fs::write` 就整条绕过。另补漏掉的 `std::fs::{remove_dir, read_link, hard_link, set_permissions}`（roadmap 更正 8）。**结果**：`tokio::fs` 的全部孪生项与那四个 `std::fs` 项已加并逐条实测；`tokio::process` 那组**故意没加**（没有 crate 开那个 feature，clippy 会回 "does not refer to a reachable function"，实测不触发 `-D warnings` 失败但每次门禁留五条警告）。细节见本日变更日志与 clippy.toml 头部
 - [x] (M2 · Phase 0) **两个 README 对账**（roadmap 更正 14）：原 `crates/hatchery-capabilities/README.md:3-5` 把影子 Git 检查点与「带注册句柄的工具注册表（ADR-0009）」写成既有，原 `crates/hatchery-tools/README.md:3-4` 列七个工具（实际三个）——都不成立。**2026-10-07 已随本轮文档对账改正**：capabilities 的 README 现在只声称 M1 只读切片（并写明 `ApprovalGate` 只有 trait、无实现，检查点/写路径/PTY/`DaemonApproval` 属 M2，注册句柄顺延 M5）；tools 的 README 只列 `read_file`/`glob`/`grep`，其余标 M2/M3/M5，与 src/lib.rs:45 的口径一致。Phase 0 剩下的文档对账（更正 16 那批）属其他方向
 - [ ] (M2 · Phase 1) **CheckpointStore**：把测试里的 `Sandbox` 提炼成正式实现——open 配方（init_opts + 手写 `core.worktree`/`core.bare` + `set_workdir(.., false)`）、`harden()` 的配置钉扎、每次打开重放 ignore 规则、purge 走 `checkout_index(remove_untracked)`、restore 前自动 snapshot。**可提炼的材料至今只存在于 spike 的私有 `Sandbox` 里**（`crates/hatchery-capabilities/tests/spike_shadow_git.rs`，全绿）：`open_shadow()`（:96-146）、`harden()`（:73-94）、per-open ignore 重放（:130-138）、`snapshot()`（:255）、`restore(to, purge)`（:296-318）、`changed_paths()`（:320）、`shadow_dir_bytes()`（:346）；任何 `src/` 下都**没有** `CheckpointStore`。`git2` 已声明在 capabilities 的 `[dependencies]` 却无任何 `src/` 文件使用它（产品侧唯一的 git2 用法在 hatchery-daemon/src/prompt.rs:133-160）
 - [ ] (M2 · Phase 1) **D13 检查点如何成为 item**：`ToolCtx` 加检查点收集器（`LocalFs` 写前 push）→ `ToolInvocation` 带出 `Vec<Checkpoint>` → kernel 在 ToolResult item **之前**追加 Checkpoint item（链成 `… → ToolCall → Checkpoint → ToolResult`；工具结果靠 `ToolResult.call` 配对而非父子关系，故此顺序安全）→ daemon 的 HubSink 在 item 落库后补写 `checkpoints` 行，行写失败只记日志（item 里已有 commit_id 可回退）
@@ -101,6 +101,18 @@ capabilities 的**代码**在 M0b 没有动（trait 与工具实现是 M1/M2 的
 - 2026-09-28 影子 Git 后端：git2 vendored（用户裁决 + 第二轮实测），ADR-0012。若将来要摆脱 C 依赖，替代候选是 `gix`（纯 Rust，**未实测**），前提是把这 11 项门槛在 gix 上重跑全绿。
 
 ## 变更日志
+
+### 2026-10-07 · M2 Phase 0：不变量 4 的编译期门禁补洞
+
+`clippy.toml` 加了 `tokio::fs` 的全部孪生项（read/read_to_string/read_dir/write/copy/rename/remove_file/remove_dir/remove_dir_all/create_dir/create_dir_all/metadata/symlink_metadata/read_link/hard_link/set_permissions/File::open/File::create/OpenOptions::open）与漏掉的 `std::fs::{remove_dir, read_link, hard_link, set_permissions}`。此前只禁 `std`：hatchery-tools 依赖 tokio，一句 `tokio::fs::write` 就绕过整条纪律。
+
+**逐条实测过**，因为 clippy 对解析不到的路径是**静默忽略**而不是报错——打错一个路径就等于留一个洞，而看不出来。做法：临时给 hatchery-tools 开 tokio 的 `fs`/`process` feature，写一个 scratch 测试模块调用表里每一条路径，跑 `cargo clippy -p hatchery-tools --all-targets`，把诊断里点名的路径与 clippy.toml 的表做集合差；两边完全一致（表里每条都开火，没有多余项）。scratch 模块与 feature 改动随后撤掉，`git status` 里 hatchery-tools 干净。
+
+**`tokio::process::Command` 的孪生项故意没加。** 没有任何 crate 开 tokio 的 `process` feature，clippy 对这五条路径回 `does not refer to a reachable function`。实测（`cargo clippy --workspace --all-targets -- -D warnings`）：退出码仍是 0——它是配置诊断不是 lint，`-D warnings` 管不到——但会在每次门禁输出里留五条警告，而「输出里有可以忽略的警告」正是让真警告被跳过的原因。等有 crate 开那个 feature（Phase 4 的 shell/PTY 若走 tokio::process）再加，届时它们会真正生效。理由写在 clippy.toml 头部，不是只写在这里。
+
+**ADR-0012 引的测试名已过时。** `no_gitlink_is_planted_in_the_user_workspace` 于本日改名为 `invariant_no_gitlink_is_planted_in_the_user_workspace`（补前缀进 `invariants` 门禁组，同批还有 `purge_restore_also_removes_never_tracked_files`）。ADR 一经 accepted 不修改，所以 ADR-0012 正文里那个名字不再能 grep 到——映射记在这里，处理方式与 ADR-0006 的 `RewindScope::ConversationAndCode` vs 协议 `Both` 一致（以代码为准，ADR 不动，worklog 留痕）。
+
+### 2026-10-07 · M2 重新规划对账
 
 ### 2026-10-07 · M2 重新规划对账
 

@@ -25,11 +25,11 @@
 - [x] (M1) fixture 录制 xtask + 脱敏（API key 扫描）+ provenance 元数据格式（2026-09-30：`cargo xtask record-fixtures`，sidecar `*.meta.json`，扫描命中即拒写）
 - [x] (M1) 不变量 1/2 落地（2026-10-01）：`invariants` 分组从 4 条涨到 8 条——新增客户端代际过滤、会话租约拒绝、20 线程单实例竞态、逐字节 reasoning 回放；5（硬门）与 3/6 的 store/tool 层补充随 M2
 - [x] (M1) e2e 场景 1-2 落地（2026-10-01，hatchery-tests）：最小对话 + resume + 逐字节回放、双前端扇出 + 重连补差；D7 子进程对比一并交付
-- [ ] (M2 Phase 0) **让 `invariants` profile 真被调用**：`scripts/ci.sh:134` 只跑 `--profile ci`，pr.yml/nightly.yml 也没有 `--profile invariants`（nightly 只有 slow/gui/audit/coverage + `msrv` job）——那个 profile 是死配置。不变量测试确实跑到了（`ci` 继承 `default`，`default-filter` 只排除 `live_`/`slow_`/`gui_`），但没有可单独报告或阻塞的门禁
-- [ ] (M2 Phase 0) **前缀对账**：design/testing.md §5 映射到不变量、却没有 `invariant_` 前缀的 5 条测试（`two_concurrent_prompts_yield_exactly_one_turn`、`a_turn_with_no_subscriber_runs_to_completion_and_persists`、`no_gitlink_is_planted_in_the_user_workspace`、`purge_restore_also_removes_never_tracked_files`、`events_below_the_session_generation_are_dropped`）改名，或把 profile 的过滤器换成显式清单——否则一旦真跑 `--profile invariants`，它们会被静默漏掉
-- [ ] (M2 Phase 0) `check_i18n` 改为诚实的 skip 而不是门禁步骤（ci.sh:121-124 打印「i18n extraction check lands in M4 — nothing to verify yet」后返回成功）
-- [ ] (M2 Phase 0) `clippy.toml` 补不变量 4 的洞：`tokio::fs::*` / `tokio::process::*` 未禁（tools crate 依赖 tokio、`LocalFs` 自己就用 tokio::fs，一句 `tokio::fs::write` 绕过整条纪律）+ 漏掉的 `std::fs::{remove_dir, read_link, hard_link, set_permissions}`
-- [ ] (M2 Phase 0) 覆盖率表加 `hatchery-tools`（M2 四个新工具全落在那里，而 `xtask/src/coverage.rs:17-25` 只闸七个 crate）；`the_threshold_table_covers_the_seven_gated_crates`（coverage.rs:283）把「七」钉住了，加 crate 要同步改那条测试
+- [x] (M2 Phase 0，2026-10-07 完成) **让 `invariants` profile 真被调用**：`scripts/ci.sh:134` 只跑 `--profile ci`，pr.yml/nightly.yml 也没有 `--profile invariants`（nightly 只有 slow/gui/audit/coverage + `msrv` job）——那个 profile 是死配置。不变量测试确实跑到了（`ci` 继承 `default`，`default-filter` 只排除 `live_`/`slow_`/`gui_`），但没有可单独报告或阻塞的门禁。**结果**：`scripts/ci.sh` 加了 `run_step invariants cargo nextest run --workspace --profile invariants`（在 `tests` 之后）。重复跑是有意的：命名步骤才可单独报告与单独 skip，而过滤器选空时 nextest 默认 `fail`，前缀约定一漂移就会红而不是静默空跑
+- [x] (M2 Phase 0，2026-10-07 完成) **前缀对账**：design/testing.md §5 映射到不变量、却没有 `invariant_` 前缀的 5 条测试（`two_concurrent_prompts_yield_exactly_one_turn`、`a_turn_with_no_subscriber_runs_to_completion_and_persists`、`no_gitlink_is_planted_in_the_user_workspace`、`purge_restore_also_removes_never_tracked_files`、`events_below_the_session_generation_are_dropped`）改名，或把 profile 的过滤器换成显式清单——否则一旦真跑 `--profile invariants`，它们会被静默漏掉。**结果**：五条全部改名（清单与新名见 design/testing.md §5），选择改名而不是显式清单——清单会在 §5 与 `nextest.toml` 两处重复同一份知识并各自腐烂，前缀约定才是本项目本来就有的机制。改完实测 profile 选中 13 条全绿。**代价**：ADR-0012 正文引的是 `no_gitlink_is_planted_in_the_user_workspace` 旧名，ADR 不改，映射记在 worklog/capabilities.md
+- [x] (M2 Phase 0，2026-10-07 完成) `check_i18n` 改为诚实的 skip 而不是门禁步骤（ci.sh:121-124 打印「i18n extraction check lands in M4 — nothing to verify yet」后返回成功）。**结果**：`check_i18n` 函数与 `run_step i18n` 一并删除，改成脚本末尾打印 `--- i18n: not gated yet (extraction lands in M4)`，`--help` 的步骤表照实列 `toolchain fmt clippy build tests invariants doctests determinism` 并单列一行「Not gated yet: i18n」
+- [x] (M2 Phase 0，2026-10-07 完成) `clippy.toml` 补不变量 4 的洞：`tokio::fs::*` / `tokio::process::*` 未禁（tools crate 依赖 tokio、`LocalFs` 自己就用 tokio::fs，一句 `tokio::fs::write` 绕过整条纪律）+ 漏掉的 `std::fs::{remove_dir, read_link, hard_link, set_permissions}`。**结果**：`tokio::fs` 的全部孪生项与那四个 `std::fs` 项已加，并逐条实测（见 worklog/capabilities.md）；`tokio::process::Command` 的孪生项**故意没加**——没有 crate 开 tokio 的 `process` feature，clippy 对这类路径回 "does not refer to a reachable function"，实测全 workspace `-D warnings` 仍退出 0（配置诊断不是 lint），但会在每次门禁留五条警告
+- [x] (M2 Phase 0，2026-10-07 完成) 覆盖率表加 `hatchery-tools`（M2 四个新工具全落在那里，而 `xtask/src/coverage.rs:17-25` 只闸七个 crate）；`the_threshold_table_covers_the_seven_gated_crates`（coverage.rs:283）把「七」钉住了，加 crate 要同步改那条测试。**结果**：地板取 85%（与其他产品核心 crate 同档），**先实测再定**——加入前 `cargo xtask coverage --report-only` 报 hatchery-tools 95.6%，所以不是愿望数字。那条测试改名为 `the_threshold_table_covers_the_gated_crates`（测试名里的计数正是要从活文档里拿掉的那类东西）
 - [ ] (M2 Phase 1) `TempWorkspace` 补 git init + 文件树 DSL（design §2 一直这么描述；今天只有 `new`/`path`/`write`/`fs()`/`root()`），并把不变量 6 的测试从 spike 的 `Sandbox` 迁到真 `CheckpointStore`——它要的「脏用户仓库」（staged/unstaged/untracked + 一次 commit）今天由 spike 自己的 harness 手搭
 - [ ] (M2 Phase 1) `MemoryFs` 补写路径（`FsBackend` 一加 `write_text_file` 它就编译不过——是有用的 forcing function，也是工作量；今天它只实现三个读方法）
 - [ ] (M2 Phase 2) **`invariant_project_config_cannot_disable_hard_gates`**（M2 DoD「硬门测试全绿」的正主，今天零命中）+ `config.rs:154` 那个空的 `STRICT_KEYS` 接线。前置是审批规则配置本身：没有它就没有「恶意项目配置」可加载，所以排 Phase 2 不是 Phase 0。工作区内硬门（`.env*`、`.git/hooks`）按裁决走 `ApprovalRequest::once_only()`（新增 `RiskLevel` 变体属协议 major bump；kernel 已拒绝不在所给选项里的答案，所以 `once_only` 真不可绕）
@@ -91,6 +91,14 @@
 - 2026-09-28 辅助二进制形态：M0 不需要（`dummy-acp-agent` 是 M3 的事），推迟到 M3 与 ACP client 一起定；倾向 workspace member + `required-features`。
 
 ## 变更日志
+
+### 2026-10-07 · M2 Phase 0：门禁诚实化与不变量 2 的边界
+
+**门禁**：`scripts/ci.sh` 现在有 `invariants` 步（`--profile invariants`，在 `tests` 之后），`check_i18n` 从「返回成功的空操作」变成脚本末尾一行明示未设门禁；`--help` 的步骤表照实写。五条映射到不变量却缺前缀的测试已改名，改完实测 profile 选中 13 条全绿。`hatchery-tools` 进了覆盖率表（85%，实测 95.6%）。`clippy.toml` 补齐 `tokio::fs` 孪生项与四个漏掉的 `std::fs` 项，逐条用 scratch 模块实测过（解析不到的路径是静默忽略，打错字等于留洞）；`tokio::process` 那组故意没加，理由写在 clippy.toml 头部。
+
+**不变量 2 的边界（D15 落地）**：system prompt 注入后，场景 1 的 `invariant_minimal_chat_replays_reasoning_byte_exact` 从「整个 messages 数组整表比对」改成三段——① 两次请求的 system 文本逐字节相同（装配时渲染一次并冻结）② 它等于 `prompt/render` 的 `text`（透明性 API 说的就是模型看到的那份）③ 它**后面**的 messages 数组仍与手写期望整表比对（分支历史逐字节）。子进程 e2e 的 byte-exact 腿同步。分支历史那半的强度没有降低。
+
+**testkit**：`ScriptedToolHost::requiring_approval_with(ApprovalRequest)`（老构造器表达不出收窄选项的请求，硬门那条分支因此结构性不可测，见 worklog/kernel.md）；`hatchery-tests/tests/subprocess.rs` 的 `spawn` helper 给子进程设 `XDG_CONFIG_HOME`，让「daemon 从环境推导覆盖目录」这条生产路径可测而不依赖宿主机（`set_var` 在 edition 2024 是 unsafe 且被 clippy 禁掉，测试拥有子进程环境是唯一形状）。
 
 ### 2026-10-07 · M2 重新规划对账
 

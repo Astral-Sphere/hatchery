@@ -30,7 +30,7 @@
 - 分组：Rust 无法按属性过滤测试，所以用**命名前缀** + `.config/nextest.toml` 的 `default-filter` 实现（原设计的 `#[live]` 属性标记不可行）：
   - `live_*` 真实网络/需 secrets，另外再用 `live-tests` cargo feature 双保险（默认不编译）；
   - `slow_*` >5s；`gui_*` 需显示环境；
-  - `invariant_*` 核心不变量套件（§5），**始终在默认组里跑**，永不 skip。（`invariants` profile 今天从未被任何门禁调用，是死配置；不变量测试只是搭 `ci` 继承 `default` 的车跑到。M2 Phase 0 加真正的步骤并对账前缀，见 §5。）
+  - `invariant_*` 核心不变量套件（§5），**始终在默认组里跑**，永不 skip；自 Phase 0（2026-10-07）起它还有自己的一步门禁：`scripts/ci.sh` 的 `invariants` 步单独跑 `--profile invariants`，前缀对账同时完成（§5）。这一步会**重复跑**默认组里已有的那些测试，是有意的——命名步骤才让「不变量组红或绿」可单独报告；而一旦前缀约定漂移、过滤器一个都选不到，nextest 的 `--no-tests` 默认 `fail` 会让这一步直接红，不会静默变成空跑。
   - 默认组过滤掉 live/slow/gui；PR CI 跑默认组，其余进 nightly 或手动。
   - 实测（nextest 0.9.146）：profile 匹配不到任何测试时 `--no-tests` 默认 `auto → fail`（退出码 4），所以 nightly 跑空的 slow/gui 组必须显式传 `--no-tests=warn`。
 
@@ -141,9 +141,9 @@ pub fn json_fixture(name: &str) -> Vec<u8>;   // 同上，非流式 fixture（�
 
 风险：影子 Git 碰用户仓库（灾难级）、硬门被绕过、PTY 泄漏进程。
 
-- **影子 Git 安全**（不变量 6 专属）：`invariant_shadow_git_never_touches_user_repo`——先造一个脏仓库（staged/unstaged/untracked + 一次 commit），跑 snapshot + restore，断言用户仓库的 HEAD、分支、refs、`.git/index` mtime、`.git` 目录条目全部不变；外加 `no_gitlink_is_planted_in_the_user_workspace`（libgit2 的 `set_workdir(.., update_gitlink=true)` 会在用户工作区里种一个 `.git` 文件，必须传 false 并自己写 `core.worktree`/`core.bare`，ADR-0012）。**后端已从 CLI git 换成 git2 / vendored libgit2，门槛测试常驻 `crates/hatchery-capabilities/tests/spike_shadow_git.rs` 且全绿。**「脏仓库」今天由 spike 自己的 `Sandbox` harness 手搭（`TempWorkspace` 没有 git init）；M2 Phase 1 把它换成 `TempWorkspace` 的 git init + 树 DSL，被测对象同时从 `Sandbox` 换成转正的 `CheckpointStore`。
-- 检查点语义：写前必有 snapshot（MemoryFs 写序列 vs checkpoint 记录对齐）；restore 可回滚（restore 前自动 snapshot）；purge 才删未跟踪文件（`purge_restore_also_removes_never_tracked_files`，实现走 `checkout_index(remove_untracked)`）；忽略规则每次打开句柄都要重放（实测 `add_ignore_rule` 是 per-handle 的）；大文件跳过；预算熔断触发 GC（构造超预算 fixture）；非 git 工作区可用。
-- 硬门（不变量 5 专属）：`invariant_project_config_cannot_disable_hard_gates`——加载恶意项目配置后断言危险路径写仍需审批、规则不可 allow-always。**这条测试今天在任何形态下都不存在**，而它是 M2 DoD「硬门测试全绿」的正主。它不可能早于 Phase 2 存在，因为**前置不存在**：审批规则配置还没有（`hatchery-daemon/src/config.rs` 的 `STRICT_KEYS` 是空表，注释说接线进 `filter_keys` 与 typed reader 是 M2 的活），没有可加载的项目级规则，就无从断言「配置关不掉硬门」。今天唯一沾边的覆盖是值类型谓词 `RiskLevel::is_hard_gate()` 的两条单测（生产代码无人调用）与 prompt 级的 `the_safety_gate_cannot_be_overridden`。**工作区内硬门怎么表达**：`is_hard_gate()` 只认 `WritesOutside`，而 design/capabilities.md §5 的硬门含工作区内的 `.env*` 与 `.git/hooks`——裁决是对这些路径强制 `ApprovalRequest::once_only()`，不加 `RiskLevel` 变体（新增枚举值是协议 major bump）；kernel 本来就会拒绝不在所给选项里的答案，所以「不提供 always 选项」是真不可绕，测试要断言的正是这一点（规则里存了 `AllowAlways` 也不生效）。
+- **影子 Git 安全**（不变量 6 专属）：`invariant_shadow_git_never_touches_user_repo`——先造一个脏仓库（staged/unstaged/untracked + 一次 commit），跑 snapshot + restore，断言用户仓库的 HEAD、分支、refs、`.git/index` mtime、`.git` 目录条目全部不变；外加 `invariant_no_gitlink_is_planted_in_the_user_workspace`（libgit2 的 `set_workdir(.., update_gitlink=true)` 会在用户工作区里种一个 `.git` 文件，必须传 false 并自己写 `core.worktree`/`core.bare`，ADR-0012）。**ADR-0012 正文引的是改名前的旧名**——ADR 一经 accepted 不修改，映射记在 worklog/capabilities.md。**后端已从 CLI git 换成 git2 / vendored libgit2，门槛测试常驻 `crates/hatchery-capabilities/tests/spike_shadow_git.rs` 且全绿。**「脏仓库」今天由 spike 自己的 `Sandbox` harness 手搭（`TempWorkspace` 没有 git init）；M2 Phase 1 把它换成 `TempWorkspace` 的 git init + 树 DSL，被测对象同时从 `Sandbox` 换成转正的 `CheckpointStore`。
+- 检查点语义：写前必有 snapshot（MemoryFs 写序列 vs checkpoint 记录对齐）；restore 可回滚（restore 前自动 snapshot）；purge 才删未跟踪文件（`invariant_purge_restore_also_removes_never_tracked_files`，实现走 `checkout_index(remove_untracked)`）；忽略规则每次打开句柄都要重放（实测 `add_ignore_rule` 是 per-handle 的）；大文件跳过；预算熔断触发 GC（构造超预算 fixture）；非 git 工作区可用。
+- 硬门（不变量 5 专属）：`invariant_project_config_cannot_disable_hard_gates`——加载恶意项目配置后断言危险路径写仍需审批、规则不可 allow-always。**这条测试今天在任何形态下都不存在**，而它是 M2 DoD「硬门测试全绿」的正主。它不可能早于 Phase 2 存在，因为**前置不存在**：审批规则配置还没有（`hatchery-daemon/src/config.rs` 的 `STRICT_KEYS` 是空表，注释说接线进 `filter_keys` 与 typed reader 是 M2 的活），没有可加载的项目级规则，就无从断言「配置关不掉硬门」。今天唯一沾边的覆盖是值类型谓词 `RiskLevel::is_hard_gate()` 的两条单测（生产代码无人调用）与 prompt 级的 `the_safety_gate_cannot_be_overridden`。**工作区内硬门怎么表达**：`is_hard_gate()` 只认 `WritesOutside`，而 design/capabilities.md §5 的硬门含工作区内的 `.env*` 与 `.git/hooks`——裁决是对这些路径强制 `ApprovalRequest::once_only()`，不加 `RiskLevel` 变体（新增枚举值是协议 major bump）；kernel 本来就会拒绝不在所给选项里的答案，所以「不提供 always 选项」是真不可绕。**这条 kernel 侧的腿 Phase 0 已钉住**：`a_hard_gate_refuses_an_answer_it_never_offered`（`turn_state_machine.rs`）拿一个 `once_only()` 的请求先答 `AllowAlways` 再答 `Deny`，断言工具从未被调用、结果是拒绝文本、ToolCall 状态是 `Denied`。它依赖 testkit 新增的 `ScriptedToolHost::requiring_approval_with`：老的 `requiring_approval` 恒用 `ApprovalRequest::new`（`options` 恒为全四个），**造不出**收窄选项的请求，那条分支此前是结构性不可测的。测试落地时做过变异验证——把 `agent.rs` 的 `!offers.contains(&option)` 分支临时删掉，该测试立刻红在「工具从未被调用」这条断言上。剩下的 `invariant_project_config_cannot_disable_hard_gates`（规则里存了 `AllowAlways` 也不生效）仍排 Phase 2，它缺的是配置侧前置。
 - LocalFs：路径逃逸（`../`、symlink 出工作区、绝对路径）全部拦截；行范围读取边界。
 - LocalPty：真实进程（`sh -c echo/sleep/kill -0`）——输出完整性、超时杀、cancel 后无孤儿进程（`kill -0` 断言）、环形缓冲截断。
 - 工具单测：每个工具 × MemoryFs/MemoryTerminal 的行为矩阵；spill 阈值；凭据脱敏（高熵串 fixture 正反例）。
@@ -154,7 +154,7 @@ pub fn json_fixture(name: &str) -> Vec<u8>;   // 同上，非流式 fixture（�
 风险：竞态（双实例/双 runtime）、事件错序、代际污染。
 
 - 单实例：两进程并发 attach-or-spawn → 恰一胜者（重复 20 次抓竞态）；陈旧 daemon.json（pid 已死）自愈。
-- 租约与代际（不变量 1 专属）：`stale_runtime_events_are_dropped`——旧 generation 事件注入 hub，断言订阅者收不到；`session_lease_blocks_second_runtime`（第二 prompt 拒绝）。此外 hub 侧代际过滤（`events_below_the_session_generation_are_dropped`，daemon）、manager 级并发接受（`two_concurrent_prompts_yield_exactly_one_turn`，hatchery-tests）、空闲清扫双守卫（busy 不扫、被看的不扫，manager 测试）均已落地。
+- 租约与代际（不变量 1 专属）：`stale_runtime_events_are_dropped`——旧 generation 事件注入 hub，断言订阅者收不到；`session_lease_blocks_second_runtime`（第二 prompt 拒绝）。此外 hub 侧代际过滤（`invariant_events_below_the_session_generation_are_dropped`，daemon）、manager 级并发接受（`invariant_two_concurrent_prompts_yield_exactly_one_turn`，hatchery-tests）、空闲清扫双守卫（busy 不扫、被看的不扫，manager 测试）均已落地。
 - hub：两订阅者收到同序事件；迟加入者 replay 完整（M1 未建 replay window，重连走 session/load 重建，见 daemon.md §4 状态注记）；慢消费者被踢且不阻塞他人；coalescing 合并 delta 但控制事件不合并、不乱序（M1 未实现 coalescing，`is_coalescable` 分类有测试）。**coalescing 与 replay window 的实现连同其测试于 2026-10-07 顺延 M3**：`is_coalescable` 只含 text/reasoning delta，而 M2 新增的事件量主要来自不可合并的 `ToolCallProgress`——coalescing 治不了 M2 的病；replay window 已被 `session/load` + `replay_from` 取代且有 e2e 覆盖。M2 只产出一次 Code 会话的事件量测量并记档，作为 M3 的策略依据。
 - 崩溃恢复：status=running 的会话重启后标记 interrupted 且发过 TurnFailed 存档事件。
 - **fail-loud 装配审计**（ADR-0009）：`startup_audit_missing_provider_refuses_service`——profile 必需组件缺失（如密钥环境变量不存在）时 daemon 拒绝服务、输出缺失清单、非零退出；逐个必需组件各一条。
@@ -217,22 +217,26 @@ GUI 是测试最薄弱层，策略 = 「逻辑出 GTK，GTK 只做投影」+ 分
 
 ## 5. 不变量 → 测试映射（CI `invariants` 分组）
 
-测试名一律带 `invariant_` 前缀，nextest 的 `invariants` profile 就是靠这个前缀选出来的（§1）。**两处现状与本节不符，M2 Phase 0 修**：① 那个 profile 从未被任何门禁调用（`scripts/ci.sh` 只跑 `--profile ci`，两个 workflow 也没有它），不变量测试是搭 `ci` 继承 `default` 的车跑到的，没有可单独报告或阻塞的门禁；② 下表映射到不变量、却**没有** `invariant_` 前缀的测试有五条，一旦真去跑 `--profile invariants` 就会被静默漏掉：
+测试名一律带 `invariant_` 前缀，nextest 的 `invariants` profile 就是靠这个前缀选出来的（§1）。**本节与现状的两处不符已于 Phase 0（2026-10-07）修掉**：
 
-- `two_concurrent_prompts_yield_exactly_one_turn`（hatchery-tests/tests/invariants.rs，不变量 1）
-- `a_turn_with_no_subscriber_runs_to_completion_and_persists`（同上）
-- `no_gitlink_is_planted_in_the_user_workspace`（hatchery-capabilities/tests/spike_shadow_git.rs，与不变量 6 配对，§3.5）
-- `purge_restore_also_removes_never_tracked_files`（同上）
-- `events_below_the_session_generation_are_dropped`（hatchery-daemon/src/hub.rs，§3.6 里不变量 1 的 hub 侧那条腿）
+① `--profile invariants` 此前从未被任何门禁调用，不变量测试是搭 `ci` 继承 `default` 的车跑到的。现在 `scripts/ci.sh` 有独立的 `invariants` 步（§8）。
 
-Phase 0 要么给它们改名，要么把 profile 的过滤器换成显式清单。
+② 下表映射到不变量、却没有前缀的五条测试**已改名**（选择改名而不是把 profile 换成显式清单：清单会在本表与 `nextest.toml` 两处重复同一份知识并各自腐烂，而前缀约定是这个项目本来就有的机制）：
+
+- `two_concurrent_prompts_yield_exactly_one_turn` → `invariant_two_concurrent_prompts_yield_exactly_one_turn`（hatchery-tests/tests/invariants.rs，不变量 1）
+- `a_turn_with_no_subscriber_runs_to_completion_and_persists` → `invariant_an_unwatched_turn_runs_to_completion_and_persists`（同上，D2）
+- `no_gitlink_is_planted_in_the_user_workspace` → `invariant_no_gitlink_is_planted_in_the_user_workspace`（hatchery-capabilities/tests/spike_shadow_git.rs，与不变量 6 配对，§3.5。**ADR-0012 引的是旧名**，ADR 不改，映射见 worklog/capabilities.md）
+- `purge_restore_also_removes_never_tracked_files` → `invariant_purge_restore_also_removes_never_tracked_files`（同上）
+- `events_below_the_session_generation_are_dropped` → `invariant_events_below_the_session_generation_are_dropped`（hatchery-daemon/src/hub.rs，§3.6 里不变量 1 的 hub 侧那条腿）
+
+改名后实测：`cargo nextest list --workspace --profile invariants` 的选中集合逐条核对过，五条新前缀的都在里面，全部通过。
 
 | 不变量（architecture.md §5） | 专属测试 |
 |---|---|
 | 1 单一 runtime 所有者 | `invariant_stale_runtime_events_are_dropped`（客户端代际过滤，hatchery-tests）、`invariant_session_lease_blocks_second_runtime`（第二 prompt 拒绝，hatchery-tests）+ `two_concurrent_prompts_yield_exactly_one_turn`（竞窗，hatchery-tests）、`invariant_single_instance_race_admits_exactly_one_winner`（20 线程竞态，hatchery-tests）。**均已落地**（其中 `two_concurrent_prompts_yield_exactly_one_turn` 缺前缀，待 Phase 0 对账） |
-| 2 模型可见=已记录 | e2e 每场景收尾断言「重建上下文 == MockWire 实际收到的请求体」（逐 turn）。**已落地**：场景 1 对第二 turn 请求体的 messages 数组做整表比对（serde 字符串相等即字节相等，含首尾空白/unicode/换行）。**边界待 Phase 0 明确**：system prompt 注入后，建议只管分支历史，system prompt 是可复现的派生态、由 `prompt/render` 的 golden 单独钉（D15） |
+| 2 模型可见=已记录 | e2e 每场景收尾断言「重建上下文 == MockWire 实际收到的请求体」（逐 turn）。**已落地**：场景 1 对第二 turn 请求体的 messages 数组做整表比对（serde 字符串相等即字节相等，含首尾空白/unicode/换行）。**边界已由 Phase 0 定稿（D15）**：本不变量只管**分支历史**；system prompt 是可复现的派生态（模板 + 装配时冻结的运行时事实），不是 item，由 `prompt/render` 钉——该方法对活着的 runtime 返回装配时冻结的那一份。场景 1 因此断言三件事：两次请求的 system 文本逐字节相同、它等于 `prompt/render` 的 `text`、它**后面**的 messages 数组仍与手写期望整表比对 |
 | 3 items append-only | `invariant_items_are_never_rewritten`、`invariant_the_database_refuses_to_update_an_item`（**均已落地**：前者断言编辑后原 item 逐字段不变，后者直接用第二条连接 `UPDATE items` 被触发器拒绝，错误带我们的消息；引擎级 `invariant_items_update_trigger_aborts` 于 M0a 实测）、store 属性测试 |
-| 4 工具只经接缝 | clippy `disallowed_methods`（编译期）+ 工具单测只注入 Memory 后端（运行期证明）。**强制机制的口径要更正**：不是「workspace 级 allow + crate 属性 deny」——实测（2026-10-01）证明 crate 属性压不过 Cargo lint 表（lint 表是命令行 flag），真正的机制是 `hatchery-tools` 自带一份**完整的本地 `[lints]` 表**（workspace 继承不能与本地表混用，cargo 直接拒载 manifest）。**今天有两个洞**：禁令没覆盖 `tokio::fs::*` / `tokio::process::*`（tools 依赖 tokio、`LocalFs` 自己就用 tokio::fs，一句 `tokio::fs::write` 就绕过整条纪律），也漏 `std::fs::{remove_dir, read_link, hard_link, set_permissions}`——Phase 0 补；`disallowed_methods` 的 compile-fail 探针（trybuild 类，把「违规真的会红」钉成测试）排 Phase 7 |
+| 4 工具只经接缝 | clippy `disallowed_methods`（编译期）+ 工具单测只注入 Memory 后端（运行期证明）。**强制机制的口径要更正**：不是「workspace 级 allow + crate 属性 deny」——实测（2026-10-01）证明 crate 属性压不过 Cargo lint 表（lint 表是命令行 flag），真正的机制是 `hatchery-tools` 自带一份**完整的本地 `[lints]` 表**（workspace 继承不能与本地表混用，cargo 直接拒载 manifest）。**两个洞的 Phase 0 结果**：`tokio::fs::*` 的全部孪生项与 `std::fs::{remove_dir, read_link, hard_link, set_permissions}` 已补进 clippy.toml，并用一个临时 scratch 模块逐条实测——每条路径都被 clippy 点名（一个解析不到的路径是**静默忽略**而不是报错，所以打错字等于留洞，必须实测）。`tokio::process::Command` 的孪生项**故意没有加**：没有任何 crate 开 tokio 的 `process` feature，clippy 对这类路径回一句 "does not refer to a reachable function"，实测这不会让 `-D warnings` 失败（它是配置诊断不是 lint），但会在每次门禁输出里留下警告；等有 crate 开那个 feature 时再加。`disallowed_methods` 的常驻 compile-fail 探针（trybuild 类，把「违规真的会红」钉成测试）排 Phase 7 |
 | 5 安全门不可覆盖 | `invariant_project_config_cannot_disable_hard_gates` + prompts 覆盖正反用例。**专属测试今天不存在**（全仓库零命中），前置也不存在——审批规则配置还没接线，所以它排 Phase 2 而不是 Phase 0；细节与工作区内硬门的 `once_only()` 表达见 §3.5。今天真实存在的只有 prompt 级的 `the_safety_gate_cannot_be_overridden` 与 `RiskLevel::is_hard_gate()` 的两条值类型单测（生产代码无人调用） |
 | 6 影子 Git 不碰用户仓库 | `invariant_shadow_git_never_touches_user_repo`（**已落地**，跑在 spike 的 `Sandbox` 上；Phase 1 迁到转正的 `CheckpointStore` + `TempWorkspace` 的 git init，§3.5） |
 
@@ -251,17 +255,17 @@ Phase 0 要么给它们改名，要么把 profile 的过滤器换成显式清单
 
 ## 8. CI 门禁
 
-**PR（必须全绿，<10min 目标）**：与 `scripts/ci.sh` 的实际步骤一一对应——导出 `INSTA_UPDATE=no` / `INSTA_FORCE_UPDATE=0` → toolchain 检查 → fmt → clippy `-D warnings`（含 disallowed_methods）→ build →（非 `--quick` 时）tests → doctests → determinism → i18n。三平台的 `pr.yml` 全部调这一条命令。三处要如实写清：
+**PR（必须全绿，<10min 目标）**：与 `scripts/ci.sh` 的实际步骤一一对应——导出 `INSTA_UPDATE=no` / `INSTA_FORCE_UPDATE=0` → toolchain 检查 → fmt → clippy `-D warnings`（含 disallowed_methods）→ build →（非 `--quick` 时）tests → **invariants** → doctests → determinism，末尾打印一行 i18n 未设门禁的说明。三平台的 `pr.yml` 全部调这一条命令。三处要如实写清：
 
-- **只有一条 nextest 调用**：`cargo nextest run --workspace --profile ci`。`ci` 继承 `default`（`retries = 0` + junit），所以单元/契约/属性/集成/e2e/invariants 全在这一组里；**没有独立的 invariants 步骤**，`--profile invariants` 从未被调用（§5）——「不变量组红或绿」今天无法单独报告，Phase 0 补这一步。
-- **i18n 步在 M4 之前是空操作**：`check_i18n` 只打印「i18n extraction check lands in M4 — nothing to verify yet」然后返回成功，此前被算作通过的门禁步骤；Phase 0 改成诚实的 skip。
+- **两条 nextest 调用**（Phase 0 起）：`--profile ci` 跑全部（`ci` 继承 `default`：`retries = 0` + junit，单元/契约/属性/集成/e2e/invariants 都在里面），随后 `--profile invariants` 再单独跑一遍不变量组。重复是有意的：只有命名步骤能让「不变量组红或绿」单独报告与单独 skip；过滤器选空时 nextest 默认失败，所以前缀约定漂移会立刻暴露（§5）。
+- **i18n 不是门禁步骤**：`check_i18n` 曾被算作通过的一步，其实只 `printf` 一句话就返回成功。Phase 0 把这个函数与 `run_step i18n` 一并删掉，改成脚本末尾打印 `--- i18n: not gated yet (extraction lands in M4)`，`--help` 的步骤表也照实写——缺一项门禁应当看得见，而不是混在一串 ok 里。
 - **determinism 步的判据**是 `git status --porcelain` 里出现 `tests/(fixtures|snapshots)/` 或 `*.snap[.new]`——协议加字段的那几个 Phase 会照旧撞上「有意修改 → 提交前保持红」的已知摩擦。
 
 **nightly**：今天的 `nightly.yml` 是先跑一遍 PR 门禁（让 nightly-only 的失败可归因），再跑 slow 组与 gui 组（都带 `--no-tests=warn`）、`cargo audit`、`cargo xtask coverage`，另有一个独立的 `msrv` job。fuzz 短跑（10min/target）、criterion 基线对比与 `cargo mutants`（先只跑 store/kernel 两个高风险 crate）随 **M2 Phase 7** 进去——它们目前还是文件末尾的 TODO 注释；gui 组进 GNOME SDK 容器 + xvfb 随 M4。
 
 **live 组（不进 CI，手动/自托管）**：需要真实 provider 密钥；`cargo nextest run -E 'test(live_)'`；触发时机 = 新 provider 接入、上游 openai-interface 升级、能力表改动。结果记 worklog/llm.md。
 
-**覆盖率**：cargo-llvm-cov，PR 报告不 block；阈值（line）：kernel/store/llm/capabilities ≥ 85%，protocol/daemon ≥ 80%，cli ≥ 60%，gui 豁免（view-model 部分 ≥ 80%）。**阈值已 enforce（M1 Phase 5）**：`cargo xtask coverage` 把 llvm-cov 的逐文件报告按 `crates/<name>/src` 前缀折算成 crate 线覆盖（tests 目录不计），低于下限即失败；`--report-only` 只出表。**闸的今天只有上面那七个 crate**：`hatchery-tools` 没有地板，而 M2 的四个新工具（write_file/edit/shell/web_fetch）全落在那里——Phase 0 加进去，同时要改 `the_threshold_table_covers_the_seven_gated_crates`（`xtask/src/coverage.rs`），它把「七个」这个数字钉住了。执行位在 nightly（不是 PR 门禁）——挡百分比易诱发凑数，nightly 失败则点名漂移的 crate。**MSRV**：nightly 另有 `msrv` job，`cargo +1.90.0 check --workspace --all-targets --locked`。覆盖率是指标不是目标——不变量套件与属性测试的通过优先于数字。
+**覆盖率**：cargo-llvm-cov，PR 报告不 block；阈值（line）：kernel/store/llm/capabilities/**tools** ≥ 85%，protocol/daemon ≥ 80%，cli ≥ 60%，gui 豁免（view-model 部分 ≥ 80%）。**阈值已 enforce（M1 Phase 5）**：`cargo xtask coverage` 把 llvm-cov 的逐文件报告按 `crates/<name>/src` 前缀折算成 crate 线覆盖（tests 目录不计），低于下限即失败；`--report-only` 只出表。**`hatchery-tools` 的地板于 Phase 0（2026-10-07）补上**——M2 的四个新工具（write_file/edit/shell/web_fetch）全落在那个 crate，而把它们关在接缝里的禁令是编译期的，工具拿到批准之后**做了什么**只有测试能管。取的 85% 是与其他产品核心 crate 同一档，且**先实测再定**（加入前 `--report-only` 的读数远高于它），所以不是一个愿望数字。钉阈值表的那条测试同时改名为 `the_threshold_table_covers_the_gated_crates`（原名把「七个」写进了测试名，正是本项目不在活文档里留计数的理由）。执行位在 nightly（不是 PR 门禁）——挡百分比易诱发凑数，nightly 失败则点名漂移的 crate。**MSRV**：nightly 另有 `msrv` job，`cargo +1.90.0 check --workspace --all-targets --locked`。覆盖率是指标不是目标——不变量套件与属性测试的通过优先于数字。
 
 ## 9. 手动实测清单（模板）
 

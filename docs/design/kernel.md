@@ -168,11 +168,15 @@ pub trait HistorySource { async fn view(&self) -> Result<HistoryView, KernelErro
 - 按 provider 能力表过滤/保留 reasoning 块（ADR-0007）；
 - compaction item 替换其覆盖区间；
 - token 预算裁剪（最旧 round 优先，工具结果先于消息裁剪）——**M2 Phase 4**，与 `ToolOutput::Spilled`（D12）同排：两者是「工具输出太大」这同一个问题的两半，来源是 shell 与 web_fetch；
-- **system prompt 作为一条 `Role::System` 的 `Message` 排在最前**（M2 Phase 0 · D15）。
+- **system prompt 作为一条 `Role::System` 的 `Message` 排在最前**（**已落地**，2026-10-07 · Phase 0 · D15）。
 
 store 只返回**有序 item 链**（storage.md §4），这些过滤都在 daemon——它们需要 provider 能力表，而 store 没有也不该有。
 
-**system prompt 不走 `ChatOptions`**：`ChatOptions` 是「中立旋钮」（§4），没有也不该有 system 字段——prompt 是一条**消息**，不是一个旋钮。它由 daemon 的 `HistorySource::view()` 产出，接缝已经够用（`Message::system` 与 llm 侧 `Role::System => WireMessage::system(text)` 的翻译都在），**kernel 无需改动**。渲染时机由 D15 定：建议在 runtime 装配时渲染一次、冻结整个 runtime 生命周期——模式切换与 config 变更本来就 bump generation 重组装，而每轮重渲染会让 environment 节的日期/cwd 破坏前缀稳定性，那正是项目为 KV cache 反复强调的东西。**不变量 2（重建 == 实际请求体）的边界随之重划为只管分支历史**：system prompt 是可复现的派生态，由 `prompt/render` 的 golden 单独钉住，而不是逐字节混进请求体断言里。
+**system prompt 不走 `ChatOptions`**：`ChatOptions` 是「中立旋钮」（§4），没有也不该有 system 字段——prompt 是一条**消息**，不是一个旋钮。它由 daemon 的 `HistorySource::view()` 产出，接缝已经够用（`Message::system` 与 llm 侧 `Role::System => WireMessage::system(text)` 的翻译都在），**kernel 一行未改**——落地时核对过：`Message::system` 此前零消费者，现在是这一个；llm 的 `translate.rs` 也未改。
+
+渲染时机由 **D15 定稿**：在 runtime 装配时渲染一次、冻结整个 runtime 生命周期。理由**不是**规划时写的「模式切换与 config 变更本来就 bump generation 重组装」——实测不成立：全仓库唯一的卸载路径是空闲清扫，`session/set_config` 与 `config/set` 都不重组装活着的 runtime（daemon.md 开放问题 5）。真正的理由是每轮重渲染会让 environment 节的日期/cwd 破坏请求前缀的稳定性，那正是项目为 KV cache 反复强调的东西；而 model 与 effort 本来就同样是「下次装配才生效」，冻结让 prompt 与它们一致。
+
+**不变量 2（重建 == 实际请求体）的边界随之重划为只管分支历史**：system prompt 是可复现的派生态，由 `prompt/render` 钉住——该方法对活着的 runtime 返回装配时冻结的那一份，而不是重新渲染一份可能已经不同的。e2e 的断言形状因此是「system 文本两次请求逐字节相同 + 等于 `prompt/render` 的 text + 它后面的 messages 数组仍整表比对」。
 
 kernel 自己只做两件事：把本轮用户输入作为 item 提交（保证「模型可见 = 已记录」），并把工具结果作为 `Message` 回填给下一轮。
 
@@ -181,7 +185,7 @@ kernel 自己只做两件事：把本轮用户输入作为 item 提交（保证�
 - **一次只开一个 item**：provider 在同一条流里交错发 reasoning 与 text，若两个 item 同时开着，它们都只能挂在「最后一个**已完成**的 item」上——形成分叉，其中一个会从 active 分支消失并在重建时丢失。所以 text 到来会关闭已开的 reasoning item，reasoning 恢复则新开一个。
 - **新 item 只挂在已提交的 item 上**：`ItemStarted` 提前公布 id（前端可以先建节点），但 store 只会收到 `ItemFinished`；挂在「已预留但未提交」的 id 上会让下一次插入撞外键。
 - **中断也照常提交**：已经流出的文本、已经记录的工具调用都会收尾并提交，所以历史与用户看到的一致；被中断的工具记为 `ToolStatus::Cancelled`，被拒绝的调用记为 `Denied`。
-- **审批是 id 往返**：kernel 进入 `AwaitingApproval` 后发 `ApprovalNeeded { request_id, request }`，等 `AgentCommand::ApprovalDecision { request_id, … }`。**kernel 不设超时**——超时是应答方（`ApprovalGate`）的策略，fail-closed 的 deny 由它决定；收到别的 request_id 的答复记 warning 后忽略。
+- **审批是 id 往返**：kernel 进入 `AwaitingApproval` 后发 `ApprovalNeeded { request_id, request }`，等 `AgentCommand::ApprovalDecision { request_id, … }`。**kernel 不设超时**——超时是应答方（`ApprovalGate`）的策略，fail-closed 的 deny 由它决定；收到别的 request_id 的答复记 warning 后忽略，**收到不在所给选项里的答复同样忽略**（这条是硬门唯一承重的机制：`once_only()` 不提供 always 选项，所以「不可记忆」是真的不可绕；Phase 0 起由 `a_hard_gate_refuses_an_answer_it_never_offered` 钉住）。
 - **拒绝不是失败**：被拒的调用以 `is_error` 的 tool result 回填，turn 继续，模型得到「用户拒绝了，别再重试」的明确信息。
 - **事件序确定性**：同一脚本两次运行产生完全相同的事件序列（有测试）。
 

@@ -43,7 +43,8 @@ sections（有序）:                                                    现状�
   2. mode_variant    Chat/Code 变体纪律段（ADR-0005）                Chat 侧 M1 已有（id 实为 `mode_chat`）；
                                                                      Code 侧 `mode-code.md` 随 M2 Phase 2
   3. user_override   ~/.config/hatchery/prompts/<section>.md 逐 section 覆盖
-                                                                     覆盖机制 M1 已有；作为编号「节」M2
+                                                                     覆盖机制 M1 已有，目录 Phase 0 已接线；
+                                                                     作为编号「节」M2 Phase 2
   4. project_context AGENTS.md（工作区层级向上发现 + 项目根，qwen-code memoryDiscovery 语义）
                                                                      M2 Phase 2
   5. environment     cwd、平台、日期、工作区是否 git 仓库等运行时事实   M1 已有
@@ -51,11 +52,15 @@ sections（有序）:                                                    现状�
   7. safety_gate     安全门声明（不可覆盖，见下）                     M1 已有（含不可覆盖 + warning + 测试）
 ```
 
-**节序的现状对账（2026-10-07）**：`render_chat` 今天发出且只发出 `["identity", "mode_chat", "environment", "safety_gate"]` 四节（由 `all_four_sections_assemble_in_order` 与 dispatch 级的 `prompt_render_lists_four_sections` 钉住），嵌入文件是 `crates/hatchery-daemon/prompts/{identity,mode-chat,environment,safety-gate}.md`——**没有 `mode-code.md`**。缺的三项是 `project_context`、`tool_discipline`，以及作为编号节的 `user_override`。第三项要拆开说：**per-section 覆盖机制在 M1 已落地**（逐节读 `<id>.md`，命中则该节来源标为 `user:prompts/<id>.md`；`safety_gate` 的覆盖被拒绝并 `tracing::warn!`，`the_safety_gate_cannot_be_overridden` 断言不泄漏），没落地的是「用户内容作为节序里独立的一节」——今天的覆盖是**替换某节的来源**，不是追加一节。另有两处未接线：生产调用方传的 override 目录是 `None`，且 `~/.config/hatchery/prompts` 这个路径在代码里从未被构造，所以**用户覆盖目录今天实际不被读取**（M2 接线）；覆盖文件名取节 id（`mode_chat.md`，下划线），而 §2.2 的例子写 `mode-code.md`（连字符），加 Code 变体时要统一。
+**节序的现状对账（2026-10-07）**：`render_chat` 今天发出且只发出 `["identity", "mode_chat", "environment", "safety_gate"]` 四节（由 `all_four_sections_assemble_in_order` 与 dispatch 级的 `prompt_render_lists_four_sections` 钉住），嵌入文件是 `crates/hatchery-daemon/prompts/{identity,mode-chat,environment,safety-gate}.md`——**没有 `mode-code.md`**。缺的三项是 `project_context`、`tool_discipline`，以及作为编号节的 `user_override`。第三项要拆开说：**per-section 覆盖机制在 M1 已落地**（逐节读 `<id>.md`，命中则该节来源标为 `user:prompts/<id>.md`；`safety_gate` 的覆盖被拒绝并 `tracing::warn!`，`the_safety_gate_cannot_be_overridden` 断言不泄漏），没落地的是「用户内容作为节序里独立的一节」——今天的覆盖是**替换某节的来源**，不是追加一节。**覆盖目录已接线（2026-10-07，Phase 0）**：此前生产调用方恒传 `None`、`~/.config/hatchery/prompts` 在代码里从未被构造，机制因此只有单测能碰到。现在 `prompt::prompts_dir(config_home, home)` 按 `config::LoadPaths::detect` 的同一套规则算出 `$XDG_CONFIG_HOME/hatchery/prompts`（否则 `~/.config/hatchery/prompts`），`prompt::default_prompts_dir()` 读环境，`entry.rs` 把它交给 `SessionManager`，装配时传进 `render_chat`。纯函数那半由单测钉住两条分支；**生产路径**由 e2e 的子进程测试钉住（`a_prompt_override_in_the_standard_location_reaches_the_request`：子进程自己读 `XDG_CONFIG_HOME`，而 `set_var` 在 edition 2024 是 unsafe 且被 clippy 禁掉，所以「测试拥有子进程环境」是唯一能测真路径的形状），同一测试也断言 `safety_gate.md` 的覆盖尝试经真路径依然被拒。测试侧的 `SessionManager` 一律传 `None`，不继承跑测试那台机器的配置——与 `LayeredConfig` 用注入层是同一个理由。覆盖文件名取节 id（`mode_chat.md`，下划线），而 §2.2 的例子写 `mode-code.md`（连字符），加 Code 变体时要统一。
 
-**更要紧的一条：M1 装配出来的 prompt 只被 `prompt/render` 消费过，从未进入任何一次模型请求。** `render_chat` 的唯一非测试调用方就是 `prompt/render` 的实现（它甚至把解析出的会话 model 直接 `let _ = model;` 丢掉），`ChatOptions` 没有 system prompt 字段，daemon 的 `HistorySource::view()` 也不产 system 消息——还有一条测试主动断言消息里没有 `Role::System`。**注入是 M2 Phase 0**：system 消息由 daemon 的 `HistorySource` 实现前置进 `view()`，每次 runtime 装配渲染一次并冻结，`ChatOptions` 有意不加字段（做法与理由见 design/daemon.md §3）。
+**注入已落地（2026-10-07，Phase 0）。** 此前 M1 装配出来的 prompt 只被 `prompt/render` 消费过，从未进入任何一次模型请求。现在的链路是：`SessionManager::assemble` 渲染一次 → `RuntimeParts.prompt` 带进 `SessionRuntime`（冻结，同时供 `prompt/render` 回报）→ `StoreHistory::view()` 把 `join()` 后的文本前置成一条 `Role::System` 消息。**`ChatOptions` 有意不加字段**：llm 的 `wire_message` 本来就映射 `Role::System`（`translate.rs:134`），所以 adapter 一行没改，注入完全住在 daemon 这个装配器里（kernel.md §6 的分工）。原来那条断言「消息里没有 `Role::System`」的测试改为直接断言 checkpoint 不产消息（`checkpoints_are_not_provider_visible`，判据换成 commit id 不出现在任何消息里）。`prompt/render` 的实现也不再自己拼 `Environment`——它调 `SessionManager::render_prompt`，与装配走同一条路，两边不可能漂移；顺带删掉了那个把会话 model 读出来又 `let _ = model;` 丢掉的死绑定。
 
-**D15（Phase 0 定稿）的两条建议**：① **每次 runtime 装配渲染一次，冻结该 runtime 的整个生命周期**——模式切换与 config 变更本来就 bump generation 并重组装，冻结不会让 prompt 陈旧；反之每轮重渲染会让 environment 节的日期/cwd 破坏请求前缀的稳定性，而那正是本项目为 KV cache 反复强调的东西。② **不变量 2 只管辖分支历史**——system prompt 是可复现的派生态，由 `prompt/render` 的 golden 单独钉；相应地，e2e 里那条把 turn 2 请求体 `messages` 数组整体与手写期望比对的不变量测试，必须随注入一起更新期望。
+**D15 已定稿并实现（2026-10-07，Phase 0）**：
+
+① **每次 runtime 装配渲染一次，冻结该 runtime 的整个生命周期。** 理由**不是**规划时写的「模式切换与 config 变更本来就 bump generation 并重组装」——那句经实测不成立：全仓库唯一的卸载路径是空闲清扫（`sweep_after` → `unload`），`session/set_config` 与 `config/set` 都不重组装活着的 runtime，`session/set_mode` 甚至还没被路由。所以 model、effort 与 prompt 三者今天都是「下次装配才生效」，冻结只是让 prompt 与既有语义一致，而不是它引入了陈旧。真正的理由是每轮重渲染会让 environment 节的日期/cwd 破坏请求前缀的稳定性，而那正是本项目为 KV cache 反复强调的东西。由此暴露的「`/model` 改完当轮不生效」记为 design/daemon.md 开放问题 5；Phase 3 的 `session/set_mode` 必须先回答它——换模式要换工具表与 prompt 变体，非重组装不可。
+
+② **不变量 2 只管辖分支历史。** system prompt 是可复现的派生态（模板 + 装配时冻结的运行时事实），不是 item，由 `prompt/render` 钉：该方法对活着的 runtime 返回它装配时冻结的那一份，而不是重新渲染一份可能已经不同的。e2e 的 `invariant_minimal_chat_replays_reasoning_byte_exact` 因此断言三件事——两次请求的 system 文本逐字节相同（冻结）、它等于 `prompt/render` 的 `text`（透明性说的就是模型看到的那份）、它后面的 messages 数组仍与手写期望整表比对（分支历史逐字节）。
 
 - section 注册表模式（借鉴 dsh system-prompt）：每 section 有 id、默认内容、是否可覆盖、排序权重；`{{var}}` 插值。
 - **PRECEDENCE 声明**（借鉴 atomcode）：identity section 开头明确「用户与项目注入的规则优先于默认 persona，但 safety_gate 不可被任何注入覆盖」。

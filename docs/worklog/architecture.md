@@ -37,6 +37,16 @@
 
 ## 变更日志
 
+### 2026-10-07 · M2 Phase 0：两处门禁口径不实已修，两条不变量的口径已更正
+
+本日勘察记下的两处「门禁说自己跑了其实没跑」都修掉了：① `--profile invariants` 现在真有步骤（`scripts/ci.sh` 的 `invariants` 步），五条映射到不变量却缺前缀的测试已改名，改完逐条核对该 profile 的选中集合并全绿；② `check_i18n` 从「返回成功的空操作」变成脚本末尾一行明示未设门禁，`--help` 的步骤表照实写。细节见 worklog/testing.md。
+
+**不变量 2 的边界写进 architecture.md §5**：本条管辖分支历史；请求最前面那条 system prompt 是可复现的派生态（嵌入模板 + 装配时冻结的运行时事实），不是 item，由 `prompt/render` 钉——它对活着的 runtime 返回装配时冻结的那一份（D15，落地见 worklog/daemon.md）。这不是给不变量开口子：分支历史的逐字节断言强度没变，而 system prompt 现在有了一个比「混进请求体比对」更强的钉子（透明性 API 必须与模型实际收到的字节相同）。
+
+**不变量 4 的 §5 描述更正为真实机制**：原文写「CI 中用 lint（如 `#![deny(clippy::disallowed_methods)]`）强制」，而 crate 属性压不过 Cargo 的 lint 表（2026-10-01 实测），真正生效的是 `hatchery-tools` 自带的完整本地 `[lints]` 表 + 根目录 `clippy.toml` 的禁令表；禁令表本日补齐 `tokio::fs` 孪生项（见 worklog/capabilities.md）。
+
+**分层未变**：Phase 0 只动 daemon 内部装配与门禁配置，没有跨层新边；删掉 daemon → `hatchery-acp` 的死依赖边后 `cargo xtask layering` 仍报 strictly downward、无环。`./scripts/ci.sh` 全绿。
+
 ### 2026-10-07 · M2 重新规划：跨方向的勘察更正
 
 M2 开工前做了一次全仓库勘察（三路并行：capabilities/tools、kernel/store、daemon/cli/protocol/tests），逐条对着代码复核后重写了 roadmap 的 M2 段（Phase 0–8 + 决策点 D8–D18 + 顺延表）。方向内的细节在各自的 worklog，这里只记跨方向的部分。

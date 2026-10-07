@@ -22,7 +22,7 @@
 - [ ] (M2 · Phase 0，收口 M1) max_rounds 熔断与 TurnCompletion 语义在真实对话下验证（脚本化验证已做：`the_default_fuse_is_finite_and_generous` state.rs:178、`a_fuse_already_at_its_limit_ends_the_turn_without_a_provider_call` tests/turn_state_machine.rs:1451）
 - [ ] (M2 · Phase 4) ToolOutput::Spilled 路径（形状已就位、**全仓库无人构造**；阈值与落盘位置是 **D12**）
 - [ ] (M2 · Phase 1) **D13**：`ToolInvocation`（tools.rs:22-27）带出工具收集到的检查点，kernel 在 **ToolResult item 之前**追加 Checkpoint item，链变成 `… → ToolCall → Checkpoint → ToolResult`——M1 的 `TurnInput { turn, content }` 之后第一处 kernel 改动
-- [ ] (M2 · Phase 0) **D15**：system prompt 经 `HistorySource::view()` 以 system `Message` 进请求（`ChatOptions` 无 system 字段，message.rs:257-279，也不该有）。**kernel 侧无需改动**——`Message::system`（message.rs:56）与 llm 的 `Role::System => WireMessage::system(text)`（translate.rs:134）都已就位；要动的是 daemon 的 `StoreHistory` 与**不变量 2 的边界**（重划为只管分支历史，system prompt 是可复现的派生态、由 `prompt/render` 的 golden 单独钉）
+- [x] (M2 · Phase 0，2026-10-07 完成) **D15**：system prompt 经 `HistorySource::view()` 以 system `Message` 进请求（`ChatOptions` 无 system 字段，message.rs:257-279，也不该有）。**kernel 侧无需改动**——`Message::system`（message.rs:56）与 llm 的 `Role::System => WireMessage::system(text)`（translate.rs:134）都已就位；要动的是 daemon 的 `StoreHistory` 与**不变量 2 的边界**（重划为只管分支历史，system prompt 是可复现的派生态、由 `prompt/render` 的 golden 单独钉）。**结果**：如预判，kernel 与 llm 一行未改（`Message::system` 从零消费者变成一个）；`prompt/render` 现在对活着的 runtime 返回冻结那一份，不变量测试断言「两次请求的 system 文本逐字节相同 + 等于 `prompt/render` 的 text」。D15 的理由①（config 变更会重组装）经实测不成立，更正写在 design/kernel.md §6 与 design/daemon.md 开放问题 5
 - [ ] (M5) compaction 钩子
 
 ## 开放问题
@@ -35,6 +35,15 @@
 - 2026-09-28 M0b 落地时又定了几处（设计文档 §5/§7 有完整理由）：`ToolHost::summarize`（摘要需要工具语义，kernel 不该解析参数）、`ToolInvocation { output, is_error }`（「跑失败」与「没跑成」是两件事）、进度改走 **mpsc 通道**（同步回调和「await 工具的同时转发进度」不可兼得，同一 select 循环也让中断能取消工具）、审批改由 **kernel 发起 / daemon 应答**的 id 往返（capabilities.md 的 `ApprovalOutcome` 并入 `ApprovalOption`）。
 
 ## 变更日志
+
+### 2026-10-07 · M2 Phase 0：硬门唯一承重的那条腿终于可测
+
+**kernel 本体一行未改**（D15 的注入住在 daemon 的 `HistorySource` 实现里）。本方向的交付是把 2026-09-30 那条「审批答复必须是提供过的选项之一」的修复真正钉住——它此前**结构性不可测**，因为 fake 造不出收窄选项的请求。
+
+- testkit 加 `ScriptedToolHost::requiring_approval_with(ApprovalRequest)`，老的 `requiring_approval(name, risk)` 改为委托它（行为不变，仍是全四个选项）。
+- 新增 `a_hard_gate_refuses_an_answer_it_never_offered`（`tests/turn_state_machine.rs`）：一个 `once_only()` 的请求，先答 `AllowAlways`（不在提供列表里）再答 `Deny`（在），断言 ① 工具**从未被调用**（`call_names()` 为空）② tool result 是「the user denied this call to `write_file`; do not repeat it」③ ToolCall item 状态是 `Denied` ④ turn 正常收尾。两条答复走同一条有序命令通道，所以顺序是确定的，没有 sleep、没有轮询。
+- **变异验证**（项目纪律：新测试要证明它真的钉住了东西）：把 `await_approval` 里的 `!offers.contains(&option)` 分支去掉，该测试立刻红在「工具从未被调用」这条断言上；分支在时绿。
+- 断言 ① 是这条测试的承重部分：如果那个不被提供的 `AllowAlways` 被接受，工具就会跑起来，`Denied` 也变成 `Completed`——这正是硬门被绕过的形状。Phase 2 的 `invariant_project_config_cannot_disable_hard_gates`（规则里存了 `AllowAlways` 也不生效）建在这条之上。
 
 ### 2026-10-07 · M2 重新规划对账
 

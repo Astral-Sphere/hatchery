@@ -127,9 +127,9 @@ dev hatchery-testkit       测试基建：fake 后端 / ScriptedProvider / TestD
 每条不变量都有专属测试锁定，映射表见 [design/testing.md §5](design/testing.md)。
 
 1. **单一 runtime 所有者**：一个会话在任意时刻至多绑定一个 runtime 实例；`SessionLease`（advisory 文件锁）+ 单调代际号（generation）保证旧实例的迟到事件不会污染新实例（借鉴 atomcode `RuntimeGeneration`）。
-2. **模型可见 = 已记录**（借鉴 deepseek-harness "model-visible means logged"）：发给 LLM 的上下文必须能从数据库 active 分支完整重建；不允许存在只活在内存里的历史。
+2. **模型可见 = 已记录**（借鉴 deepseek-harness "model-visible means logged"）：发给 LLM 的上下文必须能从数据库 active 分支完整重建；不允许存在只活在内存里的历史。**边界（2026-10-07，D15）**：本条管辖**分支历史**；请求最前面那条 system prompt 是可复现的派生态（嵌入模板 + 装配时冻结的运行时事实），不是 item，由 `prompt/render` 钉住——它对活着的 runtime 返回装配时冻结的那一份。
 3. **Items append-only**：已提交的 item 永不原地修改；编辑产生新分支，删除是显式的级联操作（ADR-0003）。
-4. **工具只经接缝**：工具实现不得直接调用 `std::fs`/`std::process`，必须经 `FsBackend`/`TerminalBackend`（ADR-0004）。CI 中用 lint（如 `#![deny(clippy::disallowed_methods)]`）强制。
+4. **工具只经接缝**：工具实现不得直接调用 `std::fs`/`std::process`，必须经 `FsBackend`/`TerminalBackend`（ADR-0004）。强制机制是 clippy 的 `disallowed_methods`/`disallowed_types` + 根目录 `clippy.toml` 的禁令表，**`tokio::fs` 的孪生项一并禁掉**（2026-10-07 补：只禁 `std` 等于留了一条绕过路径，而 tools crate 本来就依赖 tokio）。生效方式不是 crate 属性 `#![deny(...)]`——实测（2026-10-01）crate 属性压不过 Cargo 的 lint 表，真正的机制是 `hatchery-tools` 自带一份完整的本地 `[lints]` 表（细节见 design/testing.md §5）。
 5. **安全门不可覆盖**：危险路径保护、审批硬门不可被项目级配置 / AGENTS.md / prompt 覆盖（借鉴 atomcode 的 PRECEDENCE 节 + 测试保证）。
 6. **影子 Git 不碰用户仓库**：检查点仓库使用独立 `--git-dir`，绝不操作用户的 HEAD/index/refs（ADR-0006）。
 
