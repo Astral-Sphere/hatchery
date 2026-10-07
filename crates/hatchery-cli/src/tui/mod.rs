@@ -17,7 +17,8 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::Line;
 
-use hatchery_protocol::{ItemId, ServerEvent, ToolStatus};
+use hatchery_protocol::method::PromptRenderResult;
+use hatchery_protocol::{Item, ItemId, ItemKind, ServerEvent, ToolStatus, TurnId};
 
 pub mod theme;
 pub mod widgets;
@@ -27,6 +28,36 @@ pub use scroll::ScrollState;
 
 use theme::{Theme, ThemeSetting};
 use widgets::{composer, indicator, scrollbar, status, toasts, transcript};
+
+/// How much of a tool's output its cell shows: one line, capped, as a hint rather than a dump.
+const TAIL_CHARS: usize = 160;
+
+/// How much of a call's arguments a history cell shows in place of a summary.
+const ARGUMENT_CHARS: usize = 80;
+
+/// The arguments as one line, the only description a committed tool call still carries: the
+/// summary a live cell shows is built by the tool and never stored.
+///
+/// Arguments that say nothing — an empty object, or the empty string the kernel keeps when a
+/// provider's argument blob would not parse — become no summary at all, so the cell shows the
+/// tool's name alone instead of `{}` behind a separator.
+fn argument_summary(args: &serde_json::Value) -> String {
+    let says_something = match args {
+        serde_json::Value::Object(map) => !map.is_empty(),
+        serde_json::Value::String(text) => !text.is_empty(),
+        serde_json::Value::Null => false,
+        _ => true,
+    };
+    if !says_something {
+        return String::new();
+    }
+    let compact = args.to_string();
+    let mut summary: String = compact.chars().take(ARGUMENT_CHARS).collect();
+    if compact.chars().count() > ARGUMENT_CHARS {
+        summary.push('…');
+    }
+    summary
+}
 
 /// The TUI's whole state: what the events said, what the user is typing, and where the window
 /// sits in the wrapped transcript.
@@ -52,6 +83,8 @@ pub struct Model {
     pub tick: u64,
     /// Tick the current turn started running, for the indicator's elapsed seconds.
     pub turn_started_tick: Option<u64>,
+    /// The turn this client's own last prompt started, if any.
+    own_turn: Option<TurnId>,
     probe: Option<(u8, u8, u8)>,
     colorfgbg: Option<String>,
     wrapped: Vec<Line<'static>>,
@@ -91,6 +124,8 @@ pub enum CellKind {
     Reasoning,
     /// A tool call cell with a lifecycle glyph.
     Tool,
+    /// The assembled prompt `/prompt` asked for, dumped as plain faint lines.
+    Prompt,
 }
 
 /// What the transcript knows about one tool call.
@@ -171,6 +206,7 @@ impl Model {
             theme_setting: setting,
             tick: 0,
             turn_started_tick: None,
+            own_turn: None,
             probe,
             colorfgbg: std::env::var("COLORFGBG").ok(),
             wrapped: Vec::new(),
@@ -204,6 +240,154 @@ impl Model {
         self.cells.push(Cell {
             kind: CellKind::User,
             raw: text.to_owned(),
+            item: None,
+            tool: None,
+            expanded: None,
+        });
+        self.dirty = true;
+        self.scroll.follow();
+    }
+
+    /// Records the turn this client's own prompt started.
+    ///
+    /// The typed line is on screen from [`Model::push_user`] the moment Enter goes down, while
+    /// the item the daemon commits for it arrives later on the same event stream; without the
+    /// turn id to tell them apart, the client that typed a message would read it twice. Turn
+    /// identity rather than text equality, because two clients on one session are free to send
+    /// the same line.
+    pub fn mark_submitted(&mut self, turn: TurnId) {
+        self.own_turn = Some(turn);
+    }
+
+    /// Projects a loaded branch, oldest first.
+    pub fn push_history(&mut self, items: &[Item]) {
+        for item in items {
+            self.push_item(item);
+        }
+    }
+
+    /// Projects one item of loaded history into the transcript.
+    ///
+    /// The kinds a provider sees become cells; a tool result folds into the call it answers
+    /// instead of getting a cell of its own; the bookkeeping kinds project nothing, because
+    /// none of them is part of the conversation and the transcript has no cell for them.
+    pub fn push_item(&mut self, item: &Item) {
+        match &item.kind {
+            ItemKind::UserMessage(content) => self.push_cell(CellKind::User, content.text.clone()),
+            ItemKind::AssistantMessage(content) => {
+                self.push_cell(CellKind::Assistant, content.text.clone());
+            }
+            ItemKind::Reasoning(block) => self.push_cell(CellKind::Reasoning, block.text.clone()),
+            ItemKind::ToolCall(call) => self.push_tool_call(item.id, call),
+            ItemKind::ToolResult(result) => self.fold_tool_result(result),
+            ItemKind::Checkpoint(_)
+            | ItemKind::Compaction(_)
+            | ItemKind::ModeSwitch(_)
+            | ItemKind::BranchNote(_) => {}
+        }
+    }
+
+    /// Appends one cell and keeps the window on the tail, where a resumed session should open.
+    fn push_cell(&mut self, kind: CellKind, raw: String) {
+        self.cells.push(Cell {
+            kind,
+            raw,
+            item: None,
+            tool: None,
+            expanded: None,
+        });
+        self.dirty = true;
+        self.scroll.follow();
+    }
+
+    /// A tool cell from history: the call's own name and final status, and its arguments where
+    /// the live stream would have had a summary — a committed item does not carry one.
+    fn push_tool_call(&mut self, id: ItemId, call: &hatchery_protocol::ToolCall) {
+        self.cells.push(Cell {
+            kind: CellKind::Tool,
+            raw: String::new(),
+            item: Some(id),
+            tool: Some(ToolCell {
+                name: Some(call.name.clone()),
+                title: argument_summary(&call.args),
+                detail: None,
+                status: call.status,
+                tail: String::new(),
+            }),
+            expanded: None,
+        });
+        self.dirty = true;
+        self.scroll.follow();
+    }
+
+    /// Folds a result into the call it answers, as the one-line hint the live progress tail is.
+    /// A result whose call is not on screen belongs to another branch and is dropped.
+    fn fold_tool_result(&mut self, result: &hatchery_protocol::ToolResult) {
+        let Some(tool) = self.tool_mut(result.call) else {
+            return;
+        };
+        let hint = result
+            .output
+            .text
+            .lines()
+            .map(str::trim_end)
+            .find(|line| !line.is_empty())
+            .unwrap_or_default();
+        tool.tail = hint.chars().take(TAIL_CHARS).collect();
+        self.dirty = true;
+    }
+
+    /// Projects one item from the live stream: only what a delta cannot express.
+    ///
+    /// Assistant text and reasoning are on screen token by token before their item finishes, so
+    /// projecting the finished item too would double every reply; a tool call's cell is opened
+    /// by `ToolCallStarted` and only completed here. That leaves the user message — the one
+    /// thing another client's typing produces that this client has no other news of.
+    fn push_live_item(&mut self, item: &Item) {
+        match &item.kind {
+            ItemKind::ToolCall(call) => {
+                if let Some(tool) = self.tool_mut(item.id) {
+                    tool.name = Some(call.name.clone());
+                    tool.status = call.status;
+                    self.dirty = true;
+                }
+            }
+            ItemKind::UserMessage(content) => {
+                // This client's own line went up when Enter did, and the daemon's copy of it
+                // comes back on the same stream; the turn id tells the two apart.
+                let mine = self.own_turn.is_some_and(|turn| item.turn == Some(turn));
+                if !mine {
+                    self.push_cell(CellKind::User, content.text.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Dumps the assembled prompt `/prompt` asked for into the transcript.
+    ///
+    /// The sections are what gets rendered, because they carry the provenance the joined text
+    /// flattens away; the daemon builds that text by joining exactly these sections, so showing
+    /// both would print every word twice. A reply with no sections falls back to the text, which
+    /// is then all it has.
+    pub fn push_prompt(&mut self, result: &PromptRenderResult) {
+        let mut raw = String::from("prompt as sent");
+        if result.sections.is_empty() {
+            raw.push('\n');
+            raw.push_str(result.text.trim_end());
+        } else {
+            for section in &result.sections {
+                raw.push_str(&format!(
+                    "\n\n{} · {}\n{}",
+                    section.id,
+                    section.source,
+                    section.text.trim_end()
+                ));
+            }
+        }
+        self.cells.push(Cell {
+            kind: CellKind::Prompt,
+            raw,
             item: None,
             tool: None,
             expanded: None,
@@ -263,18 +447,12 @@ impl Model {
             ServerEvent::ToolCallProgress { item, chunk } => {
                 if let Some(tool) = self.tool_mut(*item) {
                     let tail = chunk.lines().next_back().unwrap_or_default().trim_end();
-                    tool.tail = tail.chars().take(160).collect();
+                    tool.tail = tail.chars().take(TAIL_CHARS).collect();
                     self.dirty = true;
                 }
             }
             ServerEvent::ItemFinished { item } => {
-                if let hatchery_protocol::ItemKind::ToolCall(call) = &item.kind
-                    && let Some(tool) = self.tool_mut(item.id)
-                {
-                    tool.name = Some(call.name.clone());
-                    tool.status = call.status;
-                    self.dirty = true;
-                }
+                self.push_live_item(item);
             }
             ServerEvent::ApprovalRequested { .. } => {
                 self.status.state = "awaiting approval".to_owned();
@@ -947,6 +1125,372 @@ mod tests {
             fg(&dark),
             fg(&light),
             "every styled span follows the palette"
+        );
+    }
+
+    /// One item of history, with the turn it belongs to when it belongs to one.
+    fn item(kind: hatchery_protocol::ItemKind, turn: Option<hatchery_protocol::TurnId>) -> Item {
+        let item = Item::new(hatchery_protocol::SessionId::new(), kind);
+        match turn {
+            Some(turn) => item.with_turn(turn),
+            None => item,
+        }
+    }
+
+    fn kinds(model: &Model) -> Vec<CellKind> {
+        model.cells.iter().map(|cell| cell.kind).collect()
+    }
+
+    #[test]
+    fn loaded_history_projects_the_conversation_into_cells() {
+        let mut model = Model::new(
+            "p/m".to_owned(),
+            "medium".to_owned(),
+            false,
+            ThemeSetting::Dark,
+            Theme::dark(),
+            None,
+            "/tmp".to_owned(),
+        );
+        model.push_history(&[
+            item(
+                hatchery_protocol::ItemKind::UserMessage(hatchery_protocol::Content::text(
+                    "what did I ask before?",
+                )),
+                None,
+            ),
+            item(
+                hatchery_protocol::ItemKind::Reasoning(hatchery_protocol::ReasoningBlock::text(
+                    "the earlier turn was about the store",
+                )),
+                None,
+            ),
+            item(
+                hatchery_protocol::ItemKind::AssistantMessage(hatchery_protocol::Content::text(
+                    "you asked about the store",
+                )),
+                None,
+            ),
+            // Bookkeeping: not provider-visible, and the transcript has no cell for it.
+            item(
+                hatchery_protocol::ItemKind::Checkpoint(hatchery_protocol::Checkpoint {
+                    commit_id: "deadbeef".to_owned(),
+                    kind: hatchery_protocol::CheckpointKind::PreWrite,
+                }),
+                None,
+            ),
+        ]);
+        model.relayout(60);
+        assert_eq!(
+            kinds(&model),
+            vec![
+                CellKind::Banner,
+                CellKind::User,
+                CellKind::Reasoning,
+                CellKind::Assistant
+            ],
+            "{:?}",
+            model.cells
+        );
+        let frame = drawn(&model, 60, 14);
+        assert!(frame.contains("> what did I ask before?"), "{frame}");
+        assert!(frame.contains("you asked about the store"), "{frame}");
+        assert!(
+            frame.contains("∴ Thought for"),
+            "reasoning from history folds like the live kind: {frame}"
+        );
+        assert!(!frame.contains("deadbeef"), "{frame}");
+        assert!(
+            model.scroll.following(),
+            "a resumed session opens on its tail"
+        );
+    }
+
+    #[test]
+    fn a_history_tool_call_keeps_its_status_and_its_result_folds_into_it() {
+        let mut model = model();
+        let call = ItemId::new();
+        // The call and its result, oldest first, as a branch carries them.
+        model.push_item(&tool_call_item(call));
+        model.push_item(&item(
+            hatchery_protocol::ItemKind::ToolResult(hatchery_protocol::ToolResult {
+                call,
+                output: hatchery_protocol::ToolOutput::text("fn main() {}\nsecond line"),
+                is_error: false,
+            }),
+            None,
+        ));
+        model.relayout(60);
+        assert_eq!(
+            kinds(&model),
+            vec![CellKind::Banner, CellKind::Tool],
+            "the result is not a cell of its own: {:?}",
+            model.cells
+        );
+        let frame = drawn(&model, 60, 12);
+        assert!(frame.contains("✓ read_file"), "{frame}");
+        assert!(
+            frame.contains("fn main() {}"),
+            "the result's first line folds into the call: {frame}"
+        );
+        assert!(
+            !frame.contains("second line"),
+            "one line of the output is a hint, not a dump: {frame}"
+        );
+    }
+
+    /// A finished call, the shape history carries it in: name, arguments and final status.
+    fn tool_call_item(id: ItemId) -> Item {
+        hatchery_protocol::Item::with_id(
+            id,
+            hatchery_protocol::SessionId::new(),
+            hatchery_protocol::ItemKind::ToolCall(hatchery_protocol::ToolCall::new(
+                "read_file",
+                serde_json::json!({"path": "src/main.rs"}),
+                ToolStatus::Completed,
+            )),
+        )
+    }
+
+    #[test]
+    fn a_history_call_shows_its_arguments_and_nothing_when_it_had_none() {
+        let mut model = model();
+        for args in [
+            serde_json::json!({}),
+            serde_json::Value::String(String::new()),
+        ] {
+            model.push_item(&Item::new(
+                hatchery_protocol::SessionId::new(),
+                hatchery_protocol::ItemKind::ToolCall(hatchery_protocol::ToolCall::new(
+                    "list_sessions",
+                    args,
+                    ToolStatus::Completed,
+                )),
+            ));
+        }
+        model.relayout(60);
+        let frame = drawn(&model, 60, 12);
+        assert!(frame.contains("✓ list_sessions"), "{frame}");
+        assert!(
+            !frame.contains("list_sessions ·"),
+            "arguments that say nothing are no summary: {frame}"
+        );
+    }
+
+    #[test]
+    fn a_history_call_caps_the_arguments_it_shows() {
+        let mut model = model();
+        model.push_item(&Item::new(
+            hatchery_protocol::SessionId::new(),
+            hatchery_protocol::ItemKind::ToolCall(hatchery_protocol::ToolCall::new(
+                "write_file",
+                serde_json::json!({"content": "x".repeat(500)}),
+                ToolStatus::Completed,
+            )),
+        ));
+        let tool = model
+            .cells
+            .last()
+            .expect("a cell")
+            .tool
+            .as_ref()
+            .expect("a tool cell");
+        assert!(
+            tool.title.ends_with('…'),
+            "a call that carried a whole file is cut, not dumped: {:?}",
+            tool.title
+        );
+        assert!(
+            tool.title.chars().count() <= ARGUMENT_CHARS + 1,
+            "{} characters of arguments is a screenful",
+            tool.title.chars().count()
+        );
+    }
+
+    #[test]
+    fn another_clients_user_message_reaches_the_transcript() {
+        let mut model = model();
+        model.push_event(&ServerEvent::ItemFinished {
+            item: item(
+                hatchery_protocol::ItemKind::UserMessage(hatchery_protocol::Content::text(
+                    "typed from the other front-end",
+                )),
+                Some(hatchery_protocol::TurnId::new()),
+            ),
+        });
+        model.relayout(60);
+        let frame = drawn(&model, 60, 10);
+        assert!(
+            frame.contains("> typed from the other front-end"),
+            "{frame}"
+        );
+    }
+
+    #[test]
+    fn the_clients_own_message_is_not_projected_a_second_time() {
+        let mut model = model();
+        let turn = hatchery_protocol::TurnId::new();
+        model.push_user("mine");
+        model.mark_submitted(turn);
+        model.push_event(&ServerEvent::ItemFinished {
+            item: item(
+                hatchery_protocol::ItemKind::UserMessage(hatchery_protocol::Content::text("mine")),
+                Some(turn),
+            ),
+        });
+        // Another client sending the very same line is a different turn and still shows.
+        model.push_event(&ServerEvent::ItemFinished {
+            item: item(
+                hatchery_protocol::ItemKind::UserMessage(hatchery_protocol::Content::text("mine")),
+                Some(hatchery_protocol::TurnId::new()),
+            ),
+        });
+        model.relayout(60);
+        let user_cells: Vec<&Cell> = model
+            .cells
+            .iter()
+            .filter(|cell| cell.kind == CellKind::User)
+            .collect();
+        assert_eq!(
+            user_cells.len(),
+            2,
+            "the echo of my own turn is dropped, an identical line from another turn is not: {:?}",
+            kinds(&model)
+        );
+    }
+
+    #[test]
+    fn the_live_stream_does_not_repeat_what_the_deltas_already_carried() {
+        let mut model = model();
+        let streamed = ItemId::new();
+        model.push_event(&ServerEvent::ReasoningDelta {
+            item: streamed,
+            text: "thinking".to_owned(),
+        });
+        model.push_event(&ServerEvent::TextDelta {
+            item: streamed,
+            text: "the answer".to_owned(),
+        });
+        model.push_event(&ServerEvent::ItemFinished {
+            item: item(
+                hatchery_protocol::ItemKind::Reasoning(hatchery_protocol::ReasoningBlock::text(
+                    "thinking",
+                )),
+                None,
+            ),
+        });
+        model.push_event(&ServerEvent::ItemFinished {
+            item: item(
+                hatchery_protocol::ItemKind::AssistantMessage(hatchery_protocol::Content::text(
+                    "the answer",
+                )),
+                None,
+            ),
+        });
+        model.relayout(60);
+        assert_eq!(
+            kinds(&model),
+            vec![CellKind::Banner, CellKind::Reasoning, CellKind::Assistant],
+            "a finished item must not open a second cell beside its deltas: {:?}",
+            model.cells
+        );
+        let frame = drawn(&model, 60, 10);
+        assert_eq!(frame.matches("the answer").count(), 1, "{frame}");
+    }
+
+    fn rendered_prompt() -> PromptRenderResult {
+        PromptRenderResult {
+            // The daemon builds this by joining the sections below; both halves arrive.
+            text: "You are Hatchery.\n\nDo not write files.".to_owned(),
+            sections: vec![
+                hatchery_protocol::method::PromptSection {
+                    id: "identity".to_owned(),
+                    source: "builtin".to_owned(),
+                    text: "You are Hatchery.".to_owned(),
+                },
+                hatchery_protocol::method::PromptSection {
+                    id: "safety_gate".to_owned(),
+                    source: "user:prompts/safety_gate.md".to_owned(),
+                    text: "Do not write files.\n".to_owned(),
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn the_prompt_dump_names_its_sections_and_where_they_came_from() {
+        let mut model = model();
+        model.push_prompt(&rendered_prompt());
+        model.relayout(60);
+        let frame = drawn(&model, 60, 16);
+        assert!(frame.contains("≡ prompt as sent"), "{frame}");
+        assert!(frame.contains("identity · builtin"), "{frame}");
+        assert!(frame.contains("You are Hatchery."), "{frame}");
+        assert!(
+            frame.contains("safety_gate · user:prompts/safety_gate.md"),
+            "{frame}"
+        );
+        assert!(frame.contains("Do not write files."), "{frame}");
+        assert_eq!(
+            frame.matches("You are Hatchery.").count(),
+            1,
+            "the joined text is the sections joined, so it is not printed twice: {frame}"
+        );
+        assert!(model.scroll.following(), "the dump lands at the tail");
+    }
+
+    #[test]
+    fn a_prompt_reply_with_no_sections_falls_back_to_its_text() {
+        let mut model = model();
+        model.push_prompt(&PromptRenderResult {
+            text: "the whole prompt in one piece".to_owned(),
+            sections: Vec::new(),
+        });
+        model.relayout(60);
+        assert!(
+            drawn(&model, 60, 12).contains("the whole prompt in one piece"),
+            "{:?}",
+            model.cells
+        );
+    }
+
+    #[test]
+    fn a_prompt_dump_has_no_fold_and_a_click_on_it_changes_nothing() {
+        let mut model = model();
+        model.push_prompt(&rendered_prompt());
+        model.relayout(60);
+        let before = drawn(&model, 60, 16);
+        let dump = model.cells.len() - 1;
+        assert_eq!(model.cells[dump].kind, CellKind::Prompt);
+
+        model.toggle_cell(dump);
+        assert_eq!(
+            model.cells[dump].expanded, None,
+            "the dump is what the user asked to read; it does not fold"
+        );
+        model.relayout(60);
+        assert_eq!(drawn(&model, 60, 16), before, "a click repaints nothing");
+        // Hit testing still addresses every row, so the click landed on the dump and was
+        // refused by kind rather than by a hole in the row map.
+        assert!(
+            model.cell_of_row().contains(&dump),
+            "{:?}",
+            model.cell_of_row()
+        );
+        // Taller than a short window, so it scrolls like any other cell: the window can sit at
+        // the head or follow the tail, and the offsets the scrollbar is drawn from agree.
+        let total = model.wrapped_lines().len();
+        assert!(
+            total > 6,
+            "the dump overflows a six-row window: {total} rows"
+        );
+        model.scroll.top();
+        assert_eq!(model.scroll_offset(6), 0);
+        model.scroll.follow();
+        assert_eq!(
+            model.scroll_offset(6),
+            total - 6,
+            "following lands on the last window of the dump"
         );
     }
 }

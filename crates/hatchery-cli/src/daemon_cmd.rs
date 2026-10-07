@@ -1,9 +1,10 @@
 //! `hatchery daemon {start|run|status|stop}`.
 //!
-//! `start` is the D1 spawn half: launch `daemon run` detached (`process_group(0)`, stdio to
-//! the void), poll for `daemon.json`, report. `stop` sends SIGTERM through the system `kill`
-//! binary — the workspace denies unsafe, and a one-line subprocess beats a syscall binding
-//! for one signal (recorded in the worklog); the daemon's own handler does the graceful part.
+//! `start` is the D1 spawn half: launch `daemon run` detached (`process_group(0)`, stdio
+//! appended to a log file so a refused startup stays readable), poll for `daemon.json`, report.
+//! `stop` sends SIGTERM through the system `kill` binary — the workspace denies unsafe, and a
+//! one-line subprocess beats a syscall binding for one signal (recorded in the worklog); the
+//! daemon's own handler does the graceful part.
 
 use std::time::Duration;
 
@@ -48,15 +49,24 @@ async fn start(state: &StateDir) -> i32 {
         || std::path::PathBuf::from("."),
         std::path::Path::to_path_buf,
     );
+    // The detached child's own words go to a file rather than the void, so that "see …" names
+    // something that can actually hold the reason it died (`attach::STDIO_LOG`).
+    let captured = crate::attach::child_stdio(state);
+    let log_hint = crate::attach::log_hint_for(state, captured.as_ref());
     let mut command = std::process::Command::new(&exe);
     command
         .arg("daemon")
         .arg("run")
         .arg("--state-dir")
         .arg(&state_root)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
+        .stdin(std::process::Stdio::null());
+    if let Some(captured) = captured {
+        command.stdout(captured.stdout).stderr(captured.stderr);
+    } else {
+        command
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+    }
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -85,14 +95,14 @@ async fn start(state: &StateDir) -> i32 {
         if child.try_wait().is_ok_and(|ended| ended.is_some()) {
             eprintln!(
                 "hatchery: the daemon process exited before serving; see {}",
-                state.logs_dir().display()
+                log_hint.display()
             );
             return 1;
         }
         if tokio::time::Instant::now() >= deadline {
             eprintln!(
                 "hatchery: the daemon (pid {pid}) did not publish within {READY_TIMEOUT:?}; see {}",
-                state.logs_dir().display()
+                log_hint.display()
             );
             return 1;
         }

@@ -2,8 +2,9 @@
 //!
 //! The spawn half implements the D1 decision (2026-09-30): no double fork, no sd_notify — the
 //! CLI simply launches `hatchery daemon run` as a detached process (`process_group(0)`, stdio
-//! to the void) and polls the state directory until the daemon publishes `daemon.json`. The
-//! boot token in that file is the handshake, and its mtime-plus-log the user's trail.
+//! appended to a log file) and polls the state directory until the daemon publishes
+//! `daemon.json`. The boot token in that file is the handshake, and its mtime-plus-log the
+//! user's trail.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -16,6 +17,56 @@ const SPAWN_READY_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// How often a spawned daemon's publication is polled.
 const SPAWN_POLL_PERIOD: Duration = Duration::from_millis(100);
+
+/// The file a detached child's stdout and stderr are appended to, under [`StateDir::logs_dir`].
+///
+/// The daemon's own logger writes `hatchery.log.<date>` in the same directory, but it never sees
+/// a refused startup: `entry::run` *returns* that error, and only the foreground path prints it.
+/// A detached child has no terminal either (D1), so without this file the fatal words exist
+/// nowhere — and "its log is at …" sends the user to an empty one (ADR-0009 is fail-*loud*).
+pub const STDIO_LOG: &str = "hatchery-stdio.log";
+
+/// A detached child's captured stdout and stderr, and the file they land in.
+pub(crate) struct ChildStdio {
+    /// The file both streams append to; a refusal should name this, not its directory.
+    pub(crate) path: PathBuf,
+    /// The child's stdout.
+    pub(crate) stdout: std::process::Stdio,
+    /// The child's stderr.
+    pub(crate) stderr: std::process::Stdio,
+}
+
+/// Opens [`STDIO_LOG`] under the state's log directory for a detached child's stdout and stderr.
+///
+/// Appended rather than replaced: a spawn must not destroy the words of a daemon that is still
+/// running — or of the one that just failed and is about to be reported — and appending is the
+/// only mode two CLIs racing to spawn can share.
+///
+/// `None` when the directory or the file will not open. The spawn still happens then, with its
+/// stdio to the void and the log *directory* as the hint: a log that cannot be written is not a
+/// reason to refuse to start a daemon.
+pub(crate) fn child_stdio(state: &StateDir) -> Option<ChildStdio> {
+    let dir = state.logs_dir();
+    std::fs::create_dir_all(&dir).ok()?;
+    let path = dir.join(STDIO_LOG);
+    let stdout = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .ok()?;
+    let stderr = stdout.try_clone().ok()?;
+    Some(ChildStdio {
+        path,
+        stdout: stdout.into(),
+        stderr: stderr.into(),
+    })
+}
+
+/// The path a failure message should point at: the captured stdio when there is one, else the
+/// directory the daemon's own log files live in.
+pub(crate) fn log_hint_for(state: &StateDir, captured: Option<&ChildStdio>) -> PathBuf {
+    captured.map_or_else(|| state.logs_dir(), |stdio| stdio.path.clone())
+}
 
 /// Why reaching the daemon failed. Every variant is the user's business.
 #[derive(Debug, thiserror::Error)]
@@ -120,10 +171,18 @@ async fn spawn_and_attach(
     if let Some(workspace) = workspace {
         command.current_dir(workspace);
     }
-    command
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
+    // The child's own words go to a file, not the void: a detached daemon that refuses to start
+    // has no other way to say why (see [`STDIO_LOG`]).
+    let captured = child_stdio(&state);
+    let log_hint = log_hint_for(&state, captured.as_ref());
+    command.stdin(std::process::Stdio::null());
+    if let Some(captured) = captured {
+        command.stdout(captured.stdout).stderr(captured.stderr);
+    } else {
+        command
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+    }
     #[cfg(unix)]
     {
         // Detached: own process group, so closing the terminal's foreground group does not
@@ -156,15 +215,54 @@ async fn spawn_and_attach(
         if child.try_wait().map_err(AttachError::Spawn)?.is_some() {
             return Err(AttachError::NotReady {
                 timeout_secs: SPAWN_READY_TIMEOUT.as_secs(),
-                log_hint: state.logs_dir(),
+                log_hint: log_hint.clone(),
             });
         }
         if tokio::time::Instant::now() >= deadline {
             return Err(AttachError::NotReady {
                 timeout_secs: SPAWN_READY_TIMEOUT.as_secs(),
-                log_hint: state.logs_dir(),
+                log_hint: log_hint.clone(),
             });
         }
         tokio::time::sleep(SPAWN_POLL_PERIOD).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_stdio_log_appends_and_the_hint_names_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = StateDir::at(dir.path().join("state"));
+        let captured = child_stdio(&state).expect("the log opens");
+        assert_eq!(
+            captured.path,
+            state.logs_dir().join(STDIO_LOG),
+            "the capture lives beside the daemon's own log files"
+        );
+        assert_eq!(
+            log_hint_for(&state, Some(&captured)),
+            captured.path,
+            "a refusal names the file the child's words went to"
+        );
+        assert_eq!(
+            log_hint_for(&state, None),
+            state.logs_dir(),
+            "with no capture the hint falls back to the directory"
+        );
+        drop(captured);
+
+        // Reopening appends: the words of the daemon that just failed are the evidence the next
+        // troubleshooter needs, and two CLIs racing to spawn must not truncate each other.
+        let log = state.logs_dir().join(STDIO_LOG);
+        std::fs::write(&log, "the previous daemon died here\n").expect("write");
+        drop(child_stdio(&state).expect("the log reopens"));
+        let contents = std::fs::read_to_string(&log).expect("read");
+        assert!(
+            contents.contains("the previous daemon died here"),
+            "{contents:?}"
+        );
     }
 }

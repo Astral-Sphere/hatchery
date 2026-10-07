@@ -101,7 +101,9 @@ pub fn render_cell(
                     Style::new().fg(theme.tool).bold(),
                 ),
             ];
-            if tool.name.is_some() {
+            // A cell with nothing to add after its name keeps the separator out too: history
+            // carries calls whose arguments were empty, and a live summary is never blank.
+            if tool.name.is_some() && !tool.title.is_empty() {
                 spans.push(Span::styled(
                     format!(" · {}", tool.title),
                     Style::new().fg(theme.dim),
@@ -134,6 +136,19 @@ pub fn render_cell(
             lines.extend(body);
             lines
         }
+        CellKind::Prompt => cell
+            .raw
+            .split('\n')
+            .enumerate()
+            .map(|(index, line)| {
+                let mut spans = Vec::new();
+                if index == 0 {
+                    spans.push(Span::styled("≡ ", Style::new().fg(theme.faint)));
+                }
+                spans.push(Span::styled(line.to_owned(), Style::new().fg(theme.faint)));
+                Line::from(spans)
+            })
+            .collect(),
     }
 }
 

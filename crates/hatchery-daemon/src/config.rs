@@ -110,6 +110,10 @@ fn toml_value_of<T: Serialize>(value: &T) -> toml::Value {
 #[derive(Clone, Debug, Serialize)]
 pub struct BuiltinUi {
     /// Whether the frontend shows reasoning by default.
+    ///
+    /// Folded: reasoning is process, not answer, and a long chain scrolls the answer off the
+    /// screen. `Ctrl+R` (or a click on the cell) expands it, and the key is here for anyone who
+    /// wants the opposite.
     pub show_reasoning: bool,
     /// Palette choice: `auto` (follow the terminal background), `dark` or `light`.
     pub theme: String,
@@ -122,7 +126,7 @@ pub struct BuiltinUi {
 impl Default for BuiltinUi {
     fn default() -> Self {
         Self {
-            show_reasoning: true,
+            show_reasoning: false,
             theme: "auto".to_owned(),
             language: String::new(),
             response_language: String::new(),
@@ -366,7 +370,7 @@ impl LayeredConfig {
                 .map(str::to_owned)
         };
         UiConfig {
-            show_reasoning: flag("ui.show_reasoning", true),
+            show_reasoning: flag("ui.show_reasoning", false),
             language: text("ui.language"),
             response_language: text("ui.response_language"),
         }
@@ -859,7 +863,7 @@ mod tests {
             table("ui.show_reasoning = \"banana\"\nui.show_reasoning_note = 1\n"),
         )]);
         assert!(
-            config.ui().show_reasoning,
+            !config.ui().show_reasoning,
             "the wrong-typed value is dropped and the default stands"
         );
         // And config/set refuses a type mismatch instead of lying on the wire.

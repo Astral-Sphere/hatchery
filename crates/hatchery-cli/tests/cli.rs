@@ -215,6 +215,49 @@ async fn a_spawned_child_that_dies_is_reported_not_polled_out() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_detached_childs_fatal_words_reach_the_log_it_is_pointed_at() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    // Stands in for a daemon that dies of a locked database, complaining on stderr exactly the
+    // way the foreground `daemon run` does — the words the live acceptance run could only read
+    // by giving up on the detached path.
+    let doomed = dir.path().join("doomed-daemon.sh");
+    std::fs::write(
+        &doomed,
+        "#!/bin/sh\necho 'store: database: Locking error: Failed locking file' >&2\nexit 1\n",
+    )
+    .expect("the stand-in is written");
+    std::fs::set_permissions(&doomed, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+    let state_root = dir.path().join("state");
+    let state = hatchery_daemon::discover::StateDir::at(state_root.clone());
+    let error = match hatchery_cli::attach::attach_or_spawn(state.clone(), Some(doomed), None).await
+    {
+        Err(error) => error,
+        Ok(_) => panic!("a child that publishes nothing must be refused"),
+    };
+    let message = error.to_string();
+    assert!(message.contains("did not become ready"), "{message}");
+
+    let log = state.logs_dir().join(hatchery_cli::attach::STDIO_LOG);
+    let captured = std::fs::read_to_string(&log).unwrap_or_else(|error| {
+        panic!(
+            "the log the refusal points at ({}) holds the child's own words: {error}",
+            log.display()
+        )
+    });
+    assert!(
+        captured.contains("Locking error"),
+        "the fatal startup error survived the detach: {captured:?}"
+    );
+    assert!(
+        message.contains(&log.display().to_string()),
+        "and the refusal names that file, not a directory that may hold nothing: {message}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn the_exec_exit_code_matrix_is_the_documented_one() {
     assert_eq!(Outcome::Completed.exit_code(), 0);
     assert_eq!(Outcome::Failed.exit_code(), 1);

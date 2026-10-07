@@ -61,6 +61,8 @@ struct Seed {
     show_reasoning: bool,
     theme: ThemeSetting,
     workspace: String,
+    /// The resumed session's active branch, oldest first; empty for a fresh one.
+    history: Vec<hatchery_protocol::Item>,
 }
 
 async fn open_session(
@@ -74,29 +76,46 @@ async fn open_session(
         args.workspace.as_deref(),
     )
     .await?;
-    // Both subscribing replies carry a whole `session` object; read the status line's seed out
-    // of it so a resumed session shows its own model and effort, not defaults.
-    let view = serde_json::from_value::<SessionView>(reply).ok();
-    let model_name = view
+    // The subscribing reply carries the session row the status line seeds from, and a resumed
+    // session's reply carries the branch to project as well. Decoded once: a long history is
+    // not something to clone just to read a model name out of.
+    let (row, history) = match args.session {
+        Some(_) => {
+            let loaded = serde_json::from_value::<m::SessionLoadResult>(reply)
+                .map_err(|error| format!("session/load reply: {error}"))?;
+            let row = loaded.session.clone();
+            let client = attached.client.clone();
+            let history = drain_history(loaded, |params| {
+                let client = client.clone();
+                async move {
+                    client
+                        .call::<_, m::SessionLoadResult>(m::SESSION_LOAD, &params)
+                        .await
+                        .map_err(|error| error.to_string())
+                }
+            })
+            .await?;
+            (Some(row), history)
+        }
+        // A fresh session has no branch yet, and a reply that will not decode leaves the status
+        // line on its defaults rather than refusing to open the TUI.
+        None => (
+            serde_json::from_value::<SessionView>(reply)
+                .ok()
+                .map(|view| view.session),
+            Vec::new(),
+        ),
+    };
+    let model_name = row
         .as_ref()
-        .map(|view| {
-            format!(
-                "{}/{}",
-                view.session.model.provider, view.session.model.model
-            )
-        })
+        .map(|row| format!("{}/{}", row.model.provider, row.model.model))
         .unwrap_or_default();
-    let effort = view
+    let effort = row
         .as_ref()
-        .and_then(|view| view.session.config_patch.as_ref())
-        .and_then(|patch| patch.get("reasoning_effort"))
-        .and_then(|value| value.as_str())
-        .unwrap_or("medium")
-        .to_owned();
-    // `ui.show_reasoning` seeds the fold; a daemon without the key gets the default.
-    let show_reasoning = config_bool(attached, "ui.show_reasoning")
-        .await
-        .unwrap_or(true);
+        .and_then(applied_effort)
+        .unwrap_or_else(|| "medium".to_owned());
+    // `ui.show_reasoning` seeds the fold; a daemon without the key gets the shipped default.
+    let show_reasoning = seed_show_reasoning(config_bool(attached, "ui.show_reasoning").await);
     // `ui.theme` seeds the palette; `auto` is resolved against the terminal once raw mode is on.
     let theme = config_str(attached, "ui.theme")
         .await
@@ -118,8 +137,60 @@ async fn open_session(
             show_reasoning,
             theme,
             workspace,
+            history,
         },
     ))
+}
+
+/// The whole active branch: the subscribing load's page, plus every page its cursor leads to.
+///
+/// The cursor is the protocol's contract, not a hint — `next_cursor` set means "call again with
+/// `replay_from`" — so a client that reads one page silently truncates the history the moment
+/// the store grows into paging. Each follow-up carries the generation the last page reported,
+/// which is what makes a runtime that changed mid-replay a refusal instead of a torn transcript
+/// (invariant 1).
+async fn drain_history<F, Fut>(
+    first: m::SessionLoadResult,
+    mut next_page: F,
+) -> Result<Vec<hatchery_protocol::Item>, String>
+where
+    F: FnMut(m::SessionLoadParams) -> Fut,
+    Fut: std::future::Future<Output = Result<m::SessionLoadResult, String>>,
+{
+    let m::SessionLoadResult {
+        session,
+        mut items,
+        next_cursor: mut cursor,
+    } = first;
+    let session_id = session.id;
+    let mut generation = Some(session.generation);
+    while let Some(replay_from) = cursor {
+        let page = next_page(m::SessionLoadParams {
+            session_id,
+            replay_from: Some(replay_from),
+            generation,
+        })
+        .await?;
+        // Handing back the cursor it was given would replay forever, and the TUI has not drawn
+        // its first frame yet, so there would be nothing on screen to explain the hang with.
+        if page.next_cursor == Some(replay_from) {
+            return Err(format!(
+                "the replay cursor {replay_from} did not advance; the history is incomplete"
+            ));
+        }
+        generation = Some(page.session.generation);
+        cursor = page.next_cursor;
+        items.extend(page.items);
+    }
+    Ok(items)
+}
+
+/// Whether reasoning opens folded when the daemon has no `ui.show_reasoning` to seed from.
+///
+/// The daemon's builtin answer is folded (ruled 2026-10-07); the fallback must agree with it,
+/// because the two are the same setting seen from either side of a missing config key.
+fn seed_show_reasoning(configured: Option<bool>) -> bool {
+    configured.unwrap_or(false)
 }
 
 async fn config_bool(attached: &attach::Attached, key: &str) -> Option<bool> {
@@ -150,7 +221,8 @@ async fn config_str(attached: &attach::Attached, key: &str) -> Option<String> {
     result.entries.first()?.value.as_str().map(str::to_owned)
 }
 
-/// The one field the seeders need; both `session/new` and `session/load` reply with it.
+/// The one field the seeders need out of a `session/new` reply. A resumed session decodes the
+/// whole `SessionLoadResult` instead, because that reply also carries the branch to project.
 #[derive(serde::Deserialize)]
 struct SessionView {
     session: hatchery_protocol::Session,
@@ -178,6 +250,9 @@ async fn app_loop(
         probe,
         seed.workspace,
     );
+    // The resumed branch goes up before the first draw, so the window opens on its tail with
+    // the history in it rather than filling in afterwards.
+    model.push_history(&seed.history);
     // Bracketed paste on: a pasted block arrives as one `Event::Paste` instead of the first line
     // being submitted and the rest fired off as stray prompts.
     let paste_on =
@@ -488,7 +563,12 @@ async fn submit_line(
             | commands::SlashCommand::Prompt => {}
         }
         for (method, params) in commands::actions(&command, *session) {
-            attached.client.call_raw(method, params).await?;
+            let reply = attached.client.call_raw(method, params).await?;
+            match project_reply(&command, method, reply)? {
+                Reply::Nothing => {}
+                Reply::Note(text) => model.note(text, ToastKind::Info),
+                Reply::Prompt(rendered) => model.push_prompt(&rendered),
+            }
         }
         return Ok(true);
     }
@@ -498,11 +578,76 @@ async fn submit_line(
         content: hatchery_protocol::Content::text(line),
         generation: None,
     };
-    attached
+    let accepted = attached
         .client
         .call::<_, m::SessionPromptResult>(m::SESSION_PROMPT, &params)
         .await?;
+    // The daemon commits an item for the line just typed and broadcasts it like any other; the
+    // turn id is what keeps this client from reading its own message twice.
+    model.mark_submitted(accepted.turn);
     Ok(true)
+}
+
+/// What a slash command's reply puts on screen.
+enum Reply {
+    /// Nothing: the status bar carries it.
+    Nothing,
+    /// A one-line confirmation.
+    Note(String),
+    /// The assembled prompt, dumped into the transcript.
+    Prompt(m::PromptRenderResult),
+}
+
+/// Projects a slash command's reply instead of dropping it.
+///
+/// `/prompt` exists to show the prompt the runtime froze, and `/effort` and `/model` deserve a
+/// confirmation naming the value the daemon *applied* rather than the one that was asked for —
+/// today their only feedback is the status bar moving when `SessionUpdated` arrives. A reply
+/// that does not decode is reported, not swallowed (ADR-0009).
+///
+/// # Errors
+///
+/// [`ClientError`] when the reply is not the shape the method documents.
+fn project_reply(
+    command: &commands::SlashCommand,
+    method: &str,
+    reply: serde_json::Value,
+) -> Result<Reply, ClientError> {
+    fn decode<T: serde::de::DeserializeOwned>(
+        method: &str,
+        reply: serde_json::Value,
+    ) -> Result<T, ClientError> {
+        serde_json::from_value(reply)
+            .map_err(|error| ClientError::Connection(format!("{method} reply: {error}")))
+    }
+    match method {
+        m::PROMPT_RENDER => decode(method, reply).map(Reply::Prompt),
+        m::SESSION_SET_CONFIG => {
+            let applied = decode::<m::SetConfigResult>(method, reply)?;
+            let note = match command {
+                commands::SlashCommand::Effort(_) => {
+                    applied_effort(&applied.session).map(|effort| format!("effort: {effort}"))
+                }
+                commands::SlashCommand::Model(_) => Some(format!(
+                    "model: {}/{}",
+                    applied.session.model.provider, applied.session.model.model
+                )),
+                _ => None,
+            };
+            Ok(note.map_or(Reply::Nothing, Reply::Note))
+        }
+        _ => Ok(Reply::Nothing),
+    }
+}
+
+/// The reasoning effort the session reports as applied, if it reports one.
+fn applied_effort(session: &hatchery_protocol::Session) -> Option<String> {
+    session
+        .config_patch
+        .as_ref()?
+        .get("reasoning_effort")?
+        .as_str()
+        .map(str::to_owned)
 }
 
 #[cfg(test)]
@@ -750,5 +895,397 @@ mod tests {
             model.scroll.following(),
             "the bottom track row is the sticky tail"
         );
+    }
+
+    /// The reasoning fold a daemon with no `ui.show_reasoning` key gets: folded, matching the
+    /// daemon's own builtin answer for the same setting.
+    #[test]
+    fn reasoning_starts_folded_when_the_daemon_says_nothing() {
+        assert!(
+            !seed_show_reasoning(None),
+            "the CLI's fallback and the daemon's builtin must agree"
+        );
+        assert!(seed_show_reasoning(Some(true)));
+        assert!(!seed_show_reasoning(Some(false)));
+    }
+
+    fn fake_session(session: SessionId, generation: u64) -> hatchery_protocol::Session {
+        serde_json::from_value(serde_json::json!({
+            "id": session,
+            "mode": "chat",
+            "model": {"provider": "p", "model": "m"},
+            "created_at": 0,
+            "updated_at": 0,
+            "generation": generation,
+            "status": "idle"
+        }))
+        .expect("session")
+    }
+
+    fn load_page(
+        session: SessionId,
+        texts: &[&str],
+        next_cursor: Option<hatchery_protocol::ItemId>,
+        generation: u64,
+    ) -> m::SessionLoadResult {
+        m::SessionLoadResult {
+            session: fake_session(session, generation),
+            items: texts
+                .iter()
+                .map(|text| {
+                    hatchery_protocol::Item::new(
+                        session,
+                        hatchery_protocol::ItemKind::UserMessage(hatchery_protocol::Content::text(
+                            *text,
+                        )),
+                    )
+                })
+                .collect(),
+            next_cursor,
+        }
+    }
+
+    fn texts(items: &[hatchery_protocol::Item]) -> Vec<String> {
+        items
+            .iter()
+            .map(|item| match &item.kind {
+                hatchery_protocol::ItemKind::UserMessage(content) => content.text.clone(),
+                other => format!("{other:?}"),
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn the_replay_cursor_is_followed_to_the_end_of_the_branch() {
+        let session = SessionId::new();
+        let first_cursor = hatchery_protocol::ItemId::new();
+        let second_cursor = hatchery_protocol::ItemId::new();
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorder = std::sync::Arc::clone(&asked);
+        let items = drain_history(
+            load_page(session, &["one"], Some(first_cursor), 1),
+            move |params| {
+                let recorder = std::sync::Arc::clone(&recorder);
+                async move {
+                    let cursor = params.replay_from.expect("a follow-up asks from a cursor");
+                    recorder.lock().expect("recorder").push(params);
+                    Ok(if cursor == first_cursor {
+                        load_page(session, &["two"], Some(second_cursor), 2)
+                    } else {
+                        load_page(session, &["three"], None, 3)
+                    })
+                }
+            },
+        )
+        .await
+        .expect("replay");
+        assert_eq!(
+            texts(&items),
+            vec!["one".to_owned(), "two".to_owned(), "three".to_owned()],
+            "every page of the branch is projected, oldest first"
+        );
+        let asked = asked.lock().expect("recorder");
+        assert_eq!(asked.len(), 2, "one call per cursor: {asked:?}");
+        assert_eq!(asked[0].session_id, session);
+        assert_eq!(asked[0].replay_from, Some(first_cursor));
+        assert_eq!(
+            asked[0].generation,
+            Some(1),
+            "each follow-up carries the generation the previous page reported"
+        );
+        assert_eq!(asked[1].replay_from, Some(second_cursor));
+        assert_eq!(asked[1].generation, Some(2));
+    }
+
+    #[tokio::test]
+    async fn a_replay_cursor_that_does_not_advance_is_refused() {
+        let session = SessionId::new();
+        let stuck = hatchery_protocol::ItemId::new();
+        let error = drain_history(
+            load_page(session, &["one"], Some(stuck), 1),
+            move |params| async move {
+                // A daemon that hands back the cursor it was given would spin the TUI forever.
+                Ok(load_page(session, &[], params.replay_from, 1))
+            },
+        )
+        .await
+        .expect_err("a cursor that never advances is a refusal, not a hang");
+        assert!(error.contains("cursor"), "{error}");
+    }
+
+    /// A chat/completions stream with one answer, a stop and usage — the full field shape,
+    /// since the wire layer skips chunks it cannot deserialise.
+    const SSE_ONE_ANSWER: &str = concat!(
+        "data: {\"id\":\"1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"the answer you are owed\"},\"finish_reason\":\"stop\"}],\"created\":1718345013,\"model\":\"m\",\"object\":\"chat.completion.chunk\",\"usage\":null}\n\n",
+        "data: {\"choices\":[],\"created\":1718345013,\"id\":\"1\",\"model\":\"m\",\"object\":\"chat.completion.chunk\",\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":4,\"total_tokens\":7}}\n\n",
+        "data: [DONE]\n\n",
+    );
+
+    /// The two builtin rows the audit expects, plus the provider under test. `PATH` stands in
+    /// for a credential: every environment has it, and a real request reads it.
+    fn provider_toml(base_url: &str) -> toml::Table {
+        toml::from_str(&format!(
+            "[providers.deepseek]\nenv_key = \"\"\n\n[providers.qwen]\nenv_key = \"\"\n\n[providers.testprov]\nbase_url = \"{base_url}\"\nenv_key = \"PATH\"\nmodels = [\"m\"]\n"
+        ))
+        .expect("toml")
+    }
+
+    fn new_params() -> m::SessionNewParams {
+        m::SessionNewParams {
+            mode: hatchery_protocol::SessionModeId::chat(),
+            workspace: None,
+            model: Some(hatchery_protocol::ModelRef::new("testprov", "m")),
+            title: None,
+            config_patch: None,
+        }
+    }
+
+    fn cells(model: &Model) -> Vec<(crate::tui::CellKind, String)> {
+        model
+            .cells
+            .iter()
+            .map(|cell| (cell.kind, cell.raw.clone()))
+            .collect()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resuming_a_session_projects_the_branch_it_loaded() {
+        use hatchery_testkit::{ClientProbe, TestDaemon, wire::MockWire};
+
+        let wire = MockWire::replay_sse(SSE_ONE_ANSWER).await;
+        let daemon =
+            TestDaemon::start(vec![(m::ConfigOrigin::User, provider_toml(&wire.url()))]).await;
+        let probe = ClientProbe::attach(&daemon).await;
+        let created: m::SessionNewResult = probe.call(m::SESSION_NEW, &new_params()).await;
+        let session = created.session.id;
+        let mut events = probe.events(&daemon, session).await;
+        let accepted: m::SessionPromptResult = probe
+            .call(
+                m::SESSION_PROMPT,
+                &m::SessionPromptParams {
+                    session_id: session,
+                    content: hatchery_protocol::Content::text("what did I ask before?"),
+                    generation: None,
+                },
+            )
+            .await;
+        // The branch is only loadable once the turn that wrote it has ended.
+        loop {
+            let event = tokio::time::timeout(std::time::Duration::from_secs(30), events.next())
+                .await
+                .expect("the turn ends")
+                .expect("the stream stays up");
+            if matches!(event.event, hatchery_protocol::ServerEvent::TurnFinished { turn, .. } if turn == accepted.turn)
+            {
+                break;
+            }
+        }
+        drop(events);
+
+        let info = daemon.state.discover().expect("published");
+        let attached = attach::attach_to(&info).await.expect("attached");
+        let args = ChatArgs {
+            session: Some(session),
+            workspace: None,
+            model: None,
+            state_dir: None,
+        };
+        let (_stream, _id, seed) = open_session(&attached, &args)
+            .await
+            .expect("the resumed session opens");
+        assert_eq!(
+            seed.model_name, "testprov/m",
+            "the status line seeds from the resumed session's own row"
+        );
+        assert!(
+            !seed.history.is_empty(),
+            "the load reply carries the branch it just served"
+        );
+
+        let mut model = model();
+        model.push_history(&seed.history);
+        model.relayout(80);
+        let projected = cells(&model);
+        assert!(
+            projected
+                .iter()
+                .any(|(kind, raw)| *kind == crate::tui::CellKind::User
+                    && raw.contains("what did I ask before?")),
+            "the question the previous turn asked is on screen: {projected:?}"
+        );
+        assert!(
+            projected
+                .iter()
+                .any(|(kind, raw)| *kind == crate::tui::CellKind::Assistant
+                    && raw.contains("the answer you are owed")),
+            "and so is the answer: {projected:?}"
+        );
+        daemon.stop().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_prompt_from_another_client_reaches_the_observing_transcript() {
+        use hatchery_testkit::{ClientProbe, TestDaemon, wire::MockWire};
+
+        let wire = MockWire::replay_sse(SSE_ONE_ANSWER).await;
+        let daemon =
+            TestDaemon::start(vec![(m::ConfigOrigin::User, provider_toml(&wire.url()))]).await;
+        // The observing front-end: subscribed to the session, typing nothing itself.
+        let observer = ClientProbe::attach(&daemon).await;
+        let created: m::SessionNewResult = observer.call(m::SESSION_NEW, &new_params()).await;
+        let mut events = observer.events(&daemon, created.session.id).await;
+
+        // The prompting front-end, on its own connection.
+        let info = daemon.state.discover().expect("published");
+        let prompter = attach::attach_to(&info).await.expect("attached");
+        let _: m::SessionPromptResult = prompter
+            .client
+            .call(
+                m::SESSION_PROMPT,
+                &m::SessionPromptParams {
+                    session_id: created.session.id,
+                    content: hatchery_protocol::Content::text("typed elsewhere"),
+                    generation: None,
+                },
+            )
+            .await
+            .expect("the other client's prompt is accepted");
+
+        let mut model = model();
+        loop {
+            let event = tokio::time::timeout(std::time::Duration::from_secs(30), events.next())
+                .await
+                .expect("the turn ends")
+                .expect("the stream stays up");
+            let last = matches!(
+                event.event,
+                hatchery_protocol::ServerEvent::TurnFinished { .. }
+            );
+            model.push_event(&event.event);
+            if last {
+                break;
+            }
+        }
+        model.relayout(80);
+        let projected = cells(&model);
+        let users: Vec<&String> = projected
+            .iter()
+            .filter(|(kind, _)| *kind == crate::tui::CellKind::User)
+            .map(|(_, raw)| raw)
+            .collect();
+        assert_eq!(
+            users.len(),
+            1,
+            "the question arrives once, through its item: {projected:?}"
+        );
+        assert!(
+            users[0].contains("typed elsewhere"),
+            "both front-ends see the same stream: {projected:?}"
+        );
+        let answers: Vec<&String> = projected
+            .iter()
+            .filter(|(kind, _)| *kind == crate::tui::CellKind::Assistant)
+            .map(|(_, raw)| raw)
+            .collect();
+        assert_eq!(
+            answers.len(),
+            1,
+            "the answer is the deltas, not the deltas plus its item: {projected:?}"
+        );
+        assert!(
+            answers[0].contains("the answer you are owed"),
+            "{projected:?}"
+        );
+        daemon.stop().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_prompt_command_puts_the_assembled_prompt_on_screen() {
+        use hatchery_testkit::TestDaemon;
+
+        let daemon = TestDaemon::start(vec![(
+            m::ConfigOrigin::User,
+            provider_toml("http://127.0.0.1:1"),
+        )])
+        .await;
+        let info = daemon.state.discover().expect("published");
+        let attached = attach::attach_to(&info).await.expect("attached");
+        let created: m::SessionNewResult = attached
+            .client
+            .call(m::SESSION_NEW, &new_params())
+            .await
+            .expect("session/new");
+
+        let mut model = model();
+        submit_line(&attached, &created.session.id, &mut model, "/prompt")
+            .await
+            .expect("/prompt is accepted");
+        model.relayout(80);
+        let projected = cells(&model);
+        let dump = projected
+            .iter()
+            .find(|(kind, _)| *kind == crate::tui::CellKind::Prompt)
+            .map(|(_, raw)| raw.clone());
+        let Some(dump) = dump else {
+            panic!("`/prompt` exists to show the assembled prompt: {projected:?}");
+        };
+        assert!(dump.contains("identity"), "sections keep their ids: {dump}");
+        assert!(
+            dump.contains("safety_gate"),
+            "every section is rendered, not just the first: {dump}"
+        );
+        assert!(dump.contains("builtin"), "and where each came from: {dump}");
+        daemon.stop().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn effort_and_model_answer_with_a_confirmation_from_the_reply() {
+        use hatchery_testkit::TestDaemon;
+
+        let daemon = TestDaemon::start(vec![(
+            m::ConfigOrigin::User,
+            provider_toml("http://127.0.0.1:1"),
+        )])
+        .await;
+        let info = daemon.state.discover().expect("published");
+        let attached = attach::attach_to(&info).await.expect("attached");
+        let created: m::SessionNewResult = attached
+            .client
+            .call(m::SESSION_NEW, &new_params())
+            .await
+            .expect("session/new");
+
+        let mut model = model();
+        submit_line(&attached, &created.session.id, &mut model, "/effort low")
+            .await
+            .expect("/effort is accepted");
+        let notes: Vec<String> = model
+            .toasts
+            .iter()
+            .map(|toast| toast.text.clone())
+            .collect();
+        assert!(
+            notes.iter().any(|note| note.contains("low")),
+            "the applied effort is confirmed from the reply: {notes:?}"
+        );
+
+        submit_line(
+            &attached,
+            &created.session.id,
+            &mut model,
+            "/model testprov/m",
+        )
+        .await
+        .expect("/model is accepted");
+        let notes: Vec<String> = model
+            .toasts
+            .iter()
+            .map(|toast| toast.text.clone())
+            .collect();
+        assert!(
+            notes.iter().any(|note| note.contains("testprov/m")),
+            "and so is the applied model: {notes:?}"
+        );
+        daemon.stop().await;
     }
 }
