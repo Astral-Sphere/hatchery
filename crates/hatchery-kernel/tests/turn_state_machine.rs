@@ -12,8 +12,8 @@ use hatchery_kernel::{
     KernelEvent, LlmError, Message, Ports, StreamEvent, TurnCompletion, TurnLimits, TurnState,
 };
 use hatchery_protocol::{
-    ApprovalOption, ApprovalRequest, Item, ItemId, ItemKind, ItemKindTag, RiskLevel, SessionId,
-    SignatureBlock, StopReason, ToolOutput, ToolStatus,
+    ApprovalOption, ApprovalRequest, Item, ItemId, ItemKind, ItemKindTag, ReasoningEffort,
+    RiskLevel, SessionId, SignatureBlock, StopReason, ToolOutput, ToolStatus, TurnId,
 };
 use hatchery_testkit::{
     MemoryHistory, RecordingSink, ScriptedApproval, ScriptedProvider, ScriptedToolHost,
@@ -133,6 +133,68 @@ async fn a_plain_round_finishes_the_turn() {
         requests[0].messages[0].content.text,
         "why is the store slow?"
     );
+}
+
+#[tokio::test]
+async fn per_turn_options_override_the_assembly_defaults() {
+    // D19: the model and the reasoning effort follow the turn, not the assembly. `/effort off`
+    // has to mean "the next answer does not reason", and reassembling to get there is not
+    // available to the daemon — its unload refuses a watched session, and a reassembly bumps the
+    // generation under the frontend that asked.
+    let provider = ScriptedProvider::new(vec![
+        ScriptedProvider::text_round("first"),
+        ScriptedProvider::text_round("second"),
+    ]);
+    let tools = ScriptedToolHost::new().advertising(&["read_file"]);
+    let harness = Harness::new(
+        provider,
+        tools,
+        MemoryHistory::empty(),
+        TurnLimits::default(),
+    );
+
+    harness.prompt("hi").await;
+    let first = harness.finish().await;
+
+    let options = ChatOptions {
+        reasoning_effort: Some(ReasoningEffort::Off),
+        // Empty on purpose: a caller-supplied catalogue must not win over the frozen snapshot.
+        tool_defs: Vec::new(),
+        ..ChatOptions::new("per-turn-model")
+    };
+    harness
+        .handle
+        .submit(AgentCommand::prompt_with_options(
+            TurnId::new(),
+            "hi again",
+            options,
+        ))
+        .await
+        .expect("the agent is running");
+    harness.sink.wait_for_end_from(first.len()).await;
+
+    let requests = harness.provider.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        requests[0].options.model, "scripted-model",
+        "with no per-turn options the assembly's stand"
+    );
+    assert_eq!(requests[0].options.reasoning_effort, None);
+    assert_eq!(
+        requests[1].options.model, "per-turn-model",
+        "resolved by the caller at submit time"
+    );
+    assert_eq!(
+        requests[1].options.reasoning_effort,
+        Some(ReasoningEffort::Off),
+        "the effort the user asked for reaches the very next request"
+    );
+    assert_eq!(
+        requests[1].options.tool_defs.len(),
+        1,
+        "the frozen snapshot still decides the catalogue"
+    );
+    assert_eq!(requests[1].options.tool_defs[0].name, "read_file");
 }
 
 #[tokio::test]

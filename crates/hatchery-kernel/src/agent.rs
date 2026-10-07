@@ -294,8 +294,12 @@ impl Agent {
     pub async fn run(mut self) {
         while let Some(command) = self.commands.recv().await {
             match command {
-                AgentCommand::TurnInput { turn, content } => {
-                    self.run_turn(turn, content).await;
+                AgentCommand::TurnInput {
+                    turn,
+                    content,
+                    options,
+                } => {
+                    self.run_turn(turn, content, options).await;
                 }
                 AgentCommand::Interrupt => {
                     tracing::debug!("interrupt with no turn running; ignored");
@@ -312,14 +316,14 @@ impl Agent {
     ///
     /// The turn id comes from the command: the daemon minted it before submitting, so the
     /// `session/prompt` reply, every item of the turn and the terminal event all name the same
-    /// turn.
-    async fn run_turn(&mut self, turn: TurnId, content: Content) {
+    /// turn. So do the options, when the caller resolved them (D19).
+    async fn run_turn(&mut self, turn: TurnId, content: Content, options: Option<ChatOptions>) {
         self.turn = turn;
         self.cancel = CancellationToken::new();
         let mut usage = Usage::default();
 
         self.emit(KernelEvent::TurnStarted { turn }).await;
-        let outcome = self.turn_body(content, &mut usage).await;
+        let outcome = self.turn_body(content, &mut usage, options).await;
         self.transition(TurnState::Idle).await;
 
         let completion = match outcome {
@@ -372,6 +376,7 @@ impl Agent {
         &mut self,
         content: Content,
         usage: &mut Usage,
+        turn_options: Option<ChatOptions>,
     ) -> Result<StopReason, KernelError> {
         self.transition(TurnState::Assembling).await;
         let history = Arc::clone(&self.ports.history);
@@ -390,9 +395,13 @@ impl Agent {
         // Frozen once for the whole turn: the catalogue the model sees and the catalogue calls
         // are dispatched through must be the same list, even if the registry is swapped mid-turn.
         // Built once rather than per round because nothing in it changes between rounds.
+        //
+        // The caller's per-turn options win over the assembly's (D19), except `tool_defs`, which
+        // is set explicitly and therefore survives the spread: a turn may change model or effort,
+        // but never the catalogue calls are dispatched through.
         let options = ChatOptions {
             tool_defs: self.ports.tools.snapshot(),
-            ..self.options.clone()
+            ..turn_options.unwrap_or_else(|| self.options.clone())
         };
 
         for round in 1..=self.limits.max_rounds {

@@ -15,15 +15,15 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use hatchery_kernel::AgentCommand;
-use hatchery_llm::ProviderRegistry;
+use hatchery_kernel::{AgentCommand, ChatOptions};
+use hatchery_llm::{ProviderConfig, ProviderRegistry};
 use hatchery_protocol::method::{
     SessionListParams, SessionListResult, SessionLoadParams, SessionLoadResult, SessionNewParams,
     SessionNewResult, SessionPromptParams, SessionPromptResult, SetConfigParams, SetConfigResult,
 };
 use hatchery_protocol::{
-    ErrorCode, EventError, Item, ItemId, ServerEvent, Session, SessionEvent, SessionId,
-    SessionPatch, SessionStatus, TurnId,
+    ErrorCode, EventError, Item, ItemId, ReasoningEffort, ServerEvent, Session, SessionEvent,
+    SessionId, SessionPatch, SessionStatus, TurnId,
 };
 use hatchery_store::SessionStore;
 
@@ -52,6 +52,14 @@ impl ManagerError {
     pub fn into_event(self) -> EventError {
         self.0
     }
+}
+
+/// What resolving a model name gives: the adapter to talk to, which configured provider it came
+/// from, and whether that provider echoes reasoning back into requests.
+struct Resolved {
+    provider: hatchery_llm::ChatCompletionsProvider,
+    provider_id: String,
+    echo_reasoning: bool,
 }
 
 /// One live runtime.
@@ -302,6 +310,9 @@ impl SessionManager {
                 ),
             ));
         }
+        // Resolved before the gate and before any assembly: a model nothing serves is a
+        // configuration error the caller should hear about, and it must not cost a live runtime.
+        let options = self.turn_options(&session)?;
         let gate = Arc::clone(
             self.turn_gates
                 .lock()
@@ -321,7 +332,11 @@ impl SessionManager {
         let turn = TurnId::new();
         if runtime
             .handle
-            .submit(AgentCommand::prompt_with_turn(turn, params.content))
+            .submit(AgentCommand::prompt_with_options(
+                turn,
+                params.content,
+                options,
+            ))
             .await
             .is_err()
         {
@@ -514,23 +529,94 @@ impl SessionManager {
 
     /// The live runtime for a session, assembling one if there is none.
     async fn ensure_runtime(&self, session: &Session) -> Result<Arc<SessionRuntime>, ManagerError> {
+        let wanted = self.provider_id_for(&session.model.model);
         {
             let mut slots = self.slots.lock().expect("slots is not poisoned");
-            if let Some(slot) = slots.get_mut(&session.id)
-                && !slot.runtime.handle.is_closed()
-            {
-                slot.last_activity = std::time::Instant::now();
-                return Ok(Arc::clone(&slot.runtime));
+            if let Some(slot) = slots.get_mut(&session.id) {
+                let live = !slot.runtime.handle.is_closed();
+                // `/model` can cross providers, and the adapter, the capability table and the
+                // reasoning-echo flag are all per provider, so a session that moved needs a new
+                // assembly (D19). Not while a turn is running, though: tearing a runtime down to
+                // honour a model switch would break the promise that a turn nobody is watching
+                // still runs to completion (D2). Such a prompt is refused as `TurnInProgress`
+                // instead, and the switch lands on the one after it.
+                let moved = wanted.is_some_and(|wanted| wanted != slot.runtime.provider_id);
+                if live && (!moved || slot.runtime.is_busy()) {
+                    slot.last_activity = std::time::Instant::now();
+                    return Ok(Arc::clone(&slot.runtime));
+                }
+                if live {
+                    slot.runtime.shutdown();
+                }
+                // A dead runtime in the slot is as good as absent; fall through to reassembly.
             }
-            // A dead runtime in the slot is as good as absent; fall through to reassembly.
         }
         self.assemble(session).await
+    }
+
+    /// Which configured provider serves a model right now, if any.
+    fn provider_id_for(&self, model: &str) -> Option<String> {
+        self.config.resolve_model(model).map(|(id, _)| id)
+    }
+
+    /// The knobs for one turn, resolved at submit time (D19).
+    ///
+    /// Model and effort follow the turn rather than the assembly, because the alternative is not
+    /// available: `unload` refuses a session somebody is watching, and reassembling bumps the
+    /// generation under the frontend that just asked. The prompt is the deliberate exception and
+    /// stays frozen for the runtime's life (D15) — it is a prefix-cache asset, and nothing a user
+    /// changes mid-session is supposed to move it.
+    ///
+    /// # Errors
+    ///
+    /// `ConfigError` when no configured provider serves the session's model. Failing here rather
+    /// than at assembly leaves a live runtime alone: a bad `/model` must not tear down the
+    /// session somebody is watching.
+    fn turn_options(&self, session: &Session) -> Result<ChatOptions, ManagerError> {
+        let (_, provider) = self
+            .config
+            .resolve_model(&session.model.model)
+            .ok_or_else(|| {
+                ManagerError::new(
+                    ErrorCode::ConfigError,
+                    format!("no provider serves model `{}`", session.model.model),
+                )
+            })?;
+        let mut options = ChatOptions::new(session.model.model.clone());
+        options.reasoning_effort = Self::effort_for(session, &provider);
+        Ok(options)
+    }
+
+    /// Effort for one turn: the session's own patch — what `/effort` writes — over the provider's
+    /// configured default. A patch that does not parse is a warning and falls through to the
+    /// default, rather than being silently honoured as "no preference": the value came from a
+    /// caller and a typo in it is worth saying out loud.
+    fn effort_for(session: &Session, provider: &ProviderConfig) -> Option<ReasoningEffort> {
+        if let Some(value) = session
+            .config_patch
+            .as_ref()
+            .and_then(|patch| patch.get("reasoning_effort"))
+        {
+            match serde_json::from_value::<ReasoningEffort>(value.clone()) {
+                Ok(effort) => return Some(effort),
+                Err(error) => tracing::warn!(
+                    %error,
+                    session = %session.id,
+                    "the session's reasoning_effort does not parse; using the provider's default"
+                ),
+            }
+        }
+        provider.reasoning.reasoning_effort
     }
 
     /// Builds a fresh runtime: provider from config, tools from the Chat set, generation bumped
     /// in the store *before* the first event can carry it (invariant 1).
     async fn assemble(&self, session: &Session) -> Result<Arc<SessionRuntime>, ManagerError> {
-        let (provider, echo) = self.provider_for(&session.model.model)?;
+        let Resolved {
+            provider,
+            provider_id,
+            echo_reasoning,
+        } = self.provider_for(&session.model.model)?;
         let tools = self.chat_tools(session)?;
         // Rendered here and frozen for the runtime's life (D15): re-rendering per turn would move
         // the `environment` section's date and cwd under the provider's prefix cache, which is the
@@ -555,8 +641,9 @@ impl SessionManager {
                     store: Arc::clone(&self.store),
                     hub: Arc::clone(&self.hub),
                     provider: Arc::new(provider),
+                    provider_id,
                     tools: Arc::new(tools),
-                    echo_reasoning: echo,
+                    echo_reasoning,
                     prompt,
                 },
             )
@@ -606,10 +693,7 @@ impl SessionManager {
     /// Returns the provider's echo decision with it: the same config's capability table the
     /// adapter folds, so history passback and the wire's requests can never disagree about
     /// whether reasoning rides back.
-    fn provider_for(
-        &self,
-        model: &str,
-    ) -> Result<(hatchery_llm::ChatCompletionsProvider, bool), ManagerError> {
+    fn provider_for(&self, model: &str) -> Result<Resolved, ManagerError> {
         let (id, provider_config) = self.config.resolve_model(model).ok_or_else(|| {
             ManagerError::new(
                 ErrorCode::ConfigError,
@@ -626,7 +710,11 @@ impl SessionManager {
         // stale cache. Assembled sessions keep the Arc they hold — the swap is between turns.
         registry.register(id.clone(), provider_config.clone());
         let provider = registry.get(&id).expect("the registration just landed");
-        Ok(((*provider).clone(), echo))
+        Ok(Resolved {
+            provider: (*provider).clone(),
+            provider_id: id,
+            echo_reasoning: echo,
+        })
     }
 
     /// The Chat toolset over the session's workspace (or the daemon's cwd).

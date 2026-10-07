@@ -5,8 +5,8 @@
 //! (invariant 2: what the model sees is exactly what was recorded).
 
 use hatchery_protocol::method as m;
-use hatchery_protocol::{ItemKind, ServerEvent};
-use hatchery_testkit::daemon::ClientProbe;
+use hatchery_protocol::{ItemKind, ModelRef, ReasoningEffort, ServerEvent};
+use hatchery_testkit::daemon::{ClientProbe, TestDaemon};
 use hatchery_testkit::wire::MockWire;
 use hatchery_tests::support;
 
@@ -302,6 +302,180 @@ async fn the_wire_orders_housekeeping_around_item_events_and_names_the_turn() {
         }
         other => panic!("expected a turn_finished last: {other:?}"),
     }
+
+    daemon.stop().await;
+}
+
+/// `/effort` reaches the very next request, on the same runtime (D19).
+///
+/// The live acceptance run measured the opposite: the effort was stored on the session and shown
+/// in the status bar, while the runtime's `ChatOptions` left it `None`, so no turn ever carried
+/// one — the llm layer's reasoning wire spellings had never been reached outside the doctor probe.
+/// Effort follows the turn because the alternative is not available to the daemon: `unload`
+/// refuses a watched session, and reassembling bumps the generation under the frontend that asked.
+#[tokio::test(flavor = "multi_thread")]
+async fn effort_set_mid_session_reaches_the_next_request_without_a_reassembly() {
+    let wire = MockWire::replay_sse(support::SSE_REASONING_OK).await;
+    let daemon = support::daemon_at(&wire).await;
+    let probe = ClientProbe::attach(&daemon).await;
+    let created: m::SessionNewResult = probe.call(m::SESSION_NEW, &support::chat_params()).await;
+    let (session, generation) = (created.session.id, created.session.generation);
+    let mut events = probe.events(&daemon, session).await;
+
+    let _turn: m::SessionPromptResult = probe
+        .call(
+            m::SESSION_PROMPT,
+            &support::prompt_params(session, "hi", generation),
+        )
+        .await;
+    let first = support::collect_until_terminal(&mut events).await;
+    let assembly = first
+        .iter()
+        .map(|event| event.generation)
+        .max()
+        .expect("the turn emitted events");
+
+    let patched: m::SetConfigResult = probe
+        .call(
+            m::SESSION_SET_CONFIG,
+            &m::SetConfigParams {
+                session_id: session,
+                patch: m::ConfigPatch {
+                    model: None,
+                    reasoning_effort: Some(ReasoningEffort::High),
+                    overrides: None,
+                },
+            },
+        )
+        .await;
+    assert_eq!(
+        patched.session.generation, assembly,
+        "a config patch is not a reassembly: the session is still on the generation the first \
+         turn's runtime took"
+    );
+
+    let _turn: m::SessionPromptResult = probe
+        .call(
+            m::SESSION_PROMPT,
+            &support::prompt_params(session, "again", patched.session.generation),
+        )
+        .await;
+    let second = support::collect_until_terminal(&mut events).await;
+    assert!(
+        second.iter().all(|event| event.generation == assembly),
+        "the second turn ran on the same assembly as the first — no generation bump in between: \
+         {assembly} vs {second:?}"
+    );
+
+    let requests = wire.requests().await;
+    assert_eq!(requests.len(), 2, "one request per turn");
+    let bodies: Vec<serde_json::Value> = requests
+        .iter()
+        .map(|request| serde_json::from_str(&request.body).expect("a JSON request body"))
+        .collect();
+    assert!(
+        bodies[0].get("reasoning_effort").is_none(),
+        "with no patch the request carries no effort and the provider's own default rules: {}",
+        bodies[0]
+    );
+    assert_eq!(
+        bodies[1]["reasoning_effort"], "high",
+        "the patch reached the very next request: {}",
+        bodies[1]
+    );
+    assert_eq!(bodies[1]["model"], "m", "the model is unchanged");
+}
+
+/// A `/model` that crosses providers gets a new assembly, and announces it (D19).
+///
+/// Effort can follow the turn because the adapter still speaks the same provider's dialect. A
+/// model served by a *different* provider cannot: the adapter, its capability table and the
+/// reasoning-echo flag all belong to one provider, so this case reassembles — and the reassembly
+/// is announced, because a frontend projecting the old generation has to reset its view.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_model_on_another_provider_reassembles_and_announces_it() {
+    let wire = MockWire::replay_sse(support::SSE_REASONING_OK).await;
+    let other: toml::Table = toml::from_str(&format!(
+        "[providers.other]\nbase_url = \"{url}\"\nenv_key = \"PATH\"\nmodels = [\"m2\"]\n",
+        url = wire.url()
+    ))
+    .expect("the second provider layer is valid TOML");
+    let daemon = TestDaemon::start(vec![
+        (m::ConfigOrigin::User, support::provider_layer(&wire.url())),
+        (m::ConfigOrigin::User, other),
+    ])
+    .await;
+    let probe = ClientProbe::attach(&daemon).await;
+    let created: m::SessionNewResult = probe.call(m::SESSION_NEW, &support::chat_params()).await;
+    let (session, generation) = (created.session.id, created.session.generation);
+    let mut events = probe.events(&daemon, session).await;
+
+    let _turn: m::SessionPromptResult = probe
+        .call(
+            m::SESSION_PROMPT,
+            &support::prompt_params(session, "hi", generation),
+        )
+        .await;
+    let first = support::collect_until_terminal(&mut events).await;
+    let assembly = first
+        .iter()
+        .map(|event| event.generation)
+        .max()
+        .expect("the turn emitted events");
+
+    let moved: m::SetConfigResult = probe
+        .call(
+            m::SESSION_SET_CONFIG,
+            &m::SetConfigParams {
+                session_id: session,
+                patch: m::ConfigPatch {
+                    model: Some(ModelRef::new("other", "m2")),
+                    reasoning_effort: None,
+                    overrides: None,
+                },
+            },
+        )
+        .await;
+    assert_eq!(
+        moved.session.generation, assembly,
+        "the patch itself does not reassemble anything"
+    );
+
+    let _turn: m::SessionPromptResult = probe
+        .call(
+            m::SESSION_PROMPT,
+            &support::prompt_params(session, "again", moved.session.generation),
+        )
+        .await;
+    let second = support::collect_until_terminal(&mut events).await;
+
+    let bumped = second
+        .iter()
+        .position(|event| matches!(event.event, ServerEvent::GenerationBumped))
+        .unwrap_or_else(|| {
+            panic!("the new assembly is announced before its own events: {second:?}")
+        });
+    // Everything before the announcement is the `session/set_config` reply's own `SessionUpdated`,
+    // which still carries the old generation — correctly, since a patch is not a reassembly.
+    assert!(
+        second[bumped..]
+            .iter()
+            .all(|event| event.generation > assembly),
+        "every event of the second turn carries the new generation: {assembly} vs {:?}",
+        &second[bumped..]
+    );
+
+    let bodies: Vec<serde_json::Value> = wire
+        .requests()
+        .await
+        .iter()
+        .map(|request| serde_json::from_str(&request.body).expect("a JSON request body"))
+        .collect();
+    assert_eq!(bodies[0]["model"], "m", "the first turn used the old model");
+    assert_eq!(
+        bodies[1]["model"], "m2",
+        "the second turn went to the model the session moved to"
+    );
 
     daemon.stop().await;
 }

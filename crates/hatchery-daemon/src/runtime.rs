@@ -341,6 +341,9 @@ pub struct RuntimeParts {
     pub hub: Arc<LiveHub>,
     /// The provider adapter serving the session's model.
     pub provider: Arc<dyn LlmProvider>,
+    /// Which configured provider that adapter belongs to, so a session whose model moved to
+    /// another provider can be recognised and reassembled (D19).
+    pub provider_id: String,
     /// The tool catalogue and dispatcher for the session's mode.
     pub tools: Arc<dyn ToolHost>,
     /// Whether reasoning rides back into requests on this provider (ADR-0007).
@@ -355,6 +358,8 @@ pub struct SessionRuntime {
     pub session: SessionId,
     /// Which assembly this is; every event this runtime emits carries it (invariant 1).
     pub generation: u64,
+    /// The provider this runtime's adapter, capability table and reasoning-echo flag belong to.
+    pub provider_id: String,
     /// The prompt this runtime was assembled with, section by section.
     ///
     /// Frozen for the runtime's life (D15) and kept in sections so `prompt/render` can answer
@@ -390,6 +395,7 @@ impl SessionRuntime {
             store,
             hub,
             provider,
+            provider_id,
             tools,
             echo_reasoning,
             prompt,
@@ -419,6 +425,7 @@ impl SessionRuntime {
         Ok(Self {
             session: session.id,
             generation,
+            provider_id,
             prompt,
             handle,
             in_flight,

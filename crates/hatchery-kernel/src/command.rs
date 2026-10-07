@@ -2,6 +2,8 @@
 
 use hatchery_protocol::{ApprovalId, ApprovalOption, Content, TurnId};
 
+use crate::message::ChatOptions;
+
 /// Something a frontend asks the kernel to do.
 ///
 /// Commands in, events out: the kernel is driven rather than polled, and the daemon is a
@@ -21,6 +23,17 @@ pub enum AgentCommand {
         turn: TurnId,
         /// What the user typed.
         content: Content,
+        /// The knobs for this turn, resolved by the caller at submit time; `None` uses the
+        /// options the agent was built with.
+        ///
+        /// This is what lets a configuration change take effect on the next turn instead of the
+        /// next assembly (D19): the model and the reasoning effort follow the turn, because the
+        /// alternative — reassembling the runtime — is not available to a session somebody is
+        /// watching, and would bump the generation under the frontend that asked. The kernel
+        /// still does not interpret any of it; `tool_defs` in particular is overwritten with the
+        /// frozen [`crate::ToolHost::snapshot`], so a caller cannot advertise a table that calls
+        /// are not dispatched through.
+        options: Option<ChatOptions>,
     },
     /// Stop the running turn: cancel the provider stream and any tool using the turn's
     /// cancellation token.
@@ -41,6 +54,7 @@ impl AgentCommand {
         Self::TurnInput {
             turn: TurnId::new(),
             content: content.into(),
+            options: None,
         }
     }
 
@@ -51,6 +65,24 @@ impl AgentCommand {
         Self::TurnInput {
             turn,
             content: content.into(),
+            options: None,
+        }
+    }
+
+    /// A turn whose id the caller chose, with the knobs the caller resolved for it.
+    ///
+    /// The daemon's shape for D19: it reads the session row at submit time, so `/effort off`
+    /// reaches the very next request rather than the next assembly.
+    #[must_use]
+    pub fn prompt_with_options(
+        turn: TurnId,
+        content: impl Into<Content>,
+        options: ChatOptions,
+    ) -> Self {
+        Self::TurnInput {
+            turn,
+            content: content.into(),
+            options: Some(options),
         }
     }
 
