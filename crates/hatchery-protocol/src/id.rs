@@ -119,6 +119,16 @@ uuid_newtype! {
     ApprovalId
 }
 
+uuid_newtype! {
+    /// Identifies one row of the `checkpoints` table.
+    ///
+    /// Not the item id and not the commit id: a checkpoint can exist without an item (the safety
+    /// snapshot taken before a restore is undo-of-undo, so it is recorded but never enters the
+    /// conversation), and a commit belongs to the shadow repository rather than to the record that
+    /// points at it. Garbage collection needs a handle on the record itself.
+    CheckpointId
+}
+
 /// A span of items along one branch, used by compaction items to record what they summarise.
 ///
 /// `std::ops::Range<ItemId>` cannot appear in the wire model — it is not `Serialize` — and its

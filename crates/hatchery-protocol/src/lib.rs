@@ -72,6 +72,7 @@
 mod approval;
 pub mod client;
 mod content;
+mod diff;
 mod error;
 mod event;
 mod id;
@@ -87,9 +88,10 @@ mod version;
 pub use approval::{ApprovalOption, ApprovalRequest, RiskLevel};
 pub use client::{ClientError, DaemonClient, EventStream};
 pub use content::{Content, ContentPart, SignatureBlock};
+pub use diff::{Diff, DiffFile, DiffHunk, DiffLine, DiffLineKind, DiffStatus};
 pub use error::{ErrorCode, ErrorObject, EventError, UnknownErrorCode};
 pub use event::{DaemonEvent, ServerEvent, SessionEvent};
-pub use id::{ApprovalId, ItemId, ItemIdRange, SessionId, TurnId};
+pub use id::{ApprovalId, CheckpointId, ItemId, ItemIdRange, SessionId, TurnId};
 pub use item::{
     BranchNote, Checkpoint, Compaction, Item, ItemKind, ItemKindTag, ItemStub, ModeSwitch,
     ReasoningBlock, ToolCall, ToolResult, UnknownItemKind,
