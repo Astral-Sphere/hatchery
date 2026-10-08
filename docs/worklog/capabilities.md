@@ -131,6 +131,8 @@ capabilities 的**代码**在 M0b 没有动（trait 与工具实现是 M1/M2 的
 
 另有三条属于「不写下来就会踩」的：父进程不立刻 drop slave fd 则 reader 永远等不到 EOF（实测挂到 2522ms 才在 drop 后结束）；内核缓冲只有 **4095 字节**，消费者停读会**冻住**子进程，所以超时杀可能杀在一个只是在等我们的进程上；行纪律让换行密集的输出吞吐从 171.7 MiB/s 掉到 **12.7 MiB/s**（13.5×），D12 的 spill 阈值要按后者定。4 MiB 无换行载荷逐字节无损。
 
+**收尾时补的两件事**（探针报告交回来之后才发现仓库里缺）：① `measured-linux.txt` 的 M6（构建成本）那一节写的是「由 spike report 里的命令测得」，而那份 report 不在仓库里——数字只活在一次对话里等于没有。已把实测数字与可复现的命令写进新的 `spikes/pty/README.md`：冷构建 1.74s、Linux 侧相对根门禁新增 **6 个** crate（windows-gnu 8 个）、`serial2` 对我们是死重量、MSRV 1.90 `--locked` 干净。② 同一份 README 记下**平台 payload 的成熟度差异**：macOS 复用 POSIX 脚本（只把 `setsid` 用 `command -v` 挡住），而 **Windows 那几条是照文档写的 PowerShell 字符串、从未执行过**——不写下来的话，将来 CI 上跑出的 Windows 数字会被当成实测读。另外 `release()` 的语义成了 Phase 4 之前要定的开放项（见 design/capabilities.md §1）：实测关掉 master/slave 之后 500ms 子进程仍活着，所以它在 PTY backend 上不可能是「把活着的进程交还给调用方」，只能是 `kill()` 的别名或「所有权转移给注册表」。
+
 **顺带修的两个先前就存在的问题**：`xtask coverage` 把 JSON 报告路径写死成 `target/llvm-cov/coverage.json`，而 cargo-llvm-cov 用的是 `target/llvm-cov-target/`，那个父目录从来不存在——`--output-path` 不建父目录，于是整个覆盖率门禁在**跑完全部插桩测试之后**才失败，看起来像覆盖率问题、其实是缺一个 `mkdir`（已修 + 加测试）。`MemoryFs` 的根目录只在 `dir()`/`file()` builder 被调用时才登记，所以「空 `MemoryFs` 的 `read_dir("")` 报 NotFound」——与 `LocalFs`（根是别人递给它的真目录，恒存在）不一致，`walk.rs` 有条测试把这个假的特性当成了契约。现在 `MemoryTree::default()` 恒含根，那条测试改成用一个会拒绝的假 backend 测同一条性质。
 
 ### 2026-10-07 · M2 Phase 0：不变量 4 的编译期门禁补洞

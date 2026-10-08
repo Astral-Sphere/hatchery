@@ -74,6 +74,8 @@ M1 的 handle 只有 `wait()`（进程结束后一次性返回全部输出）与
 
 现在改最便宜：`TerminalBackend` 只有一个实现 `NoTerminal`，`TerminalHandle` 一个实现都没有。
 
+**`release()` 的含义要在 Phase 4 之前定下来**（PTY 探针实测，`spikes/pty/`）。上面那段把 `release()` 与 `kill()` 并列，读起来像是一对可选的收尾动作，而在 PTY backend 上它不可能是「把活着的进程交还给调用方」：实测关掉 master/slave 之后 **500ms 子进程仍然活着**，也仍然没有任何人能再观察或停止它。所以 PTY 上的 `release()` 只有两种诚实的读法——要么它就是 `kill()` 的别名，要么它交回的是一个**没人再看管**的进程（对 `unified_exec` 式的会话复用是唯一合理的读法：所有权转移给注册表，而不是消失）。两种都能实现，但语义必须写进 trait 文档，否则第一个实现者会随手选一个。
+
 ### 值类型的归属（M0b 定案）
 
 初稿把 `ApprovalRequest`/`ApprovalOutcome`/`ToolOutput`/`ToolProgress` 都写成 kernel 类型（M0a 修正）。落地时发现：它们既要进 wire（`ItemKind::ToolResult`、`ServerEvent::ApprovalRequested`/`ToolCallProgress`），又被 kernel 与 capabilities 共用，而 layering 禁止同层横向依赖——于是它们统一搬到最底层的 **protocol**（见 architecture.md §3 的 M0b 分层裁决）：
