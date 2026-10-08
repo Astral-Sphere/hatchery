@@ -95,6 +95,20 @@ API 怪癖（写 store 实现时一定会踩）：
 
 ## 变更日志
 
+### 2026-10-08 · M2 Phase 1：`checkpoints` 表终于有 Rust 代码
+
+表从 schema v1 起就在，此前**零 Rust 代码**。新增 `CheckpointRecord` + 三个方法（`StoreCmd` 从 19 个变体到 22 个）：
+
+- `record_checkpoint`：写入前认会话（`SessionNotFound` 而不是把外键错误包成 `Database`）、认 item 存在**且属于同一会话**（复用 `insert_item` 为跨会话父节点准备的那类校验）、拒空 `commit_id`（`Invalid`）。这三条是 §3 那句「写入前先认会话」纪律的延伸。
+- `checkpoints_for_workspace(&Path)`：**最旧优先**，因为调用方是从前端 drain 的（D9 的阶梯）；`created_at` 同毫秒时按 `id` 定序——引擎的行序不保证，留一个平局就是留一个不确定性。参数收 `&Path` 并用与 `sessions.workspace` 完全相同的 `to_string_lossy()` 拼写，这样一个路径在这个库里只有一种文本形式，按工作区查不会因为拼写差异漏行。
+- `delete_checkpoints(&[CheckpointId]) -> u64`：回报**真实**消失的行数，让调用方能拿自己的账与引擎对账（`delete_branch` 已有的那条交叉校验纪律）。删一个不存在的 id 回报 0 而不是报错。
+
+`item_id` 可空这条在读取侧是承重的：`read_checkpoint` 把 NULL 原样带成 `None`，**不修补成一个 id**——安全快照（undo-of-undo）没有 item，那一列可空正是为了它。写 SQL 的 kind 拼写进了 `the_spellings_written_into_sql_are_pinned`（Rust 的重命名与 SQL 字符串会各自漂移，这条测试就是为此存在的）。**没有新迁移**：schema 停在 v1，`MIGRATIONS` 仍是一条，`migrations/v1.sql` 已冻结。
+
+9 条新测试，其中两条是级联：删**会话**带走它的检查点行（这正是「影子仓库还有没有主」变成一句查询的原因），删**分支**也带走挂在被删 item 上的行。每条校验规则都做了变异验证（临时摘掉实现里的那次检查，确认对应测试转红）。覆盖率 93.6%（地板 85%）。
+
+设计侧同时关闭了**开放问题 3**（孤儿影子仓库的清扫策略），并记下一条做不到的事：同一问题里那半句「级联删除驱动的 git 侧 commit GC」**不可实现**——libgit2 没有对象级 GC，而丢弃链上的提交必须重提交幸存者、重提交会改 commit id，那些 id 已经在 append-only 的 items 表里（`items_no_update` 拒绝修正）。回收因此只有「整个仓库」一种粒度，见 design/storage.md §5 与 design/capabilities.md §2。
+
 ### 2026-10-07 · M2 重新规划对账
 
 roadmap 的 M2 段按一次全仓库勘察重写为 Phase 0–8，本 worklog 与 design/storage.md 随之对账。四件事：

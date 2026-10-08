@@ -58,6 +58,22 @@
 
 ## 变更日志
 
+### 2026-10-08 · M2 Phase 1：检查点策略住进 daemon
+
+新增 `src/checkpoints.rs`。**为什么策略在这里而不是 capabilities**：预算熔断要读 `checkpoints` 表，而那张表在 `hatchery-store`——与 capabilities 同为 L2，layering 禁止横向依赖。能同时看见「影子仓库」与「记录」的只有 L4。所以 capabilities 提供机制（`bytes()`/`count()`/`destroy()`），daemon 提供策略。
+
+- `Checkpoints`（一个 pool + 一个 store + 一份预算）、`Budget`、`WorkspaceCheckpoints`（`Checkpointer` 的实现）、`recorded_workspace()`、`sweep_orphans()`。
+- **D9 的阶梯**（用户裁决「GC 最旧，仍超则跳过打点」，但「GC 最旧」只能按整个仓库粒度做——libgit2 没有对象级 GC，而重提交幸存者会改 commit id、那些 id 已在 append-only 的 items 表里）：全局超 → 扫孤儿 → 仍超则跳过；本工作区超且快照数 >1 → **删库重来** + 删该工作区的行（保住将来的可回滚，代价是旧 rewind 目标报 `UnknownCommit`）；本工作区超且单个快照就超 → 跳过 + 告警（删库重来只会腾出地方装同一个快照，每次写重复一遍）。**预算查不动时按「预算未知、照常打点」处理**：预算保护的是我们自己的存储，因为一次查询失败就悄悄丢掉 undo 能力是更坏的交换。
+- `[checkpoints]` 四个配置键（ADR-0006 要的「熔断可配置」）：`workspace_budget_mb`（500）、`global_budget_mb`（2048）、`max_file_mb`（10）、`ignore_rules`（换行分隔的 gitignore 语法——用字符串不用数组，因为 `config/set` 的标量机器已经在，而 gitignore 本来就按行写）。`_mb` 一律 MiB。**`max_file_mb = 0` 定为「不按大小过滤」**，另一种读法（凡有字节就排除）会让每个快照静默变空。预算为 0 是有意义的（留下一个检查点、之后全跳过），所以不像 `idle_timeout_min` 那样夹到 ≥1。
+- HubSink 在 Checkpoint item **落库之后、事件发出之前**补写 `checkpoints` 行（顺序与「先提交 item 再 publish」同理：订阅者对该事件做出反应时，行必须已经查得到）；行写失败只记日志——item 自己带着 commit_id，rewind 走链即可，行只服务预算核算与孤儿判定。
+- `entry.rs` 启动时扫一次孤儿。**只有这里能注意到它们**：删会话会级联删掉行，而没有任何东西会回头看那些行指向的目录。
+
+**一个会删用户数据的坑，实现时发现并堵掉**：影子仓库在自己 config 里记的是**规范化后**的工作区路径，而 HubSink 原先写行用的是会话里的原始拼写。两者不一致时（符号链接、`..`、`/tmp` 一类被 symlink 的前缀），孤儿清扫会认为一个**活着的**仓库没有主并删掉它。修法是把拼写规则收成一个函数 `recorded_workspace()`，sink 与 checkpointer 两处都用它；测试用符号链接进来的同一工作区钉住「仍算有主」，另有一条直接断言「行里的拼写 == 仓库自己记的拼写」。
+
+`SessionManager` 多一个 `checkpoints` 字段（由 `data_dir` + 配置自建，不加构造参数：位置不是调用方该逐会话决定的东西，测试通过把 `data_dir` 指到 tempdir 来隔离，与其余部分同一路子）。`chat_tools` 变成 async，并按 `session.workspace.is_some()` 挂 checkpointer——**仍然模式盲**（不读 `session.mode`，模式装配是 Phase 2），Chat 会话没有 workspace 所以本来也没有可写的东西。装配失败**不降级**成「没有检查点」：一个不能撤销自己写入的 Code 会话必须是启动期的发现，而不是用户第一次 `write_file` 时的意外。
+
+daemon 87 条测试全绿（新增 7 条：3 条 HubSink 行索引 + 4 条预算/清扫），覆盖率 91.2%（地板 80%）。
+
 ### 2026-10-07 · D19：哪些配置跟着 turn 走，哪些跟着 runtime 走
 
 live 验收量出「`/effort` 从不进入请求」（见 design/daemon.md 开放问题 5），用户裁决按 **D19** 修：effort 与 model 跟着 turn 走，其余跟着 runtime。

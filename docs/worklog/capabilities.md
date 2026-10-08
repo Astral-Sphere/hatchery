@@ -6,7 +6,7 @@
 
 ## 当前状态
 
-设计稿完成 + **影子 Git spike 实测两轮**（结论见 ADR-0012）+ **M1 只读层落地（2026-10-01）**：接缝 trait、LocalFs 只读路径、Chat 三工具与 ToolRegistry 全部可用，`./scripts/ci.sh` 全绿。
+设计稿完成 + **影子 Git spike 实测两轮**（结论见 ADR-0012）+ **M1 只读层落地（2026-10-01）** + **M2 Phase 1 落地（2026-10-08）**：接缝 trait、LocalFs 读写路径、Chat 三工具与 ToolRegistry、`CheckpointStore`/`CheckpointPool`、写前打点的装饰器与收集器全部可用，`./scripts/ci.sh` 与 `cargo xtask coverage` 全绿（capabilities 覆盖率 88.2%／地板 85%）。**还没有产品消费者调用写路径**——`write_file`/`edit` 是 Phase 2 的交付物，Phase 1 的写路径由接缝级测试覆盖（真 `LocalFs` + 真影子仓库）。
 
 **M2 已于 2026-10-07 重新规划**：[roadmap](../roadmap.md) 的 M2 节是本方向 M2 范围的权威——Phase 0–8、决策点 D8–D18、16 条带实证的「勘察更正」。下面的待办已按它重挂 Phase。原 M2 段是按 M0/M1 的自述写成的，勘察推翻了其中对本方向最要紧的一条假设：**两个 crate 里零 stub**（无 `todo!()`、`unimplemented!()`、FIXME、占位返回），所以 M2 不是「填已搭好的骨架」而是**从零建**——写路径、PTY、审批后端、`CheckpointStore`、模式装配在代码里**完全不存在**，不是留了坑。勘察同时查出两处 trait 形状与设计草图不符（`FsBackend` 的路径是 `&str` 且无 `line_range`；`TerminalHandle` 无输出流、无 `release`），以及一处会破坏不变量 2 的设计错误（凭据「脱敏入库」），全部记在本日变更日志里。
 
@@ -17,13 +17,13 @@
 - [x] (M1) LocalFs 只读路径 + read_file/glob/grep 工具（Chat 模式用；`chat_tools()` 装配清单随工具走）
 - [x] (M2 · Phase 0，2026-10-07 完成) **`clippy.toml` 的 tokio 洞**（不变量 4 的编译期门禁，故记在本方向）：现只禁 `std::fs::*` 与 `std::process::Command`（+`abort`、`env::set_var`），**没禁 `tokio::fs::*` / `tokio::process::*`**——而 hatchery-tools 依赖 tokio、`LocalFs` 自己就用 tokio::fs，工具里写一句 `tokio::fs::write` 就整条绕过。另补漏掉的 `std::fs::{remove_dir, read_link, hard_link, set_permissions}`（roadmap 更正 8）。**结果**：`tokio::fs` 的全部孪生项与那四个 `std::fs` 项已加并逐条实测；`tokio::process` 那组**故意没加**（没有 crate 开那个 feature，clippy 会回 "does not refer to a reachable function"，实测不触发 `-D warnings` 失败但每次门禁留五条警告）。细节见本日变更日志与 clippy.toml 头部
 - [x] (M2 · Phase 0) **两个 README 对账**（roadmap 更正 14）：原 `crates/hatchery-capabilities/README.md:3-5` 把影子 Git 检查点与「带注册句柄的工具注册表（ADR-0009）」写成既有，原 `crates/hatchery-tools/README.md:3-4` 列七个工具（实际三个）——都不成立。**2026-10-07 已随本轮文档对账改正**：capabilities 的 README 现在只声称 M1 只读切片（并写明 `ApprovalGate` 只有 trait、无实现，检查点/写路径/PTY/`DaemonApproval` 属 M2，注册句柄顺延 M5）；tools 的 README 只列 `read_file`/`glob`/`grep`，其余标 M2/M3/M5，与 src/lib.rs:45 的口径一致。Phase 0 剩下的文档对账（更正 16 那批）属其他方向
-- [ ] (M2 · Phase 1) **CheckpointStore**：把测试里的 `Sandbox` 提炼成正式实现——open 配方（init_opts + 手写 `core.worktree`/`core.bare` + `set_workdir(.., false)`）、`harden()` 的配置钉扎、每次打开重放 ignore 规则、purge 走 `checkout_index(remove_untracked)`、restore 前自动 snapshot。**可提炼的材料至今只存在于 spike 的私有 `Sandbox` 里**（`crates/hatchery-capabilities/tests/spike_shadow_git.rs`，全绿）：`open_shadow()`（:96-146）、`harden()`（:73-94）、per-open ignore 重放（:130-138）、`snapshot()`（:255）、`restore(to, purge)`（:296-318）、`changed_paths()`（:320）、`shadow_dir_bytes()`（:346）；任何 `src/` 下都**没有** `CheckpointStore`。`git2` 已声明在 capabilities 的 `[dependencies]` 却无任何 `src/` 文件使用它（产品侧唯一的 git2 用法在 hatchery-daemon/src/prompt.rs:133-160）
-- [ ] (M2 · Phase 1) **D13 检查点如何成为 item**：`ToolCtx` 加检查点收集器（`LocalFs` 写前 push）→ `ToolInvocation` 带出 `Vec<Checkpoint>` → kernel 在 ToolResult item **之前**追加 Checkpoint item（链成 `… → ToolCall → Checkpoint → ToolResult`；工具结果靠 `ToolResult.call` 配对而非父子关系，故此顺序安全）→ daemon 的 HubSink 在 item 落库后补写 `checkpoints` 行，行写失败只记日志（item 里已有 commit_id 可回退）
-- [ ] (M2 · Phase 1) **`FsBackend` 加写原语**：`write_text_file` + **`create_dir` / `remove`**（write_file 要建目录、rewind 的 purge 要删）——三者今天**都不存在**；`LocalFs` 写路径写前打检查点，`MemoryFs` 同步（trait 一加方法它就编译不过：forcing function，也是工作量）
-- [ ] (M2 · Phase 1) 预算熔断与 GC（**D9** 超预算行为：GC 最旧 vs 拒写）：`revwalk` 计数 + 影子 git-dir 体积求和（实测 5 次快照 = 3457 B，阈值逻辑与 GC 策略待定）
-- [ ] (M2 · Phase 1 内并行做，实现落 Phase 4) **D10 PTY spike（提前，产 ADR）**：必须在三平台 CI 上实测**杀进程不留孤儿**（testing.md 要的 `kill -0` 断言）、取消、输出流。证据（读 references 得来，非本机实测）：`portable-pty` 目前**既不在** workspace `[workspace.dependencies]` **也不在** `Cargo.lock`；codex 用 `portable-pty = "0.9.0"`（references/codex/codex-rs/Cargo.toml:422），且 Windows 侧额外依赖带 `jobapi`/`jobapi2` feature 的 `winapi`（references/codex/codex-rs/utils/pty/Cargo.toml）——即 Job Object，杀 PTY 不留孤儿孙进程正需要它。这就是 windows-gnu CI job 上那条测试的风险点
-- [ ] (M2 · Phase 2) `write_file` / `edit` 工具（`edit` = 精确 old/new 字符串替换，本方向开放问题 4 已裁决）；写前检查点由 Phase 1 的 `ToolCtx` 收集器带出
-- [ ] (M2 · Phase 2) **`Backends` 扩字段**：现为 `Backends { fs, terminal }`（src/registry.rs:25），无 `approval`、无 `checkpoint`——`checkpoint` 随 Phase 1 的写前打点进来，`approval` 随 Phase 2 的审批管线进来
+- [x] (M2 · Phase 1，2026-10-08 完成) **CheckpointStore**：`src/checkpoint.rs` 把 spike 的 `Sandbox` 提炼成正式实现——open 配方逐条照抄（`init_opts` 的 `no_dotgit_dir`+`bare`+`external_template(false)` → 手写 `core.worktree`/`core.bare=false` → `set_workdir(.., false)`）、`harden()` 每次打开都跑、ignore 规则每次打开重放、purge 走 `checkout_index(remove_untracked)`、restore 前自动 snapshot。加了 `CheckpointPool`（per-workspace 缓存 + 互斥，两个会话共用一个仓库）、`untracked()`（purge 的待删清单）、`recorded_workspace()`（孤儿判定）、`destroy()`（唯一的回收原语）。22 条测试在 `tests/checkpoint.rs`，spike 只留 libgit2 后端事实。详见本日变更日志
+- [x] (M2 · Phase 1) **D13 检查点如何成为 item**：链是 `… → ToolCall → Checkpoint → ToolResult`，由 kernel 追加；**但收集器不在 `ToolCtx` 上、也不由 `ToolInvocation` 带出**——原写法在取消路径上会丢掉检查点（被中断的 invocation 直接 drop 且不再被 poll），改成 kernel 造 `CheckpointCollector` 借给 `ToolHost::invoke`、三条出口都 drain。打点本身是 `FsBackend` 的**装饰器** `CheckpointedFs` 而不是 `LocalFs` 的字段。daemon 的 HubSink 在 item 落库后补写 `checkpoints` 行、失败只记日志。详见本日变更日志与 design/kernel.md §5
+- [x] (M2 · Phase 1) **`FsBackend` 加写原语**：只加了 `write_text_file`（自己建缺失的父目录）。**`create_dir` / `remove` 没加**——原待办给它们指名的两个消费者都不存在：write_file 要的父目录由 `write_text_file` 建，rewind 的 purge 是 `restore` 里的 `checkout_index(remove_untracked)`、从不经过接缝。3 个 backend × 2 个无消费者原语 = 没人跑过的死代码（ADR-0009）。`LocalFs` 的写路径另需一条解析规则（`canonicalize` 对不存在的文件必然失败）；`MemoryFs` 同步补齐。详见本日变更日志
+- [x] (M2 · Phase 1) 预算熔断与 GC（**D9** 用户裁决「GC 最旧，仍超则跳过打点」）：机制在本 crate（`bytes()` 求和、`count()` 走 `revwalk`、`destroy()` 删库），**策略在 daemon**（`daemon/src/checkpoints.rs`）——预算需要 `checkpoints` 表，而那张表在同层另一个 crate，L2 之间不能横向依赖。且「GC 最旧」**只能按整个仓库的粒度做**：libgit2 没有对象级 GC，而重提交幸存者会改 commit id，那些 id 已在 append-only 的 items 表里。详见 design/capabilities.md §2 的 D9 阶梯表
+- [ ] (M2 · Phase 1 内并行做，实现落 Phase 4) **D10 PTY spike**：→ **Linux 已实测，决策仍开放，未产 ADR**（用户裁决）。探针常驻 `spikes/pty/`（独立 workspace，不进项目锁文件），七组测量在 `spikes/pty/measured-linux.txt`。macOS/Windows 要等一次 CI 跑，所以 D10 不能在单平台上关闭。已测出四条会改 Phase 4 设计的事实，其中一条**证伪了 testing.md 原来写的断言手法**：`kill -0` 分不清僵尸与活孤儿。详见本日变更日志
+- [ ] (M2 · Phase 2) `write_file` / `edit` 工具（`edit` = 精确 old/new 字符串替换，本方向开放问题 4 已裁决）；写前检查点由 Phase 1 的接缝自动带上——工具只管调 `ctx.fs.write_text_file`，装饰器负责打点，**工具本身不需要知道影子仓库存在**
+- [ ] (M2 · Phase 2) **`Backends` 扩字段**：`checkpoint` 已随 Phase 1 进来（`checkpointer: Option<Arc<dyn Checkpointer>>`，`None` = Chat），只剩 `approval` 随 Phase 2 的审批管线进来
 - [ ] (M2 · Phase 2) DaemonApproval + approval_rules 持久化 + 硬门测试（断言项目配置不可关闭）。起点比原以为的更空：`ApprovalGate`（src/approval.rs:18-21，`async fn request(&self, request: ApprovalRequest) -> ApprovalOption` 就是整个文件）在**全 workspace 零实现**，连 testkit 假件都没有（`hatchery_testkit::Gate` 是无关的信号量包装）。规则求值语义 = **D8**（scope/matcher/decision 文法、求值顺序、默认策略）；`approval_rules` 表已在 v1 schema 里但零 Rust 代码，所以**不需要新迁移**，缺的只是 API 层（roadmap 更正 3）；规则的 list/delete 协议方法同样缺——一条误存的 `DenyAlways` 会永久废掉一个工具且无法撤销。fail-closed 超时住在 gate 实现里，不在 kernel（M0b 已定）
 - [ ] (M2 · Phase 2) **D14 审批预览载荷**：建议给 `ApprovalRequest` 加可选结构化 preview（`UnifiedDiff | Command{argv,cwd} | Excerpt`）而不是新开 `approval/details` 方法——M3 的 ACP `request_permission` 要同一份内容，放请求里一次到位。动因：`ApprovalRequest` 今天只有 `args_digest: String`（其文档明写不是原始 JSON），装不下 diff 也装不下完整命令，而 write/edit 的审批必须给人看 diff
 - [ ] (M2 · Phase 2) **路径硬门**：今天只有工作区逃逸门（读侧）；`~/.ssh`、`~/.config/hatchery`、`.git/hooks`、`.env*` 无任何代码检查，无「规则不可 allow-always」的强制，无路径模式表。表达方式已定（roadmap 更正 7）：**不新增 `RiskLevel` 变体**（新增枚举值属协议 major bump）——`ApprovalRequest::once_only()` 已用「不提供 always 选项」表达不可记忆，路径门只需能为**工作区内**的敏感路径强制 `once_only`。必须这样绕的原因：`RiskLevel::is_hard_gate()`（crates/hatchery-protocol/src/approval.rs:34）只认 `WritesOutside`，而 `.env*` 与 `.git/hooks` 在工作区**内**，风险级本身表达不了它们
@@ -101,6 +101,37 @@ capabilities 的**代码**在 M0b 没有动（trait 与工具实现是 M1/M2 的
 - 2026-09-28 影子 Git 后端：git2 vendored（用户裁决 + 第二轮实测），ADR-0012。若将来要摆脱 C 依赖，替代候选是 `gix`（纯 Rust，**未实测**），前提是把这 11 项门槛在 gix 上重跑全绿。
 
 ## 变更日志
+
+### 2026-10-08 · M2 Phase 1：CheckpointStore 转正 + 写路径 + D9/D13
+
+**新增**：`src/checkpoint.rs`（`CheckpointStore` / `CheckpointPool` / `CheckpointOptions` / `SnapshotReport` / `RestoreOptions` / `RestoreReport` / `CheckpointError`）、`src/checkpointed_fs.rs`（`Checkpointer` trait / `PreWrite` / `CheckpointedFs` 装饰器）、`tests/checkpoint.rs`（22 条）。`FsBackend` 加 `write_text_file`，`FsError` 加 `Checkpoint` 变体，`Backends` 加 `checkpointer`。capabilities 51 条测试全绿，覆盖率 88.2%（地板 85%）。
+
+**四条实测纠正了实现或计划**，都写进了 design/capabilities.md §2：
+
+1. **影子仓库尊重工作区自己的 `.gitignore`**——即便它是 bare + 外部 work tree + `core.excludesFile` 指向不存在的路径。tracked 只有 `.gitignore` 与 `src/main.rs`，`target/debug/huge` 与 `*.log` 都被排除。这条改变了「构建产物走配置化排除」的必要性：git 工作区的 `target/` 天然不入快照，`checkpoints.ignore_rules` 是给**非** git 工作区用的。两面都钉成测试。
+2. **`delta.flags()` 的 `BINARY` 位只在 `Patch::from_diff` 之后才有**（之前实测 `DiffFlags(0x0)`，之后 `DiffFlags(BINARY)`）。libgit2 要加载内容才判定二进制，所以 diff 必须**先建 patch 再读 flags**；顺序反了会把每个二进制文件报成「文本文件、零 hunk」。
+3. **restore 前的安全快照不能移动 HEAD**。原实现照 spike 的 `repo.commit(Some("HEAD"), ..)` 打安全快照，于是 HEAD 变成安全提交，接着 `reset(Hard)` 按 HEAD 的 index 决定删什么——「从未被任何快照跟踪」的用户文件看起来就是已跟踪的，被删掉了。那正是 `purge_untracked` 默认 false 要防的事，也是 `invariant_purge_restore_also_removes_never_tracked_files` 跑红暴露的。
+4. **光「不移动 HEAD」还不够**：`commit_snapshot` 里的 `index.add_all` + `index.write()` 已经把整个工作区 stage 进影子 index 并落盘，`reset(Hard)` 读的正是它。修法是快照后把 index 读回 HEAD 的树（`unstage_to`）。**变异验证过**：摘掉 `unstage_to`，两条测试立刻红（`a plain restore purged a file`）。
+
+**两处与设计草图的偏差**（都是实现时发现的，理由记在 design 文档里）：
+
+- 检查点是 `FsBackend` 的**装饰器**，不是 `LocalFs` 的字段。除了「local backend 保持只是个文件系统」，还有两条实际收益：收集器天然按**调用**划分（两个调用永不混检查点，即使 kernel 哪天并行跑工具），以及任何 backend 都能被包住——`MemoryFs` 也能，testing.md 要的「写序列 vs 检查点记录对齐」因此有得测。
+- **`create_dir` / `remove` 没加**。待办给它们指名的两个消费者都不存在：`write_file` 要的父目录由 `write_text_file` 自己建（模型给的路径里少个 `src/new/` 不是值得回给它的失败），rewind 的 purge 是 `restore` 里的 `checkout_index(remove_untracked)`、**从不经过接缝**。三个 backend × 两个无消费者原语 = 三份没人跑过的死代码，正是 ADR-0009 反预拆分刹车的适用场景。将来真出现 `delete_file` 一类工具时再加，那时它有测试。
+
+**写路径需要一条自己的解析规则**：`resolve` 靠 `canonicalize`，而写目标通常还不存在，`canonicalize` 对它必然失败。`resolve_write` 因此锚定**最近的可解析祖先**再往下拼——顺序是承重的：`link/` 指向 `/etc` 时，若先 `create_dir_all` 再校验，就会在 `/etc/new/` 建出目录来。另外目标本身若已存在则整体 canonicalize，**悬空符号链接被拒**：穿过去写会在链接目标处创建文件，落在工作区外、也落在所有检查点之外。两条都有测试（前者断言外部**一个目录都没建**）。
+
+**不变量 6 迁移**：三条 `invariant_` 测试从 spike 的私有 `Sandbox` 搬到 `tests/checkpoint.rs`，跑真的 `CheckpointStore`，脏仓库由 `TempWorkspace::git()` 提供，用户仓库状态的度量搬进 testkit（`UserRepoState` / `user_repo_state()`）供两边共用。**名字未变**，所以 `invariants` profile、testing.md §5 的映射表、以及 ADR-0012 引的旧名映射都照旧（ADR 不改）。spike 只留 libgit2 后端事实，避免两套 harness 各自腐烂。
+
+**D10 的 PTY 探针**（用户裁决「Linux 实测 + 三平台探针，D10 不关闭」）：`spikes/pty/` 是**独立 workspace**（自带空 `[workspace]` 表），根 `Cargo.toml`/`Cargo.lock` 一行未动、`cargo metadata` 看不到它、portable-pty 不进项目锁文件——决策没定之前不该进。七组测量在 `spikes/pty/measured-linux.txt`，报告里 `OBSERVED/VERDICT`（本机实测）与 `READ-FROM-SOURCE`（读 codex 源码）逐条分开标注。四条会改 Phase 4 设计的：
+
+- PTY 的 ONLCR 把 LF 变 CRLF（20 个 LF → 20 个 CRLF；100 MB 载荷 → 实测 150 MB），**输出与子进程 stdout 不逐字节相同**，golden 与 `TerminalOutcome` 必须归一化；portable-pty 传 `termios = NULL` 且 `get_termios()` 只读，没有关它的 API。
+- `Child::kill()` 只发**一个 pid**（源码：SIGHUP → 5×50ms 轮询 → SIGKILL，无 killpg），5 个场景里 **3 个留孤儿**（`setsid`、`trap '' HUP`、`set -m` 作业控制）。孙进程留在 tty 前台组时是内核的 `disassociate_ctty()` 顺手杀的，**不是库的功劳**——`set -m` 那个对照实验正是为了区分这两者。
+- **`kill -0` 分不清僵尸与活孤儿**（实测：killed-but-unreaped 的 pid 仍答 ALIVE，`/proc` 状态 `Z`）。testing.md §3.5 原来写的「cancel 后无孤儿进程（`kill -0` 断言）」**这条手法本身不成立**，已改；`LocalPty` 的测试必须同时 reap 或读进程状态。
+- `CommandBuilder` 的 cwd 默认是 **`$HOME`** 不是进程 cwd（`src/cmdbuilder.rs` 的 `as_command()`），`TerminalSpec` 必须显式设，否则每次 shell 调用都跑在用户家目录。
+
+另有三条属于「不写下来就会踩」的：父进程不立刻 drop slave fd 则 reader 永远等不到 EOF（实测挂到 2522ms 才在 drop 后结束）；内核缓冲只有 **4095 字节**，消费者停读会**冻住**子进程，所以超时杀可能杀在一个只是在等我们的进程上；行纪律让换行密集的输出吞吐从 171.7 MiB/s 掉到 **12.7 MiB/s**（13.5×），D12 的 spill 阈值要按后者定。4 MiB 无换行载荷逐字节无损。
+
+**顺带修的两个先前就存在的问题**：`xtask coverage` 把 JSON 报告路径写死成 `target/llvm-cov/coverage.json`，而 cargo-llvm-cov 用的是 `target/llvm-cov-target/`，那个父目录从来不存在——`--output-path` 不建父目录，于是整个覆盖率门禁在**跑完全部插桩测试之后**才失败，看起来像覆盖率问题、其实是缺一个 `mkdir`（已修 + 加测试）。`MemoryFs` 的根目录只在 `dir()`/`file()` builder 被调用时才登记，所以「空 `MemoryFs` 的 `read_dir("")` 报 NotFound」——与 `LocalFs`（根是别人递给它的真目录，恒存在）不一致，`walk.rs` 有条测试把这个假的特性当成了契约。现在 `MemoryTree::default()` 恒含根，那条测试改成用一个会拒绝的假 backend 测同一条性质。
 
 ### 2026-10-07 · M2 Phase 0：不变量 4 的编译期门禁补洞
 

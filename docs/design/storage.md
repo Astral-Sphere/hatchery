@@ -57,7 +57,7 @@ approval_rules(id TEXT PRIMARY KEY, scope TEXT NOT NULL, matcher TEXT NOT NULL,
 ```
 
 - `checkpoints.item_id` **可空**是承重的：rewind 之前那次「安全快照」记进这张表时 `item_id = NULL` 且**不建 item**——它是 undo-of-undo，不属于对话历史（§5）。
-- `checkpoints.session_id` 的 `ON DELETE CASCADE` 让「孤儿影子仓库」变成可判的：删会话后该 workspace 一行不剩，所以「`WHERE workspace = X` 还有行吗？」就是「这个影子仓库还有没有主」（开放问题 3）。
+- `checkpoints.session_id` 的 `ON DELETE CASCADE` 让「孤儿影子仓库」变成可判的：删会话后该 workspace 一行不剩，所以「`WHERE workspace = X` 还有行吗？」就是「这个影子仓库还有没有主」（开放问题 3，**Phase 1 已按此实现**）。这条判据要求 `workspace` 列的拼写与影子仓库自己记的那一份一致，两处都走 daemon 的 `recorded_workspace()`。
 - `approval_rules` **没有排序列、没有 enabled 列、`scope` 是裸 TEXT、没有 session 外键**。所以规则的求值顺序与匹配语义必须由审批层的定义给出（M2 的 D8），不能指望从 schema 读出来；表本身只保证「一条规则存得下、查得回、删得掉」。
 
 `items` 的 `kind` + `payload` 两列与 protocol 的 `ItemKind` 相邻标签表示一一对应：`ItemKind::to_payload()` 取内层 `payload`，`from_parts(tag, payload)` 反向重建；`items.kind` 存 `ItemKindTag::as_str()`。读到一个本版本不认识的 kind 或与 kind 不匹配的 payload → `StoreError::CorruptItem { id, message }`，**报错而不是猜**。
@@ -100,10 +100,11 @@ pub fn tips_map(skeleton) -> Result<HashMap<ItemId, Vec<ItemId>>, TreeError>;  /
 - **切换**：`active_head` 指向任意 item；rebuild 自动生效。分支 = active_head 所在的根到节点链，没有显式 branch 实体。
 - **删除**：内存 BFS 收子树（只删后代，共享祖先不动）→ 校验 `active_head` 不在子树内（否则 `ActiveHeadInside`）→ 删子树根，靠 `ON DELETE CASCADE` 完成 → **交叉校验**：删除前后的 item 行数差必须等于 BFS 收到的数量，不等就报错（引擎的 `execute` 只回报直接删除的行数，计数必须来自我们自己的走树；两者不一致说明有一边错了，不能把错的数字报给调用方）。实测兜底：即使应用层漏了校验，`sessions.active_head` 的外键也会拒绝删除。
 - **跨会话父节点**：schema 的 `parent_id` 外键只能证明父节点**存在**，不能证明它属于同一会话；`insert_item` 额外校验，否则会造出一棵谁都不走的树。同一类校验覆盖 `switch_branch`/`delete_branch` 的 head 参数（`SessionMismatch`）与整批 append（§3）。
-- **检查点如何进链（M2 Phase 1 · D13）**：`ToolCtx` 带一个检查点收集器，`LocalFs` 在写之前 push；`ToolInvocation`（kernel 类型）把收集到的 `Vec<Checkpoint>` 带出来；kernel 在 **ToolResult item 之前**追加 Checkpoint item，链因此是 `… → ToolCall → Checkpoint → ToolResult`。这个顺序是安全的，因为工具结果靠 `ToolResult.call: ItemId` 与其调用配对、**不靠父子关系**（kernel.md §7「一次只开一个 item」的纪律不受影响：Checkpoint 是在 ToolResult 之前串行提交的完整 item）。daemon 在 Checkpoint item 落库后补写 `checkpoints` 行；**行写失败只记日志**——item 里已经带着 commit_id，rewind 可以回退到走链。
+- **检查点如何进链（M2 Phase 1 · D13，已落地）**：kernel 造一个 `CheckpointCollector` **借给** `ToolHost::invoke`；capabilities 的注册表把 backend 包进 `CheckpointedFs`，它在每次写之前 push 进去；kernel 在 **ToolResult item 之前**追加 Checkpoint item，链因此是 `… → ToolCall → Checkpoint → ToolResult`。这个顺序是安全的，因为工具结果靠 `ToolResult.call: ItemId` 与其调用配对、**不靠父子关系**（kernel.md §7「一次只开一个 item」的纪律不受影响：Checkpoint 是在 ToolResult 之前串行提交的完整 item）。daemon 在 Checkpoint item 落库后补写 `checkpoints` 行；**行写失败只记日志**——item 里已经带着 commit_id，rewind 可以回退到走链。
+  早先写法是「`ToolCtx` 带收集器、`ToolInvocation` 把 `Vec<Checkpoint>` 带出来」，**在取消路径上会丢掉它们**：kernel 的工具 select 是 cancel-first，被中断的 invocation 直接 drop 且不再被 poll，所以它要返回的东西永远到不了 kernel。收集器改成借进去的，完成/失败/中断三条出口都能 drain（kernel.md §5）。
 - **rewind 靠 item 链定位 commit，不靠 `checkpoints` 表**：`ItemKind::Checkpoint { commit_id, kind }` 自己带着 commit id，而 `ItemKind::is_conversation()` **不含** Checkpoint，所以检查点 item 永远不会进模型请求。Code scope 因此是「`rebuild_chain(session, old_head)` → 定位 `target_item` → **向后**扫第一个 Checkpoint item → 读它的 `commit_id` → restore」。这条规则的正确性只依赖一件事：**pre-write 快照恰好等于 target_item 时刻的工作区状态**——所以向后扫不到 Checkpoint 意味着 target_item 之后根本没写过东西，Code rewind 是 **no-op**（不是错误）。`checkpoints` 表因此只服务**跨会话的预算核算与 GC**，不是 rewind 的主索引。
 - **`Both` 的顺序**：先 restore 代码、成功之后再移 head——restore 失败时历史绝不能已经被移走。restore 之前自动打一次安全快照，记进 `checkpoints` 表且 `item_id = NULL`、**不建 item**（它是 undo-of-undo，不属于对话历史；该列可空正是为此留的，见 §2）。
-- **级联删除要驱动 git 侧的 GC**：`delete_branch`/`delete_session` 让 `checkpoints` 行随外键级联消失（引擎门槛测试已锁定），但影子仓库里的 **commit 对象不会自己消失**，必须显式 GC（M2 Phase 1）。
+- **级联删除不驱动 git 侧的 commit GC，那件事做不到**：`delete_branch`/`delete_session` 让 `checkpoints` 行随外键级联消失（引擎门槛测试已锁定），影子仓库里的 **commit 对象也确实不会自己消失**——但 libgit2 没有对象级 GC（`Repository` 只有 `odb()` 读写与 `cleanup_state()`），而丢弃链上的提交必须重提交幸存者、**重提交的 commit id 会变**，那些 id 已经在 append-only 的 `items` 表里（`items_no_update` 触发器拒绝修正）。所以回收只有「整个影子仓库」一种粒度：行全部级联消失 ⇒ 没有 item 还指着它 ⇒ `sweep_orphans` 删目录是安全的（开放问题 3）。仍被 item 指着的工作区超预算时走 D9 的阶梯（capabilities.md §2），代价是旧 rewind 目标报 `UnknownCommit`。
 - **命名分支**（可选，M4）：`branch_note` item 给用户标注分支用途。
 
 ## 6. 迁移
@@ -134,7 +135,9 @@ pub fn tips_map(skeleton) -> Result<HashMap<ItemId, Vec<ItemId>>, TreeError>;  /
 
 1. ~~libSQL crate 选型确认~~ → **已关闭（2026-09-28，ADR-0010）**。
 2. items.payload 是否需要抽列（如 tool_name）做二级索引以加速 GUI 过滤——先 JSON extract 查询，量大了再加生成列（turso 的 `GENERATED` 列是 partial 支持，真要走得先实测）。
-3. 全局 GC：孤儿 checkpoint 仓库（会话删了但影子仓库残留）的清扫策略——**M2 Phase 1**。判据已经在 schema 里：`checkpoints.session_id` 带 `ON DELETE CASCADE`，所以「`WHERE workspace = X` 还有行吗？」就等价于「这个影子仓库还有没有主」，不必在文件系统上反向猜（§2）。同一阶段还要处理级联删除驱动的 git 侧 commit GC（§5）。
+3. ~~全局 GC：孤儿 checkpoint 仓库的清扫策略~~ → **已关闭（2026-10-08，M2 Phase 1）**。判据用的就是 schema 里那条：`checkpoints.session_id` 带 `ON DELETE CASCADE`，所以「`WHERE workspace = X` 还有行吗？」等价于「这个影子仓库还有没有主」。实现是 daemon 的 `sweep_orphans`：启动扫一次 + 每次预算检查时扫，`CheckpointStore::recorded_workspace(dir)` 从仓库自己的 config 反查归属，无行则删整个目录；**认不出属于谁的一律保留**（「cannot tell」不等于「delete」）。
+   同一条里那半句「级联删除驱动的 git 侧 commit GC」**做不到，也不该做**：libgit2 没有对象级 GC（`Repository` 只有 `odb()` 读写与 `cleanup_state()`），而丢弃链上的提交必须重提交幸存者——**重提交的 commit id 会变**，那些 id 已经在 append-only 的 `items` 表里（`items_no_update` 触发器拒绝修正）。所以回收只有「整个仓库」这一种粒度，预算超限时走 D9 的阶梯（capabilities.md §2）。
+   另有一处实现时必须对齐的细节：影子仓库记录的是**规范化后**的工作区路径，写行的地方也必须用同一拼写（daemon 的 `recorded_workspace()`），否则清扫会把活着的仓库当孤儿删掉。
 4. 断电级 durability：实测 `PRAGMA synchronous` 三种取值耗时相同（推测 pragma 无实际 fsync 效果），因此「掉电不丢已提交 item」目前**没有证据**。M0b 的 kill -9 测试覆盖进程级崩溃；若需要更强保证，得实测 turso 的 checkpoint/fsync 时机（M1 结合 daemon 崩溃恢复评估）。
 5. 10k items 会话的加载策略（骨架全取 + payload 分页的具体阈值）——M4 GUI 性能 fixture 时定。
 6. 只读连接池与 `spawn_blocking` 读路径（**M3**，2026-10-03 由 M1 改标）——现在读也走 writer actor，串行但正确；等读吞吐成为实测瓶颈再做。

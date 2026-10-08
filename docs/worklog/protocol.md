@@ -39,6 +39,16 @@
 
 ## 变更日志
 
+### 2026-10-08 · M2 Phase 1：diff 载荷类型 + `CheckpointId`
+
+新增 `src/diff.rs`：`Diff` / `DiffFile` / `DiffStatus` / `DiffHunk` / `DiffLine` / `DiffLineKind`，以及 `id.rs` 里的 `CheckpointId`（`checkpoints` 表的主键；GC 要按行删，而 item id 对安全快照不存在、commit id 属于影子仓库而不属于那条记录）。都是加类型，major 1 内合法（§6）。
+
+形状由用户裁决为**结构化 hunk**，不是 unified 文本：D11 已经定了 TUI 用 `similar` 算 hunk，git2 侧也原生产出 hunk，所以两个生产者喂同一个类型、两个前端都不必写解析器。codex 走的是文本那条路，代价是每个渲染方一个解析器（`references/codex/codex-rs/tui/src/diff_render.rs` 2745 行）。三条细节：`DiffLine.text` **不带** `+`/`-`/空格标记（`kind` 已经说了，两个都带就会互相矛盾）、不带换行（渲染方决定怎么接行，折行不该继承折点）；`DiffStatus` 是 `git2::Delta` 去掉三个描述工作树状态的变体（`Ignored`/`Untracked`/`Conflicted`）——检查点 diff 永远是树对树，预览 diff 里也没有这三个概念；`binary: true` 时 `hunks` 为空，渲染方因此能说「二进制」而不是显示一片空白。
+
+**roadmap 风险 3 这次没有兑现**：新增的 `Diff` 与 `CheckpointId` 都不在 fixture 注册表覆盖的三类里（`ItemKind` 载荷、方法结果、事件），所以 determinism 步骤全程绿、没有「有意修改 → 提交前保持红」那一轮摩擦。**也没有为 `Diff` 加 golden，这是对的而不是漏的**——第一个返回它的方法（Phase 3 的 rewind，或 `checkpoint_diff` 工具）落地时补；在那之前 serde 拼写由 `diff.rs` 内 7 条单测钉住，含「省略字段取默认、多出字段忽略、未知枚举值拒绝」三向。Phase 2 给 `ApprovalRequest` 加 preview 字段时才会真撞上那条摩擦。
+
+protocol 覆盖率 93.1%（地板 80%）。
+
 ### 2026-10-07 · M2 重新规划对账
 
 roadmap 的 M2 段按一次全仓库勘察重写为 Phase 0–8。**协议侧的结论是「M0 的声称全部为真、M2 全是加性改动」**：20 个方法都有参数与结果类型与 golden fixture（双向机器强制）、9 种 `ItemKind`、13 种 `ServerEvent` + 1 种 `DaemonEvent`、14 个错误码——枚举覆盖由宏从同一份来源生成。四项 M2 新增（diff 载荷类型 → Phase 1；`ApprovalRequest` 的结构化 preview 与规则 list/delete → Phase 2；`SessionLoadResult.pending_approvals` → Phase 3）都是加字段或加方法，因此落在 §6「方法/字段只增不改语义」里，major 1 内合法。**代价是已知的摩擦**：加字段会翻动 fixture 确定性门禁，而门禁把「工作树里有未提交的 fixture 改动」一律当成测试改写了 golden——M1 已经撞过（worklog/testing.md、worklog/cli.md、worklog/daemon.md 各记了一批「有意修改 → 提交前保持红、提交即恢复」），Phase 1/2 要预留。

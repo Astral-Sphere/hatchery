@@ -20,7 +20,8 @@ pub struct ToolCtx<'a> {          // 工具能拿到的全部外界能力 = 接�
     pub terminal: &'a dyn TerminalBackend,
     pub cancel: CancellationToken,
     pub emit: &'a dyn Fn(ToolProgress),   // 进度上报 → ToolCallProgress 事件
-    // M2 加：检查点收集器（LocalFs 写前 push；见 §2「检查点如何成为 item」）
+    // 检查点收集器**没有**进这里（原草图打算加）：工具不需要它，而本节的原则是「没有字段就没有能力」。
+    // 收集器由 kernel 造、借给 ToolHost::invoke，注册表在包装 fs 时把它交给装饰器；见 §2「检查点如何成为 item」
 }
 
 // 路径一律 &str 且工作区相对（不是 PathBuf）：根由 backend 拥有，「越界」的定义也只由 backend 给
@@ -28,8 +29,11 @@ pub trait FsBackend {
     async fn read_text_file(&self, path: &str) -> Result<String, FsError>;
     async fn read_dir(&self, path: &str) -> Result<Vec<FsEntry>, FsError>;
     async fn metadata(&self, path: &str) -> Result<FsMetadata, FsError>;
-    // M2 写原语：write_text_file + create_dir + remove
-    //   （write_file 要建父目录，rewind 的 purge 要删文件——只有 write_text_file 不够）
+    // M2 写原语（已落地）：只有 write_text_file，它自己建缺失的父目录
+    async fn write_text_file(&self, path: &str, contents: &str) -> Result<(), FsError>;
+    // create_dir / remove **没有加**，草图给它们指名的消费者都不存在：
+    //   write_file 要的父目录由 write_text_file 建；rewind 的 purge 是 CheckpointStore::restore 里的
+    //   checkout_index(remove_untracked)，从不经过接缝。无消费者的原语 = 无人跑过的死代码（ADR-0009）
     // M2 另加：glob 的模式过滤下推（read_dir 这个只读子集已提前进 M1，见下）
 }
 
@@ -47,7 +51,12 @@ pub trait ApprovalGate   // request(ApprovalRequest) → ApprovalOption（批准
 
 // ToolDef / ToolInvocation / ToolProgress* 见下；值类型住在 protocol（M0b 分层修正）
 pub struct ToolRegistry { /* name → Arc<dyn Tool>；实现 kernel::ToolHost，turn 开始冻结快照 */ }
-pub struct Backends { pub fs, pub terminal /* M2 加 approval 与 checkpoint 两个字段 */ }
+pub struct Backends {
+    pub fs,                                   // Phase 1 起是 CheckpointedFs 的内层
+    pub terminal,
+    pub checkpointer: Option<Arc<dyn Checkpointer>>,  // Phase 1 已加；None = Chat，没有写就没有 undo 点
+    // M2 Phase 2 再加 approval
+}
 ```
 
 ### 与 ADR-0004 草图的偏差（已定型）
@@ -103,29 +112,72 @@ M1 的 handle 只有 `wait()`（进程结束后一次性返回全部输出）与
 
 ## 2. 影子 Git 检查点（CheckpointStore）
 
+**Phase 1 已落地**（`src/checkpoint.rs` + `src/checkpointed_fs.rs`）。下面是落地后的形状；草图里被实现推翻的部分在每条后面写明。
+
 ```rust
-pub struct CheckpointStore { /* per-workspace 影子仓库，daemon 内互斥 */ }
+pub struct CheckpointStore { /* 一个工作区的影子仓库；每次操作开一个新句柄 + 内部 tokio Mutex 串行化 */ }
+pub struct CheckpointPool  { /* 根目录 + 选项 + per-workspace 缓存；daemon 持一个，两个会话共享一个仓库 */ }
+
+pub struct CheckpointOptions { pub ignore_rules: Vec<String>, pub max_file_bytes: u64 }
+pub struct SnapshotReport { pub checkpoint: Checkpoint, pub oversized: Vec<String> }
 
 pub struct RestoreOptions {
     /// 删除「快照之后才出现、且从未被任何快照跟踪」的文件。
     /// 默认 false：rewind 永不删用户自己的未跟踪文件。开启需要审批 + 二次确认 + 先列出待删清单。
     pub purge_untracked: bool,
 }
-
-pub struct RestoreReport { pub rolled_back: Vec<PathBuf>, pub purged: Vec<PathBuf> }
+pub struct RestoreReport { pub safety: SnapshotReport, pub rolled_back: Vec<PathBuf>, pub purged: Vec<PathBuf> }
 
 impl CheckpointStore {
-    pub fn init(workspace: &Path) -> Result<Self>;       // git-dir: ~/.local/share/hatchery/checkpoints/<workspace-hash>
-    pub fn snapshot(&self, kind: CheckpointKind, item: ItemId) -> Result<CommitId>;
-    pub fn diff(&self, from: CommitId, to: CommitId) -> Result<UnifiedDiff>;   // 见下：返回类型名是暂定的
-    pub fn restore(&self, to: CommitId, opts: RestoreOptions) -> Result<RestoreReport>;
-    pub fn gc(&self, budget: Budget) -> Result<u64>;     // 预算熔断（ADR-0006）
+    pub fn open(workspace: &Path, git_dir: &Path, options: &CheckpointOptions) -> Result<Arc<Self>>;
+    pub fn recorded_workspace(git_dir: &Path) -> Option<PathBuf>;  // 孤儿判定唯一可行的入口
+    pub async fn snapshot(&self, kind: CheckpointKind) -> Result<SnapshotReport>;
+    pub async fn diff(&self, from: &str, to: &str) -> Result<Diff>;
+    pub async fn restore(&self, to: &str, options: RestoreOptions) -> Result<RestoreReport>;
+    pub async fn untracked(&self) -> Result<Vec<PathBuf>>;  // purge 的待删清单，审批要它
+    pub async fn bytes(&self) -> u64;                        // 预算量的就是这个
+    pub async fn count(&self) -> Result<u64>;                // 从 HEAD 可达的快照数
+    pub async fn destroy(&self) -> Result<()>;               // 唯一的回收原语，只对孤儿 sound
 }
 ```
 
-`UnifiedDiff` **不存在**——protocol 里没有任何 diff 载荷类型（无 `UnifiedDiff`/`DiffHunk`/`FileDiff`），草图这个名字是暂定的。M2 Phase 1 给 hatchery-protocol 加一个 diff 载荷类型（TUI 的 diff 预览与 M4 的 GUI diff 视图共用同一份，ACP 的 `ToolCallContent{content=diff}` 也要它），最终以那次改动的命名为准。注意 `ApprovalRequest` 装不下 diff：它只有 `args_digest: String`，其文档明写不是原始 JSON；审批要预览 diff 得走 D14 的结构化 preview 字段。
+与草图的四处出入，每处都有理由：
 
-另有一处 diff **没有来源**：`git2` 出的是检查点之间（commit → commit）的 diff，而 `write_file`/`edit` 的**预览** diff 是「旧缓冲 vs 新内容」、此时还没有 commit。这需要独立的 diff 能力（D11 的证据：atomcode 用 `similar = "2"`，references/atomcode/Cargo.toml:40），目前不在任何依赖表里。
+- **没有 `init(workspace)`**，git-dir 由调用方给：`<data>/checkpoints/<uuid5(NAMESPACE, workspace)>` 由 `CheckpointPool::git_dir_for` 算。目录名用 uuid v5（`uuid` 已有的 crate 加 `v5` feature，只多 `sha1_smol` 一个依赖）而不是自己写哈希；仓库 config 里另记一个 `hatchery.workspace` 标记，`open` 每次校验，所以名字碰撞或数据目录被搬走都是**报错**而不是悄悄检查点错树。
+- **没有 `gc(budget)`**：预算熔断需要 `checkpoints` 表，而那张表在同层的另一个 crate（L2 之间禁止横向依赖），所以**策略住在 daemon**（`daemon/src/checkpoints.rs`），本 crate 只提供机制。libgit2 也**没有对象级 GC**（`Repository` 只有 `odb()` 读写与 `cleanup_state()`），所以「回收」只有整个仓库这一种粒度——见 D9 那段。
+- **`snapshot` 的签名里没有 `item: ItemId`**：item 是 kernel 在工具返回**之后**才造的，打点那一刻没有 id 可给。关联由 `checkpoints` 行（`item_id`）与 Checkpoint item 自己的载荷（`commit_id`）承担，两者都比 commit message 里塞一个字符串强。
+- **commit id 是 `String` 不是新类型 `CommitId`**：protocol 的 `Checkpoint.commit_id` 已经是 `String`，再引入一个同值类型只会在边界上添一次可失败的转换。
+
+`Diff` **已在 Phase 1 落地**（protocol 的 `Diff/DiffFile/DiffStatus/DiffHunk/DiffLine/DiffLineKind`），草图那个暂定名 `UnifiedDiff` 没有采用：载荷是**结构化 hunk**，不是 unified 文本。理由是 D11 已经裁决 TUI 用 `similar` 算 hunk、git2 侧也原生产出 hunk，两个生产者喂同一个类型，两个前端都不必写 unified-diff 解析器（codex 走文本那条路，为此有 2745 行 `tui/src/diff_render.rs`）。注意 `ApprovalRequest` 仍装不下 diff：它只有 `args_digest: String`，其文档明写不是原始 JSON；审批要预览 diff 得走 D14 的结构化 preview 字段——那时 preview 的类型就直接是这个 `Diff`。
+
+**目前没有 golden fixture 钉 `Diff`，这是对的**：fixture 注册表只覆盖三类东西（`ItemKind` 载荷、方法结果、事件），`Diff` 一类都不是。第一个返回它的方法（Phase 3 的 rewind，或 `checkpoint_diff` 工具）落地时补上。serde 拼写由 protocol 内的单测钉住。
+
+另有一处 diff **仍没有来源**：`git2` 出的是检查点之间（commit → commit）的 diff，而 `write_file`/`edit` 的**预览** diff 是「旧缓冲 vs 新内容」、此时还没有 commit。这需要独立的 diff 能力（D11 的证据：atomcode 用 `similar = "2"`，references/atomcode/Cargo.toml:40），**目前仍不在任何依赖表里**——Phase 2 的 `edit` 预览或 Phase 6 的 diff 视图谁先到谁引入，产出同一个 `Diff` 类型。
+
+### D9：预算熔断（用户裁决 2026-10-08）
+
+裁决是「GC 最旧，仍超则跳过打点」。前半句只能按**整个影子仓库**的粒度兑现，原因是两条既成事实而不是一句「太麻烦」：
+
+1. libgit2 没有对象级 GC，回收字节的唯一办法是重建仓库；
+2. 重建就要重提交幸存者，而**重提交的 commit id 会变**——`ItemKind::Checkpoint.commit_id` 已经写进 append-only 的 `items` 表（`items_no_update` 触发器拒绝那次修正），所以任何改写历史的 GC 都会让既有 item 指向不存在的 commit。
+
+于是 daemon 侧的阶梯是（`daemon/src/checkpoints.rs`，全部有测试）：
+
+| 情况 | 动作 | 为什么 |
+|---|---|---|
+| 全局预算超了 | 先扫孤儿；仍超 → **跳过打点 + 告警** | 全局那条保护的是**用户的磁盘**，不是我们的索引 |
+| 本工作区超预算、快照数 >1 | **删库重来** + 删该工作区的行 | 保住*将来*的可回滚；只跳过会让工作区因为一个配置数字永久失去 undo |
+| 本工作区超预算、单个快照就超 | **跳过打点 + 告警** | 删库重来只会腾出地方装同一个快照，每次写都重复一遍 |
+| git/IO 真故障 | **拒绝写入**（`FsError::Checkpoint`，不是 `Io`） | 拿不到 undo 点的 agent 写入比不写更糟；错误变体分开，模型才听得见「缺的是检查点」 |
+
+「删库重来」的代价是诚实且有界的：指向被丢弃 commit 的 rewind 报 `UnknownCommit`，测试钉住了这句话。ADR-0006 要的「熔断可配置」落成 `[checkpoints]` 四个键：`workspace_budget_mb`（500）、`global_budget_mb`（2048）、`max_file_mb`（10）、`ignore_rules`（换行分隔的 gitignore 语法；用字符串不用数组，因为 `config/set` 的标量机器已经在，而 gitignore 本来就是按行写的）。`_mb` 一律按 MiB——ADR-0006 原文混用了 500MB 与 2GiB。
+
+### 孤儿影子仓库（storage 开放问题 3，已关闭）
+
+删会话会级联删掉它的 `checkpoints` 行，而**没有任何东西会回头看那些行指向的目录**，所以孤儿只能在清扫时被注意到：启动扫一次 + 每次预算检查时扫。判定 = `CheckpointStore::recorded_workspace(dir)` 反查归属 + `WHERE workspace = X` 无行。**认不出属于谁的一律保留**（「cannot tell」绝不能等于「delete」）。
+
+这里有一个会**删掉用户数据**的坑，已在实现里堵掉并有测试：影子仓库记录的是**规范化后**的工作区路径，而 HubSink 写行用的是会话里的原始拼写。两者不一致时，清扫会认为一个活着的仓库没有主。修法是把拼写规则收成一个函数 `recorded_workspace()`，两处写入方（sink 与 checkpointer）都用它。
+
 
 实现纪律（后端 = **git2 / vendored libgit2**，ADR-0012；下列结论全部来自 `tests/spike_shadow_git.rs` 的门槛实测——该套件常驻，升级 git2 必须重跑）：
 
@@ -135,24 +187,36 @@ impl CheckpointStore {
   2. 自己写 config：`core.worktree = <用户工作区>`、`core.bare = false`。**必须手写**——libgit2 的 `set_workdir(path, update_gitlink=false)` 只改内存句柄；而 `update_gitlink=true` 会在用户工作区里种一个 `.git` gitlink 文件（`repository.c:3259`，读源码 + 实测双确认）。
   3. `set_workdir(<用户工作区>, false)` 让当前句柄生效；之后重新 `Repository::open(git_dir)` 靠第 2 步的 config 恢复 work tree。
   4. 钉住配置以隔绝开发者机器：`core.autocrlf=false`、`core.excludesFile=<不存在的路径>`（否则用户的全局 excludes 会悄悄缩小快照范围）、`core.fsmonitor=false`、`user.name/email`。测试里的 `harden()` 就是这份清单，实现照抄。
-- **不变量 6 已实测**：快照 + 恢复全程，用户仓库的 HEAD、分支、refs、`.git/index` mtime、`.git` 目录条目全部不变，且工作区里不会出现 `.git`（`invariant_shadow_git_never_touches_user_repo`、`no_gitlink_is_planted_in_the_user_workspace`）。启动时仍要断言影子 git-dir ≠ 用户任何 `.git`（含向上查找）。
+- **不变量 6 已实测**：快照 + 恢复全程，用户仓库的 HEAD、分支、refs、`.git/index` mtime、`.git` 目录条目全部不变，且工作区里不会出现 `.git`（`invariant_shadow_git_never_touches_user_repo`、`invariant_no_gitlink_is_planted_in_the_user_workspace`）。**Phase 1 把这三条 `invariant_` 测试从 spike 的私有 `Sandbox` 迁到了 `tests/checkpoint.rs`，跑真的 `CheckpointStore`**（名字未变；spike 只留 libgit2 后端事实）。启动断言落在 `open()`：`assert_disjoint` 拒四种重叠——影子 git-dir 就是用户 `.git`、在它内部、在工作区内部（那会把自己快照进去并每次变大）、工作区在它内部；另外每次打开都校验仓库自己记的 `hatchery.workspace`，所以「拿别人的 git dir」也是报错。
 - **读用户仓库是安全的**：libgit2 的 `statuses()` 实测**不会**重写用户的 `.git/index`（CLI 的 `git status` 会）。prompt 的 environment 节（platform.md §2.1）因此可以直接读分支/脏状态，不再需要「禁用 status」那类脆弱纪律。
-- **忽略规则是 per-handle 的**：`add_ignore_rule` 只作用于当前 `Repository` 句柄（实测：临时句柄上加的规则对下一次打开无效）。`CheckpointStore` 每次打开都要按配置重放规则；`.git/` 恒在规则里；大文件（默认 >10MB）与构建产物走配置化排除，且**排除不等于删除**（实测文件本身保留）。
-- **restore 语义（实测）**：`reset(Hard)` 会回滚已跟踪文件、并删除「被后续快照跟踪过的新文件」，但**不会**删除从未被任何快照跟踪的文件；给它传 `remove_untracked` 也无效（hard reset 的 checkout 只覆盖与目标有差异的路径）。所以 `purge_untracked=true` 要额外走一遍 `checkout_index(None, force().remove_untracked(true))`，且**不加 `remove_ignored`**（否则会删构建产物与用户的 `.env`）。默认 `false`：rewind 永不删用户自己的未跟踪文件；开启需审批 + 二次确认 + 先列出待删清单。
-- restore 前先 snapshot 当前状态（回滚也可回滚）。
+- **忽略规则是 per-handle 的**：`add_ignore_rule` 只作用于当前 `Repository` 句柄（实测：临时句柄上加的规则对下一次打开无效）。`CheckpointStore` 每次打开都要按配置重放规则；`.git/` 恒在规则里；大文件（默认 >10MB）走 `max_file_bytes` 排除、由 `Index::add_all` 的回调逐个 stat 决定，**排除不等于删除**（实测文件本身保留），被排除的路径通过 `SnapshotReport.oversized` 回报并由 daemon 记日志——ADR-0006 那句「跳过快照并记录」的「记录」就是这个。
+- **影子仓库尊重工作区自己的 `.gitignore`（Phase 1 实测，非显然）**：即便它是 bare + 外部 work tree + `core.excludesFile` 指向一个不存在的路径，libgit2 仍会读 work tree 里的 `.gitignore`。所以 git 工作区的 `target/` 天然不入快照，**不需要我们自造一份构建产物排除表**；`checkpoints.ignore_rules` 是给非 git 工作区用的。测试 `a_workspace_gitignore_is_honoured_by_the_shadow_repository` 两面都钉（有 `.gitignore` 与没有）。
+- **restore 语义（实测）**：`reset(Hard)` 会回滚已跟踪文件、并删除「被后续快照跟踪过的新文件」，但**不会**删除从未被任何快照跟踪的文件；给它传 `remove_untracked` 也无效（hard reset 的 checkout 只覆盖与目标有差异的路径）。所以 `purge_untracked=true` 要额外走一遍 `checkout_index(None, force().remove_untracked(true))`，且**不加 `remove_ignored`**（否则会删构建产物与用户的 `.env`）。默认 `false`：rewind 永不删用户自己的未跟踪文件；开启需审批 + 二次确认 + 先列出待删清单——那份清单就是 `untracked()`，它读的是 `include_ignored=false` 的 status 列表，所以 `.git/` 与构建产物**结构上**就不可能出现在里面（有测试）。
+- **restore 前的安全快照有两条反直觉的约束**（Phase 1 实测，两条都是测试跑红才发现的）：它**不能移动 HEAD**，也**不能留下已 stage 的 index**。原因是 `reset(Hard)` 按 index 决定删什么——安全快照把整个工作区 stage 进去之后，「从未被任何快照跟踪」的用户文件看起来就是已跟踪的，于是每次 rewind 都变成一次 purge，正是上一条默认 `false` 要防的事。实现：`commit_snapshot(.., update_head: false)`（提交对象不挂 ref，靠对象库 + `checkpoints` 行仍可寻址；libgit2 不做对象 GC，所以它不会自己消失）+ 快照后把 index 读回 HEAD 的树。变异验证过。
 - 用户工作区不是 git 仓库时一切照常（实测通过）——影子仓库不依赖用户仓库存在。
-- 预算核算：`revwalk` 数快照数，影子 git-dir 占用直接遍历目录求和（实测 5 次快照仅 3457 B，因为 libgit2 不铺 hooks/模板）；GC 与熔断逻辑 M2。
-- 性能（实测，Linux x86_64 / 24 核）：500 文件冷快照 48.9 ms、10 处改动的热快照 6.0 ms、硬恢复 2.8 ms。热路径（每次写前打点）是常态，比 CLI 后端快约 2 倍。
+- **`delta.flags()` 的 `BINARY` 位只在 `Patch::from_diff` 之后才有**（Phase 1 实测：之前是 `DiffFlags(0x0)`，之后是 `DiffFlags(BINARY)`）。libgit2 要加载内容才判定二进制，所以 diff 的实现必须**先建 patch 再读 flags**；顺序反了会把每个二进制文件报成「文本文件、零 hunk」。
+- 预算核算：`revwalk` 数快照数（**从 HEAD 可达的**——restore 之后目标之后的那些仍在对象库里、仍被 item 指着，但已不在这条链上，所以预算量的是 `bytes()` 而不是 `count()`），影子 git-dir 占用直接遍历目录求和（实测 5 次快照仅 3457 B，因为 libgit2 不铺 hooks/模板）。
+- 性能（实测，Linux x86_64 / 24 核）：500 文件冷快照 48.9 ms、10 处改动的热快照 6.0 ms、硬恢复 2.8 ms。热路径（每次写前打点）是常态，比 CLI 后端快约 2 倍。**48.9 ms 足以停住一个 runtime worker**，所以 `CheckpointStore` 的每个操作都经 `spawn_blocking`——与 `LocalFs` 用 `tokio::fs` 是同一个理由。
+- **树未变则不新建提交**：`snapshot` 发现新树与 HEAD 的树相同就复用 HEAD 的 commit id。写同样两遍字节不是一个新状态，而写循环否则会堆出大量空提交，让每个预算计数都得先解释一遍。
 
-### 检查点如何成为 item（D13）
+### 检查点如何成为 item（D13，Phase 1 落地）
 
-链路：**`ToolCtx` 带一个检查点收集器** → `LocalFs` 在每次写之前 snapshot 并 push 进去 → **`ToolInvocation` 把收集到的 `Vec<Checkpoint>` 带出工具调用** → **kernel 在 ToolResult item 之前追加 Checkpoint item** → daemon 的 HubSink 在 Checkpoint item 落库之后补写 `checkpoints` 行。
+链路：**kernel 造一个 `CheckpointCollector` 借给 `ToolHost::invoke`** → 注册表把 `Backends.fs` 包进 `CheckpointedFs`（装饰器），它在每次写之前 `Checkpointer::pre_write()` 并 push 进收集器 → **kernel 在 ToolResult item 之前追加 Checkpoint item** → daemon 的 HubSink 在 Checkpoint item 落库之后补写 `checkpoints` 行。
 
-三个设计理由：
+三个设计理由（原样成立）：
 
 - 追加位置由 kernel 负责而不是 daemon：kernel 本来就在造 ToolCall/ToolResult item，用同一套机器，顺序天然正确，链变成 `… → ToolCall → Checkpoint → ToolResult`。
 - 这个顺序**安全**，因为工具结果靠 `ToolResult.call` 与调用配对，**不靠父子关系**——在两者之间插 item 不会拆散配对。
 - `checkpoints` 行写失败**只记日志**：commit_id 已由 item 自己携带（`ItemKind::Checkpoint { commit_id, kind }`），行只是索引，丢了可以从 item 重建。
+
+**两处与草图不同**，都是实现时发现的：
+
+1. **收集器不在 `ToolCtx` 上，而在 `ToolHost::invoke` 的参数里**。原写法「`ToolInvocation` 把 `Vec<Checkpoint>` 带出工具调用」在**取消路径上会丢掉它们**：kernel 的工具 select 是 cancel-first，被中断的 invocation 直接 drop 且不再被 poll（这条事实本来就写在 testkit 假 host 的注释里，它为此专门写了 drop guard）。后果是具体的——取消的 `write_file` 留下半截文件而没有任何 item 指向它的 undo 点，Code rewind 向后扫会跳过它、恢复出**包含损坏**的状态。借进去的收集器由 kernel 拥有，所以完成/失败/中断三条出口都能 drain。工具也不需要看见它：`ToolCtx` 的原则是「没有字段就没有能力」。
+2. **打点是 `FsBackend` 的装饰器（`CheckpointedFs`），不是 `LocalFs` 的字段**。三条理由：local backend 保持「只是个文件系统」；收集器天然按**调用**划分而不是按会话，两个调用永不混检查点；任何 backend 都能被包住，包括 `MemoryFs`——testing.md 要的「写序列 vs 检查点记录对齐」因此有得测。接缝外看，行为与「`LocalFs` 写前打检查点」一模一样。
+
+`Checkpointer` 是 trait 而不是直接用 `CheckpointStore`：「要不要打点」是需要 `checkpoints` 表的策略（D9 的预算阶梯），而那张表在同层的另一个 crate 里，所以 trait 的实现住在 daemon，capabilities 只认接口。它有两个成功分支——`Taken(checkpoint)` 与 `Skipped { reason }`——因为「没有检查点」有时是**决定**而不是失败（D9 的第③档），把两者混成一个 `Result::Err` 会让「跳过但照样写」表达不出来。
+
+**写路径自己需要一条解析规则**：`resolve` 靠 `canonicalize`，对「还不存在的文件」必然失败。`resolve_write` 锚定**最近的可解析祖先**再往下拼，所以 `create_dir_all` 不会在符号链接祖先的另一侧建目录（`link/` 指向 `/etc` 时写 `link/deeper/x` 会先建 `/etc/deeper`）；目标本身若已存在则整体 canonicalize，**悬空符号链接被拒**——穿过去写会在链接目标处创建文件，落在工作区外、也落在所有检查点之外。两条都有测试。
 
 ### rewind 如何定位 commit（更正）
 

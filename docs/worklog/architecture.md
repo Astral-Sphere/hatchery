@@ -37,6 +37,12 @@
 
 ## 变更日志
 
+### 2026-10-08 · M2 Phase 1 顺带对账：七个 crate README 的层号还是 M0b 之前的
+
+§3 的层号在 M0b 那次「protocol 沉淀为唯一最底层、其余各层顺次 +1」之后变过，但 crate README 结尾那行 `Workspace layer **LN**` 没跟着改，于是 10 个里有 7 个是错的（kernel L0→**L1**、llm/store/capabilities L1→**L2**、tools/acp L2→**L3**、daemon L3→**L4**；protocol 的 L0 与 cli/gui 的 D 本来就对）。Phase 0 那轮 README 对账改的是**内容声称**（工具数量、检查点是否已存在），没核这一行——它看起来像元数据，其实同样是会被引用的事实：读者据此判断「这个 crate 能不能依赖那个 crate」。已全部改正，与 §3 的图逐项核对。
+
+同一轮里另修两处 README 的过期声称：`hatchery-llm` 写着「Chat Completions and Responses wires」，而 `wire = "responses"` 在 `provider.rs:92` 是 fatal 拒绝（Responses adapter 是 M2 后面的阶段）；`hatchery-tools` 写着 ban list「still has a `tokio::fs` / `tokio::process` hole, which M2 Phase 0 closes」，而 Phase 0 的结论是 `tokio::fs` 已补、`tokio::process` **故意不补**（没有 crate 开那个 feature，clippy 会回 "does not refer to a reachable function"，理由记在 `clippy.toml` 头部）。
+
 ### 2026-10-07 · M2 Phase 0：两处门禁口径不实已修，两条不变量的口径已更正
 
 本日勘察记下的两处「门禁说自己跑了其实没跑」都修掉了：① `--profile invariants` 现在真有步骤（`scripts/ci.sh` 的 `invariants` 步），五条映射到不变量却缺前缀的测试已改名，改完逐条核对该 profile 的选中集合并全绿；② `check_i18n` 从「返回成功的空操作」变成脚本末尾一行明示未设门禁，`--help` 的步骤表照实写。细节见 worklog/testing.md。

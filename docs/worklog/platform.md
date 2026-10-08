@@ -67,6 +67,12 @@
 
 ## 变更日志
 
+### 2026-10-08 · `cargo xtask coverage` 在报告步骤上根本跑不完
+
+先前就存在的问题，Phase 1 要读覆盖率读数时才撞上：xtask 把 JSON 报告路径写死成 `target/llvm-cov/coverage.json`，而 cargo-llvm-cov 的插桩构建树叫 **`target/llvm-cov-target/`**——`target/llvm-cov/` 从来不存在，而 `--output-path` **不创建父目录**。于是整个覆盖率门禁在**跑完全部插桩测试之后**才失败，报一句 `failed to create file ... No such file or directory`，看起来像覆盖率问题、其实是缺一个 `mkdir`。修法是把路径构造提成 `report_path_under(base)` 并先 `create_dir_all`；收 base 作参数是为了可测（否则单测会在真 target 目录里留东西），测试用 `temp_dir` + pid 自己清干净。
+
+它属 xtask 的范围（「与本仓库自身相关的检查」），不是 CI 平台运维。
+
 ### 2026-10-07 · M2 重新规划对账
 
 roadmap 的 M2 段被一次全仓库勘察重写（Phase 0–8 + 决策点 D8–D18），本方向按它重新对账。三件事：

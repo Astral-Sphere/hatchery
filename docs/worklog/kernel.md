@@ -36,6 +36,16 @@
 
 ## 变更日志
 
+### 2026-10-08 · M2 Phase 1：`CheckpointCollector` 与 D13 的一处机制修正
+
+`ToolHost::invoke` 多一个参数 `checkpoints: CheckpointCollector`；`run_call` 在派工具之前造一个收集器，三条出口（完成、失败、**中断**）都调 `append_checkpoints` 把它 drain 成 `ItemKind::Checkpoint` item，位置在 ToolCall 之后、ToolResult 之前。`ToolInvocation` 本身**没有**多出字段。
+
+**这是对 D13 原写法的一处修正，不是补充**。原写法是「`ToolInvocation` 带出 `Vec<Checkpoint>`」，它在取消路径上会丢掉检查点：kernel 的工具 select 是 cancel-first，`ToolStep::Cancelled` 直接返回 `ToolRun::Interrupted`，**invoke future 被 drop 且不再被 poll**——这条事实本来就写在 testkit 假 host 的注释里（它为此专门写了 drop guard 才能观察到取消）。工具已经写进用户工作区的字节不会跟着 future 一起消失，所以要带走的东西必须由 kernel 持有。后果是具体的：取消的 `write_file` 留下半截文件、却没有任何 item 指向它的 undo 点，Code rewind 向后扫会跳过它、恢复出**包含损坏**的状态。收集器借进去、kernel 拥有，就与「调用有没有返回」无关了。
+
+顺带的好处是 `ToolCtx` 不必长出这个字段——它的原则是「没有字段就没有能力」，而工具既不需要、也不应该能伪造检查点。
+
+三条新测试：`an_interrupted_call_keeps_the_checkpoints_it_already_took`（**变异验证过**：摘掉中断分支的 `append_checkpoints`，该测试立刻红在「its undo point survives the interrupt」）、`a_call_that_wrote_records_its_checkpoints_before_its_result`（钉顺序与 commit id 的先后）、`a_call_that_collected_nothing_records_no_checkpoint_item`（对照：只读调用不产生 item，否则前两条可能因为「每个调用都莫名产生一个检查点」而假绿）。testkit 侧新增 `ScriptedToolHost::checkpointing(name, commits)`，在 **gate 之前**push——真实的前写检查点就是从尝试写的那一刻起存在的，而那正是中断落进的窗口。kernel 55 条测试全绿，覆盖率 95.6%。
+
 ### 2026-10-07 · D19：`TurnInput` 带上 per-turn 旋钮
 
 `AgentCommand::TurnInput` 多一个 `options: Option<ChatOptions>`（新构造器 `prompt_with_options`，`prompt` 与 `prompt_with_turn` 传 `None`，既有调用点与测试一行未改）。`turn_body` 里那个「每轮构建一次」的 options 变成 `ChatOptions { tool_defs: snapshot, ..turn_options.unwrap_or_else(|| self.options.clone()) }`。

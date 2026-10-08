@@ -92,6 +92,21 @@
 
 ## 变更日志
 
+### 2026-10-08 · M2 Phase 1：testkit 补齐 + 一条断言手法被实测证伪
+
+**交付的前置**（§2「M2 还缺的四件前置」现在剩三件）：
+
+- `TempWorkspace::git()`——脏用户仓库（一次提交 + 已 stage + 未 stage + 未跟踪），与 spike 的 `make_user_repo` 逐项对齐；`file`/`dir` 链式树 DSL、`stage`/`commit`/`repo`/`repo_state`。testkit 因此多了 `git2` 依赖（它是 dev-only crate，产品的锁文件不受影响）。
+- `UserRepoState` / `user_repo_state(path)` 搬进 testkit：**不变量 6 的测试与 spike 必须度量同一组字段**，两边各写一套就会各自腐烂（spike 那份已删）。
+- `MemoryFs::write_text_file`，并且**根目录恒存在**（`MemoryTree::default()` 里放一个空串条目）。
+- `ScriptedToolHost::checkpointing(name, commits)`：在 **gate 之前**push，所以带 gate 的测试能断言「中断发生时收集器里已经有什么」。
+
+**一条断言手法被实测证伪**：§3.5 原来写「cancel 后无孤儿进程（`kill -0` 断言）」。PTY 探针实测（`spikes/pty/measured-linux.txt`）：**被杀但未被 reap 的进程仍然回答 `kill(pid, 0)` = ALIVE**，`/proc/<pid>/stat` 的状态是 `Z`。所以只靠 `kill -0` 的测试会在一张全是僵尸的进程表上通过——它证明的是「进程不在了」而不是「进程被回收了」，而 Phase 4 真正要防的是后者（portable-pty 的 unix `Child` 就是 `std::process::Child`，它的 `Drop` 不 reap，所以每次 shell 调用漏一个僵尸）。§3.5 已改成「必须同时 reap（`wait`/`try_wait`）或读进程状态」。这条属于「不改文档就会照着写出假绿测试」的那一类。
+
+**一处测试前提随假件一起改了**：`walk.rs` 的 `a_directory_refusal_is_a_backend_error_not_a_panic` 原来靠「空 `MemoryFs` 没有根条目、所以 `read_dir("")` 报错」来制造一次 backend 拒绝。那是假件的一个 quirk 而不是契约——`LocalFs` 的根是别人递给它的真目录，`read_dir("")` 恒 `Ok`。现在 `MemoryFs` 与 `LocalFs` 对齐（根恒存在），该测试改用一个**会拒绝的假 backend** 测同一条性质，另加 `an_empty_workspace_walks_to_nothing` 钉住新语义。**改的是 fixture，不是断言的意图**：那条性质（walk 的根被拒是 `ToolError::Backend` 而不是 panic）仍然被测，而且现在测的是它本来想测的东西。
+
+**迁移**：三条 `invariant_` 测试从 `spike_shadow_git.rs` 搬到 `checkpoint.rs`，被测对象从 spike 的私有 `Sandbox` 换成转正的 `CheckpointStore`。**名字未变**，所以 §5 的映射表、`invariants` profile 的选中集合、以及 ADR-0012 引的旧名映射都照旧（改名后仍实测过 profile 的选中集合）。全仓库 652 条测试全绿，`./scripts/ci.sh` 八步全绿，`cargo xtask coverage` 全部高于地板（capabilities 88.2/85、daemon 91.2/80、kernel 95.6/85、store 93.6/85、protocol 93.1/80、tools 94.8/85）。
+
 ### 2026-10-07 · live 验收重跑：六项全过，M1 关闭
 
 五项缺陷修完（① 按 D19、②③④⑤ 在 CLI 侧，见 worklog/cli.md）加上「reasoning 默认折叠」的裁决落地后，用同一套隔离世界（`XDG_DATA_HOME`/`XDG_STATE_HOME` 指到 /tmp、tmux 起真 pty、密钥只 `source` 不进 argv）重跑了失败与部分通过的那几项：

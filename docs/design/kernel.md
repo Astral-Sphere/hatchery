@@ -133,13 +133,13 @@ pub trait ToolHost: Send + Sync {
         args: Value,
         cancel: CancellationToken,
         progress: UnboundedSender<ToolProgress>,     // 通道而非回调
+        checkpoints: CheckpointCollector,            // M2 Phase 1（D13）：kernel 的，借给这一次调用
     ) -> Result<ToolInvocation, KernelError>;
 }
 
 pub struct ToolInvocation {
     pub output: ToolOutput,
     pub is_error: bool,
-    pub checkpoints: Vec<Checkpoint>,   // M2 Phase 1（D13）：这次调用写前打的影子 git 检查点
 }
 ```
 
@@ -150,7 +150,9 @@ pub struct ToolInvocation {
 3. **进度走通道而不是 `Arc<dyn Fn>`**：kernel 必须在 await 工具的同时异步转发进度，同步回调做不到；同一个 select 循环也正是「中断能取消工具」的实现方式。工具**返回的那一刻**还排在通道里的进度要先排空再收尾：biased select 先 poll 进度通道、再 poll invoke，所以「一次 poll 内发进度并返回」的工具，它最后那条进度会留在通道里被丢掉（`progress_sent_as_the_tool_finishes_still_reaches_the_sink` 钉住；带 gate 的测试看不见这个窗口）。中断路径不排空——那次调用正要被记成 `Cancelled`，事后再冒出来的进度会描述一件记录上说没做完的事。
 4. **Turn Tool Snapshot**：turn 开始时冻结 `snapshot()`，整轮（包括多轮往返）都用同一份 `tool_defs`；注册表的 `replace()` 是整表原子替换（ADR-0009 纪律 3），进行中的 turn 不受影响。
 
-**检查点为什么由 kernel 提交成 item（M2 Phase 1 · D13）**：`ToolCtx` 带一个收集器，`LocalFs` 在写之前 push，`ToolInvocation` 把收集到的检查点带出来，然后 **kernel 在 ToolResult item 之前追加 Checkpoint item**，链变成 `… → ToolCall → Checkpoint → ToolResult`。kernel 是这件事的正确归属：它已经在造 ToolCall/ToolResult item、用的是同一套提交机器，顺序天然正确。而这个顺序是安全的，因为工具结果靠 `ToolResult.call: ItemId` 与其调用配对、**不靠父子关系**——§7「一次只开一个 item、树保持为链」的纪律不受影响。检查点因此对模型不可见（`ItemKind::is_conversation()` 不含 Checkpoint），却对 rewind 可见（`ItemKind::Checkpoint` 自己带着 `commit_id`，见 storage.md §5）。
+**检查点为什么由 kernel 提交成 item（M2 Phase 1 · D13，已落地）**：kernel 造一个 `CheckpointCollector` **借给** `ToolHost::invoke`，capabilities 的注册表把 backend 包进 `CheckpointedFs`、由它在写之前 push，然后 **kernel 在 ToolResult item 之前追加 Checkpoint item**，链变成 `… → ToolCall → Checkpoint → ToolResult`。kernel 是这件事的正确归属：它已经在造 ToolCall/ToolResult item、用的是同一套提交机器，顺序天然正确。而这个顺序是安全的，因为工具结果靠 `ToolResult.call: ItemId` 与其调用配对、**不靠父子关系**——§7「一次只开一个 item、树保持为链」的纪律不受影响。检查点因此对模型不可见（`ItemKind::is_conversation()` 不含 Checkpoint），却对 rewind 可见（`ItemKind::Checkpoint` 自己带着 `commit_id`，见 storage.md §5）。
+
+**收集器为什么是借进去的，不是 `ToolInvocation` 带出来的**（草图原写法，实现时推翻）：kernel 的工具 select 是 cancel-first，**被中断的 invocation 会直接 drop 且不再被 poll**——这条事实本来就写在 testkit 假 host 的注释里，它为此专门写了 drop guard 才能观察到取消。所以任何「靠返回值带出来」的东西在中断路径上都到不了 kernel，而工具已经写进用户工作区的字节不会跟着消失。后果是具体的：取消的 `write_file` 留下半截文件、却没有任何 item 指向它的 undo 点，Code rewind 向后扫会跳过它、恢复出**包含损坏**的状态。借进去的收集器由 kernel 拥有，所以完成、失败、中断三条出口都能 drain（`append_checkpoints` 在三条路径上都调用）。工具自己也看不见它——`ToolCtx` 的原则是「没有字段就没有能力」，而工具既不需要、也不应该能伪造检查点。测试：`an_interrupted_call_keeps_the_checkpoints_it_already_took`（变异验证过：摘掉中断分支的 drain 立刻红）。
 
 **工具并行：同一 round 的多个 tool call 串行执行，这是设计而不是待优化项**（M2 裁决，原开放问题 1）。输出顺序确定性利于回放只是最表面的理由；真正的原因是把并行做对要重做提交序与确定性纪律，而收益只有延迟。七处结构阻碍记在 worklog/kernel.md 的 2026-10-07 条（item 链的单亲指针 `self.tail`、`AwaitingApproval` 的单槽、命令通道的单消费者、每次 `invoke_tool` 独占的进度通道与 select，加上 `ToolHost` 根本不带 `parallel_safe` 一类的元数据——**决策的输入本身也不存在**）。
 

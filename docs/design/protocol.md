@@ -95,11 +95,28 @@ pub enum StopReason { ModelDone, MaxRounds, MaxTokens, Interrupted }
 
 **`Content` 与 `Message` 的分工**：`Content` 是 wire 与存储的形态；kernel 另有自己的 `Message`（含 role/reasoning/tool_calls），由 daemon 侧的装配器从 item 链构造（kernel.md §6）。
 
-### 2.1 M2 的加性扩展（目标态，尚未实现）
+### 2.1 M2 的加性扩展（① 已于 Phase 1 落地，②③④ 仍是目标态）
 
-四项都是**加字段或加类型**，因此落在 §6「方法/字段只增不改语义」里、major 1 内合法；**没有一项需要新枚举值或新事件 `type`**——那两样在 major 内是冻结的。
+四项都是**加字段或加类型**，因此落在 §6「方法/字段只增不改语义」里、major 1 内合法；**没有一项需要新枚举值或新事件 `type`**——那两样在 major 内是冻结的。（① 落地时另加了一个 id 型 `CheckpointId`，那是加类型不是加枚举值；`checkpoints` 表的主键需要一个自己的把手，因为 GC 要按行删，而 item id 与 commit id 都不能充当它——前者对安全快照不存在，后者属于影子仓库而不属于那条记录。）
 
-**① diff 载荷类型（Phase 1）**。协议今天没有任何 diff 类型（`UnifiedDiff`/`DiffHunk`/`FileDiff` 全仓库零命中），而三处要同一份内容：TUI 的 diff 预览、审批弹层的 preview、M4 GUI 的 diff 视图；`CheckpointStore::diff(from, to)`（capabilities.md §2 的草图）也需要一个**存在的**返回类型。约束是它必须**结构化而不是一个 unified diff 字符串**：前端要按语义给 `+`/`-` 着色并折叠上下文（D11），传字符串等于把解析责任推给每一个前端。字段形状在 Phase 1 与 `CheckpointStore::diff` 一起定稿。
+**① diff 载荷类型（Phase 1，已落地）**。协议今天没有任何 diff 类型（`UnifiedDiff`/`DiffHunk`/`FileDiff` 全仓库零命中），而三处要同一份内容：TUI 的 diff 预览、审批弹层的 preview、M4 GUI 的 diff 视图；`CheckpointStore::diff(from, to)`（capabilities.md §2）也需要一个**存在的**返回类型。约束是它必须**结构化而不是一个 unified diff 字符串**：前端要按语义给 `+`/`-` 着色并折叠上下文（D11），传字符串等于把解析责任推给每一个前端。
+
+落地形状（用户裁决 2026-10-08，`protocol/src/diff.rs`）：
+
+```rust
+pub struct Diff      { pub files: Vec<DiffFile> }
+pub struct DiffFile  { pub path: String, pub old_path: Option<String>, pub status: DiffStatus,
+                       pub binary: bool, pub hunks: Vec<DiffHunk> }
+pub enum  DiffStatus { Added, Deleted, Modified, Renamed, Copied, TypeChanged }   // snake_case
+pub struct DiffHunk  { pub old_start: u32, pub old_lines: u32, pub new_start: u32, pub new_lines: u32,
+                       pub lines: Vec<DiffLine> }
+pub struct DiffLine  { pub kind: DiffLineKind, pub text: String }                 // text 不带 +/- 前缀
+pub enum  DiffLineKind { Context, Added, Removed }                                // snake_case
+```
+
+三条决定值得记下来：**两个生产者共用一个类型**——git2 出的是 hunk（commit → commit），D11 定的 `similar` 出的也是 hunk（旧缓冲 → 新内容，此时还没有 commit），所以检查点 diff 与 write/edit 的预览 diff 不必是两种东西；**`DiffLine.text` 不带标记**，`kind` 已经说了是哪种，两个都带就会互相矛盾，也不带换行（换行由渲染方决定，折行不该继承折点）；**`DiffStatus` 是 `git2::Delta` 去掉三个描述工作树状态的变体**（`Ignored`/`Untracked`/`Conflicted`）——检查点 diff 永远是树对树，预览 diff 里也没有这三个概念。
+
+**没有 golden fixture 钉它，这是对的**：fixture 注册表只覆盖三类（`ItemKind` 载荷、方法结果、事件），`Diff` 一类都不是。第一个返回它的方法（Phase 3 的 rewind，或 `checkpoint_diff` 工具）落地时补 golden；在那之前 serde 拼写由 `diff.rs` 内的单测钉住（含「省略的字段取默认、多出来的字段忽略、未知枚举值拒绝」三向）。**因此 §6 那条「协议加字段会翻动 determinism 门禁」的摩擦本次没有兑现**（roadmap 风险 3）。
 
 **② `ApprovalRequest` 的结构化 preview（Phase 2 · D14）**。`args_digest` 是一行摘要，它自己的文档写着「Not the raw JSON: the user must be able to decide in seconds, and raw arguments can be megabytes」——所以它**装不下** diff，也装不下一条完整命令。裁决是加一个可选字段而不是新开 `approval/details` 方法：M3 的 ACP `session/request_permission` 要把同一份内容放进 `ToolCallContent`，放请求里一次到位，不必为看预览多一次往返。
 
@@ -111,8 +128,10 @@ pub struct ApprovalRequest {
     pub preview: Option<ApprovalPreview>,      // M2 Phase 2（D14）
 }
 
-pub enum ApprovalPreview { Diff(UnifiedDiff), Command { argv: Vec<String>, cwd: PathBuf }, Excerpt(String) }
+pub enum ApprovalPreview { Diff(Diff), Command { argv: Vec<String>, cwd: PathBuf }, Excerpt(String) }
 ```
+
+`Diff` 就是 ① 落地的那个类型——审批预览要的正是「旧缓冲 vs 新内容」的 hunk，而 ① 的形状本来就为两个生产者设计。
 
 **③ 审批规则的 list / delete 方法（Phase 2）**。今天一条已持久化的规则**既看不见也撤不掉**：一条误存的 `DenyAlways` 会永久废掉一个工具，除了直接改数据库没有补救。`approval_rules` 表没有排序列也没有 enabled 列（storage.md §2），所以 scope/matcher/decision 的文法与求值顺序由 **D8** 定义，协议只负责把它们列举出来、删掉。
 
