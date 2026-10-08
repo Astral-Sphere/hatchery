@@ -7,19 +7,23 @@
 //! Reads go through the same actor in M0b. A read pool is M1's work (`docs/worklog/storage.md`).
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 use tokio::sync::{mpsc, oneshot};
 use turso::{Connection, params_from_iter};
 
 use hatchery_protocol::method::{SessionListParams, SessionListResult};
 use hatchery_protocol::{
-    Content, Item, ItemId, ItemKind, Session, SessionId, SessionPatch, Timestamp, TurnId,
+    CheckpointId, Content, Item, ItemId, ItemKind, Session, SessionId, SessionPatch, Timestamp,
+    TurnId,
 };
 
 use crate::error::StoreError;
 use crate::sql::{
-    self, ITEM_COLUMNS, SESSION_COLUMNS, SKELETON_COLUMNS, as_int, as_text, status_text,
+    self, CHECKPOINT_COLUMNS, ITEM_COLUMNS, SESSION_COLUMNS, SKELETON_COLUMNS, as_int, as_text,
+    checkpoint_kind_text, status_text,
 };
+use crate::store::CheckpointRecord;
 use crate::tree::{self, SkeletonRow};
 
 /// How many commands may queue before submitters wait.
@@ -34,6 +38,13 @@ pub const COMMAND_CAPACITY: usize = 1024;
 /// longer than this simply takes several statements. `many_items_rebuild_in_order` covers the
 /// chunk boundary.
 const PAYLOAD_CHUNK: usize = 200;
+
+/// How many ids go into one `IN (...)` list.
+///
+/// The same undocumented parameter limit bounds a delete as a select, and a GC sweep can easily
+/// hand over more ids than that. Chunking keeps the statement shape identical whichever way the
+/// caller batches.
+const ID_CHUNK: usize = PAYLOAD_CHUNK;
 
 /// A reply slot.
 pub type Reply<T> = oneshot::Sender<Result<T, StoreError>>;
@@ -203,6 +214,27 @@ pub enum StoreCmd {
         /// The open turns, keyed by their session.
         reply: Reply<Vec<(SessionId, TurnId)>>,
     },
+    /// Insert one `checkpoints` row.
+    RecordCheckpoint {
+        /// The row. Its session must exist; its item, when it has one, must belong to it.
+        record: CheckpointRecord,
+        /// Done.
+        reply: Reply<()>,
+    },
+    /// Every checkpoint of one workspace, oldest first.
+    CheckpointsForWorkspace {
+        /// Which workspace. Spelled into SQL the way `sessions.workspace` is.
+        workspace: PathBuf,
+        /// The rows.
+        reply: Reply<Vec<CheckpointRecord>>,
+    },
+    /// Delete `checkpoints` rows by id, in one transaction.
+    DeleteCheckpoints {
+        /// Which rows. An id that is not there is not an error — it is a row already gone.
+        ids: Vec<CheckpointId>,
+        /// How many rows actually went away.
+        reply: Reply<u64>,
+    },
     /// Everything a whole-tree export needs, read in one pass: every item oldest-first, and
     /// each item's descendant tips.
     ///
@@ -330,6 +362,15 @@ impl Writer {
                 }
                 StoreCmd::OpenTurns { reply } => {
                     reply_send(reply, self.open_turns().await);
+                }
+                StoreCmd::RecordCheckpoint { record, reply } => {
+                    reply_send(reply, self.record_checkpoint(record).await);
+                }
+                StoreCmd::CheckpointsForWorkspace { workspace, reply } => {
+                    reply_send(reply, self.checkpoints_for_workspace(&workspace).await);
+                }
+                StoreCmd::DeleteCheckpoints { ids, reply } => {
+                    reply_send(reply, self.delete_checkpoints(&ids).await);
                 }
                 StoreCmd::ExportBody { session, reply } => {
                     reply_send(reply, self.export_body(session).await);
@@ -941,6 +982,115 @@ impl Writer {
         Ok(open)
     }
 
+    // ---------------------------------------------------------- checkpoints
+
+    async fn record_checkpoint(&self, record: CheckpointRecord) -> Result<(), StoreError> {
+        // An empty commit id names no commit: the row would look healthy to every reader while
+        // pinning a shadow repository that can never be restored to, and GC would keep paying for
+        // it. That is a caller bug, so it is refused as one rather than stored — a caller mistake
+        // and a storage failure must not reach a frontend looking the same
+        // (`docs/design/storage.md` §3).
+        if record.commit_id.is_empty() {
+            return Err(StoreError::Invalid(
+                "a checkpoint must name the commit it records".to_owned(),
+            ));
+        }
+        // Checked rather than left to the foreign key, for the reason `session_exists` gives.
+        self.session_exists(record.session).await?;
+        // The foreign key on `item_id` proves the item *exists*; it cannot prove the item belongs
+        // to the checkpoint's own session, and a cross-session item would make the row describe a
+        // commit its owner can never reach by walking its chain — the same gap `insert_item`
+        // closes for a cross-session parent.
+        if let Some(item) = record.item {
+            match self.item_session(item).await? {
+                Some(owner) if owner == record.session => {}
+                Some(_) => {
+                    return Err(StoreError::SessionMismatch {
+                        item,
+                        session: record.session,
+                    });
+                }
+                None => return Err(StoreError::ItemNotFound(item)),
+            }
+        }
+        // `item_id` stays NULL when the record has no item: the pre-restore safety snapshot is
+        // recorded precisely so it can be undone, and it must not enter the conversation
+        // (docs/design/storage.md §2).
+        self.conn
+            .execute(
+                "INSERT INTO checkpoints (id, session_id, item_id, workspace, commit_id, kind, \
+                 created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                (
+                    record.id.to_string(),
+                    record.session.to_string(),
+                    record.item.map(|item| item.to_string()),
+                    record.workspace.to_string_lossy().into_owned(),
+                    record.commit_id,
+                    checkpoint_kind_text(record.kind),
+                    record.created_at.as_unix_millis(),
+                ),
+            )
+            .await
+            .map_err(StoreError::database)?;
+        Ok(())
+    }
+
+    async fn checkpoints_for_workspace(
+        &self,
+        workspace: &Path,
+    ) -> Result<Vec<CheckpointRecord>, StoreError> {
+        // `id` breaks `created_at` ties: two snapshots inside one millisecond are ordinary when a
+        // write and a shell command follow each other, and the caller drains this list from the
+        // front to free budget, so an order the engine is free to choose would make GC pick
+        // victims arbitrarily. UUIDv7 ids sort by creation time, which keeps the tiebreak on the
+        // same axis as the primary key rather than merely making the order stable.
+        let sql = format!(
+            "SELECT {CHECKPOINT_COLUMNS} FROM checkpoints WHERE workspace = ?1 \
+             ORDER BY created_at ASC, id ASC"
+        );
+        // Bound with the same lossy spelling `sessions.workspace` is written and read with, so one
+        // path has one text form in this database and a lookup cannot miss rows over a spelling
+        // difference.
+        let rows = self
+            .conn
+            .query(sql, [workspace.to_string_lossy().into_owned()])
+            .await
+            .map_err(StoreError::database)?;
+        sql::collect(rows, |row| sql::read_checkpoint(row, 0)).await
+    }
+
+    async fn delete_checkpoints(&self, ids: &[CheckpointId]) -> Result<u64, StoreError> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        // One transaction for the whole sweep: GC reconciles its own accounting against the count
+        // returned here, and a half-applied batch would hand it a number describing neither its
+        // request nor the table.
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .await
+            .map_err(StoreError::database)?;
+        let mut removed: u64 = 0;
+        for chunk in ids.chunks(ID_CHUNK) {
+            let placeholders = (1..=chunk.len())
+                .map(|index| format!("?{index}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!("DELETE FROM checkpoints WHERE id IN ({placeholders})");
+            let params = params_from_iter(chunk.iter().map(ToString::to_string));
+            // Summed rather than echoed back: `execute` reports the rows that went away, so an id
+            // that was already gone (or listed twice) contributes nothing and the caller's
+            // reconciliation stays honest.
+            removed += tx
+                .execute(sql, params)
+                .await
+                .map_err(StoreError::database)?;
+        }
+        tx.commit().await.map_err(StoreError::database)?;
+        Ok(removed)
+    }
+
     // ------------------------------------------------------------- plumbing
 
     async fn skeleton(&self, session: SessionId) -> Result<Vec<SkeletonRow>, StoreError> {
@@ -1077,7 +1227,7 @@ fn reply_send<T>(reply: Reply<T>, value: Result<T, StoreError>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hatchery_protocol::ItemKindTag;
+    use hatchery_protocol::{CheckpointKind, ItemKindTag};
 
     #[test]
     fn cursors_round_trip() {
@@ -1101,12 +1251,16 @@ mod tests {
 
     #[test]
     fn the_spellings_written_into_sql_are_pinned() {
-        // `items.kind` and `sessions.status` are matched against literals in SQL, so a rename in
-        // the protocol would surface as an empty result set rather than as a compile error.
+        // `items.kind`, `sessions.status` and `checkpoints.kind` are matched against literals in
+        // SQL, so a rename in the protocol would surface as an empty result set rather than as a
+        // compile error.
         assert_eq!(ItemKindTag::UserMessage.as_str(), "user_message");
         assert_eq!(
             status_text(sql::parse_status("idle").expect("known")),
             "idle"
         );
+        assert_eq!(checkpoint_kind_text(CheckpointKind::PreWrite), "pre_write");
+        assert_eq!(checkpoint_kind_text(CheckpointKind::PreShell), "pre_shell");
+        assert_eq!(checkpoint_kind_text(CheckpointKind::Manual), "manual");
     }
 }

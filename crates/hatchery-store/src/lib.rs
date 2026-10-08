@@ -73,5 +73,5 @@ pub use actor::{BranchNode, BranchTree, COMMAND_CAPACITY, StoreCmd, Writer};
 pub use error::StoreError;
 pub use export::{ExportLine, FORMAT_VERSION};
 pub use migrations::{MIGRATIONS, latest_version};
-pub use store::{SessionStore, TursoStore};
+pub use store::{CheckpointRecord, SessionStore, TursoStore};
 pub use tree::{SkeletonRow, TreeError};

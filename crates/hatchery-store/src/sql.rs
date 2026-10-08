@@ -9,11 +9,12 @@ use serde_json::Value as Json;
 use turso::{Connection, Value};
 
 use hatchery_protocol::{
-    Item, ItemId, ItemKind, ItemKindTag, ModelRef, Session, SessionModeId, SessionStatus,
-    Timestamp, TurnId, UnknownItemKind,
+    CheckpointKind, Item, ItemId, ItemKind, ItemKindTag, ModelRef, Session, SessionModeId,
+    SessionStatus, Timestamp, TurnId, UnknownItemKind,
 };
 
 use crate::error::StoreError;
+use crate::store::CheckpointRecord;
 
 /// Columns of `sessions`, in the order the row readers expect.
 pub const SESSION_COLUMNS: &str = "id, title, mode, workspace, model_provider, model_id, \
@@ -21,6 +22,10 @@ pub const SESSION_COLUMNS: &str = "id, title, mode, workspace, model_provider, m
 
 /// Columns of `items`, in the order the row readers expect.
 pub const ITEM_COLUMNS: &str = "id, session_id, parent_id, turn_id, kind, payload, created_at";
+
+/// Columns of `checkpoints`, in the order the row readers expect.
+pub const CHECKPOINT_COLUMNS: &str =
+    "id, session_id, item_id, workspace, commit_id, kind, created_at";
 
 /// Columns of the tree skeleton: everything the tree walk needs, no payload.
 pub const SKELETON_COLUMNS: &str = "id, parent_id, kind, turn_id";
@@ -195,6 +200,41 @@ pub fn read_item(row: &turso::Row, offset: usize) -> Result<Item, StoreError> {
     })
 }
 
+/// Reads a `checkpoints` row.
+pub fn read_checkpoint(row: &turso::Row, offset: usize) -> Result<CheckpointRecord, StoreError> {
+    let id = text(&get(row, offset)?, "checkpoints.id")?
+        .parse()
+        .map_err(|_| StoreError::Database("checkpoints.id is not a uuid".to_owned()))?;
+    let session = text(&get(row, offset + 1)?, "checkpoints.session_id")?
+        .parse()
+        .map_err(|_| StoreError::Database("checkpoints.session_id is not a uuid".to_owned()))?;
+    // NULL is a shape this row can legitimately have — the pre-restore safety snapshot records a
+    // commit and no item — so it is carried out as `None` rather than repaired into one
+    // (docs/design/storage.md §2). The column's nullability is the only thing that keeps that
+    // snapshot out of the conversation history.
+    let item = optional_text(&get(row, offset + 2)?)
+        .map(|id| {
+            id.parse()
+                .map_err(|_| StoreError::Database("checkpoints.item_id is not a uuid".to_owned()))
+        })
+        .transpose()?;
+    let workspace = PathBuf::from(text(&get(row, offset + 3)?, "checkpoints.workspace")?);
+    let commit_id = text(&get(row, offset + 4)?, "checkpoints.commit_id")?;
+    let kind = parse_checkpoint_kind(&text(&get(row, offset + 5)?, "checkpoints.kind")?)?;
+    let created_at =
+        Timestamp::from_unix_millis(integer(&get(row, offset + 6)?, "checkpoints.created_at")?);
+
+    Ok(CheckpointRecord {
+        id,
+        session,
+        item,
+        workspace,
+        commit_id,
+        kind,
+        created_at,
+    })
+}
+
 /// Reads a skeleton row: `id, parent_id, kind, turn_id`.
 pub fn read_skeleton(row: &turso::Row) -> Result<crate::tree::SkeletonRow, StoreError> {
     let id: ItemId = text(&get(row, 0)?, "items.id")?
@@ -247,6 +287,32 @@ pub fn status_text(status: SessionStatus) -> &'static str {
         SessionStatus::Running => "running",
         SessionStatus::WaitingApproval => "waiting_approval",
         SessionStatus::Error => "error",
+    }
+}
+
+/// Parses the `checkpoints.kind` spelling.
+///
+/// Hand-written rather than derived from serde, and pinned against the serde spelling by
+/// `checkpoint_kind_spellings_round_trip`: `CheckpointKind` is the wire form too, so a rename
+/// there would silently orphan every row already written with the old spelling.
+pub fn parse_checkpoint_kind(text: &str) -> Result<CheckpointKind, StoreError> {
+    match text {
+        "pre_write" => Ok(CheckpointKind::PreWrite),
+        "pre_shell" => Ok(CheckpointKind::PreShell),
+        "manual" => Ok(CheckpointKind::Manual),
+        other => Err(StoreError::Database(format!(
+            "checkpoints.kind is not a known kind: {other:?}"
+        ))),
+    }
+}
+
+/// The `checkpoints.kind` spelling.
+#[must_use]
+pub fn checkpoint_kind_text(kind: CheckpointKind) -> &'static str {
+    match kind {
+        CheckpointKind::PreWrite => "pre_write",
+        CheckpointKind::PreShell => "pre_shell",
+        CheckpointKind::Manual => "manual",
     }
 }
 
@@ -333,6 +399,35 @@ mod tests {
         assert!(
             parse_status("sleeping").is_err(),
             "unknown statuses are refused"
+        );
+    }
+
+    #[test]
+    fn checkpoint_kind_spellings_round_trip() {
+        for kind in [
+            CheckpointKind::PreWrite,
+            CheckpointKind::PreShell,
+            CheckpointKind::Manual,
+        ] {
+            assert_eq!(
+                parse_checkpoint_kind(checkpoint_kind_text(kind)).expect("round trip"),
+                kind
+            );
+            // The SQL spelling and the wire spelling are the same spelling. `CheckpointKind`
+            // serialises snake_case, and a serde rename would otherwise leave every row already
+            // on disk unreadable while the two halves of the code each looked consistent.
+            assert_eq!(
+                serde_json::to_string(&kind).expect("serialize"),
+                format!("\"{}\"", checkpoint_kind_text(kind))
+            );
+        }
+        assert!(
+            parse_checkpoint_kind("PreWrite").is_err(),
+            "the CamelCase variant name is not the spelling"
+        );
+        assert!(
+            parse_checkpoint_kind("automatic").is_err(),
+            "unknown kinds are refused rather than guessed"
         );
     }
 

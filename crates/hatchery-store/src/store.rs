@@ -10,7 +10,8 @@ use turso::Builder;
 
 use hatchery_protocol::method::{SessionListParams, SessionListResult};
 use hatchery_protocol::{
-    Content, Item, ItemId, Session, SessionId, SessionPatch, Timestamp, TurnCompletion, TurnId,
+    CheckpointId, CheckpointKind, Content, Item, ItemId, Session, SessionId, SessionPatch,
+    Timestamp, TurnCompletion, TurnId,
 };
 
 use crate::actor::{BranchTree, COMMAND_CAPACITY, Reply, StoreCmd, Writer};
@@ -18,6 +19,43 @@ use crate::error::StoreError;
 use crate::export;
 use crate::migrations;
 use crate::sql;
+
+/// One row of the `checkpoints` table: a shadow-Git commit, and who owns it.
+///
+/// This is **not** the index a rewind reads — the Checkpoint item carries its own `commit_id` and
+/// the chain is what locates it (`docs/design/storage.md` §5). What the row adds is the two things
+/// a chain cannot answer, both about ownership rather than content: which workspace the commit
+/// belongs to, so budget accounting can total commits across sessions that share one working tree,
+/// and which session owns it, so garbage collection can tell a live shadow repository from an
+/// orphaned one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CheckpointRecord {
+    /// Identifies the record. Not the commit id and not the item id: GC needs a handle on the row
+    /// itself, and a row can exist with neither of the other two being meaningful.
+    pub id: CheckpointId,
+    /// The session that owns the commit. Deleting the session deletes this row
+    /// (`ON DELETE CASCADE`), which is what turns "does this shadow repository still have an
+    /// owner?" into a query instead of a guess about the filesystem.
+    pub session: SessionId,
+    /// The item this checkpoint was taken for.
+    ///
+    /// `None` for the pre-restore safety snapshot, which deliberately has no item: it is
+    /// undo-of-undo, not conversation history, and the column is nullable precisely so that
+    /// snapshot can be recorded without inventing an item for it (§2, §5).
+    pub item: Option<ItemId>,
+    /// The workspace the shadow repository covers.
+    ///
+    /// Stored with the same lossy spelling as `sessions.workspace`, so one path has one text form
+    /// in this database and a workspace lookup cannot miss rows over a spelling difference.
+    pub workspace: PathBuf,
+    /// The shadow-Git commit id, as hex text — opaque to this crate, which only has to hand the
+    /// caller back exactly what it stored.
+    pub commit_id: String,
+    /// Why the checkpoint was taken.
+    pub kind: CheckpointKind,
+    /// When it was taken.
+    pub created_at: Timestamp,
+}
 
 /// Everything the daemon may ask of storage.
 ///
@@ -121,6 +159,43 @@ pub trait SessionStore: Send + Sync {
     /// call is deliberate — recovery runs before any runtime exists, so the answer cannot go
     /// stale under it.
     async fn open_turns(&self) -> Result<Vec<(SessionId, TurnId)>, StoreError>;
+
+    /// Records one shadow-Git checkpoint row.
+    ///
+    /// Refuses a session that does not exist, an item that does not exist or belongs to another
+    /// session, and an empty `commit_id` — the "recognise the session before writing" discipline
+    /// `append_item` and `start_turn` already follow, so a caller mistake reaches a frontend as a
+    /// caller mistake instead of as a storage failure (`docs/design/storage.md` §3).
+    ///
+    /// The daemon writes this row *after* the Checkpoint item is stored and logs a failure rather
+    /// than failing the turn: the item already carries the commit id, so a rewind can still find
+    /// it by walking the chain (§5). Losing the row costs budget accounting, not correctness.
+    async fn record_checkpoint(&self, record: CheckpointRecord) -> Result<(), StoreError>;
+
+    /// Every checkpoint of one workspace, oldest first.
+    ///
+    /// Oldest-first because the caller drains from the front when a commit budget is overrun: the
+    /// snapshots furthest from the working tree are the cheapest to lose. `created_at` ties are
+    /// broken by `id`, because the engine promises no row order and a GC that picks victims
+    /// arbitrarily is not a policy.
+    ///
+    /// Deliberately not filtered by session: the list crossing sessions is the point. An empty
+    /// answer after a session delete is the proof that a shadow repository has no owner left
+    /// (`docs/design/storage.md` §2 and its open question 3).
+    async fn checkpoints_for_workspace(
+        &self,
+        workspace: &Path,
+    ) -> Result<Vec<CheckpointRecord>, StoreError>;
+
+    /// Deletes checkpoint rows by id, returning how many rows actually went away.
+    ///
+    /// The count is the engine's, not an echo of the request, so garbage collection can reconcile
+    /// its own accounting against it the way `delete_branch` cross-checks the cascade against its
+    /// tree walk (`docs/design/storage.md` §5). An id that is not there is not an error: to a GC,
+    /// "already gone" and "just removed" are the same answer. The batch is one transaction — all
+    /// of it lands or none does, because a half-applied batch leaves the caller holding a number
+    /// that describes neither its request nor the table.
+    async fn delete_checkpoints(&self, ids: &[CheckpointId]) -> Result<u64, StoreError>;
 
     /// Writes a session out as JSONL, refusing to overwrite an existing file.
     async fn export_jsonl(
@@ -360,6 +435,26 @@ impl SessionStore for TursoStore {
 
     async fn open_turns(&self) -> Result<Vec<(SessionId, TurnId)>, StoreError> {
         self.ask(|reply| StoreCmd::OpenTurns { reply }).await
+    }
+
+    async fn record_checkpoint(&self, record: CheckpointRecord) -> Result<(), StoreError> {
+        self.ask(|reply| StoreCmd::RecordCheckpoint { record, reply })
+            .await
+    }
+
+    async fn checkpoints_for_workspace(
+        &self,
+        workspace: &Path,
+    ) -> Result<Vec<CheckpointRecord>, StoreError> {
+        let workspace = workspace.to_path_buf();
+        self.ask(|reply| StoreCmd::CheckpointsForWorkspace { workspace, reply })
+            .await
+    }
+
+    async fn delete_checkpoints(&self, ids: &[CheckpointId]) -> Result<u64, StoreError> {
+        let ids = ids.to_vec();
+        self.ask(|reply| StoreCmd::DeleteCheckpoints { ids, reply })
+            .await
     }
 
     async fn export_jsonl(

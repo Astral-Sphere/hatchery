@@ -3,13 +3,14 @@
 //! Everything runs against a real database file in a tempdir. The engine's own behaviour is pinned
 //! separately by `spike_engine.rs`; these tests are about what *this* crate does with it.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use hatchery_protocol::{
-    Content, Item, ItemId, ItemKind, ModelRef, Session, SessionId, SessionModeId, SessionPatch,
-    SessionStatus, StopReason, Timestamp, TurnCompletion, TurnId, Usage,
+    CheckpointId, CheckpointKind, Content, Item, ItemId, ItemKind, ModelRef, Session, SessionId,
+    SessionModeId, SessionPatch, SessionStatus, StopReason, Timestamp, TurnCompletion, TurnId,
+    Usage,
 };
-use hatchery_store::{SessionStore, StoreError, TursoStore};
+use hatchery_store::{CheckpointRecord, SessionStore, StoreError, TursoStore};
 
 /// A store in its own tempdir, plus a session to work with.
 struct Fixture {
@@ -109,6 +110,46 @@ async fn next_millisecond() {
     let now = Timestamp::now();
     while Timestamp::now() == now {
         tokio::task::yield_now().await;
+    }
+}
+
+/// A checkpoint row to record, with its `created_at` given rather than read from a clock: the
+/// ordering assertions below have to be about the order the store returns, and two rows recorded a
+/// microsecond apart are not a test of anything.
+fn checkpoint(
+    session: SessionId,
+    item: Option<ItemId>,
+    workspace: &Path,
+    commit_id: &str,
+    kind: CheckpointKind,
+    created_at: i64,
+) -> CheckpointRecord {
+    CheckpointRecord {
+        id: CheckpointId::new(),
+        session,
+        item,
+        workspace: workspace.to_path_buf(),
+        commit_id: commit_id.to_owned(),
+        kind,
+        created_at: Timestamp::from_unix_millis(created_at),
+    }
+}
+
+/// Counts rows behind the store's back, for the assertions that must not trust the store's own
+/// reading of what it wrote.
+async fn count_directly(conn: &turso::Connection, sql: &str) -> i64 {
+    let mut rows = conn.query(sql, ()).await.expect("count");
+    let value = rows
+        .next()
+        .await
+        .expect("count(*) answers")
+        .map(|row| row.get_value(0))
+        .expect("with a row")
+        .expect("with a value");
+    while rows.next().await.expect("drain").is_some() {}
+    match value {
+        turso::Value::Integer(count) => count,
+        other => panic!("count(*) is not an integer: {other:?}"),
     }
 }
 
@@ -1011,6 +1052,586 @@ async fn a_turn_in_a_missing_session_says_the_session_is_missing() {
             .expect_err("there is no such session"),
         StoreError::SessionNotFound(gone),
         "and finishing names the session, not a turn that was never started"
+    );
+}
+
+// --------------------------------------------------------------- checkpoints
+
+#[tokio::test]
+async fn a_recorded_checkpoint_reads_back_identically() {
+    let (fixture, session) = Fixture::with_session().await;
+    let item = say(&fixture.store, &session, "before the write", None).await;
+    let workspace = PathBuf::from("/ws/one");
+
+    let with_item = checkpoint(
+        session.id,
+        Some(item.id),
+        &workspace,
+        "aaa111",
+        CheckpointKind::PreWrite,
+        1_000,
+    );
+    let without_item = checkpoint(
+        session.id,
+        None,
+        &workspace,
+        "bbb222",
+        CheckpointKind::PreShell,
+        2_000,
+    );
+    fixture
+        .store
+        .record_checkpoint(with_item.clone())
+        .await
+        .expect("record");
+    fixture
+        .store
+        .record_checkpoint(without_item.clone())
+        .await
+        .expect("record");
+
+    let rows = fixture
+        .store
+        .checkpoints_for_workspace(&workspace)
+        .await
+        .expect("read back");
+    let itemless = without_item.id;
+    assert_eq!(
+        rows,
+        vec![with_item, without_item],
+        "every field, as written"
+    );
+
+    // Two things the read-back cannot show, so they are read out of the engine directly: the
+    // itemless row really is NULL (the pre-restore safety snapshot must not acquire an item, or it
+    // would enter the conversation it is deliberately outside of — storage.md §2), and `kind`
+    // lands with the schema's own spelling.
+    let conn = open_directly(&fixture.path).await;
+    let mut rows = conn
+        .query(
+            "SELECT item_id, kind FROM checkpoints WHERE id = ?1",
+            [itemless.to_string()],
+        )
+        .await
+        .expect("query");
+    let stored = rows
+        .next()
+        .await
+        .expect("the row")
+        .map(|row| (row.get_value(0), row.get_value(1)))
+        .expect("the safety snapshot is in the table");
+    while rows.next().await.expect("drain").is_some() {}
+    match stored {
+        (Ok(value), Ok(kind)) => {
+            assert!(
+                matches!(value, turso::Value::Null),
+                "the item column must be NULL, not an invented item: {value:?}"
+            );
+            match kind {
+                turso::Value::Text(text) => {
+                    assert_eq!(text.as_str(), "pre_shell", "the spelling the schema uses")
+                }
+                other => panic!("kind is not text: {other:?}"),
+            }
+        }
+        (left, right) => panic!("the columns could not be read: {left:?} {right:?}"),
+    }
+}
+
+#[tokio::test]
+async fn checkpoints_come_back_oldest_first_and_only_for_their_workspace() {
+    let (fixture, session) = Fixture::with_session().await;
+    let neighbour = fixture.new_session().await;
+    let mine = PathBuf::from("/ws/mine");
+    let theirs = PathBuf::from("/ws/theirs");
+
+    // Written newest-first on purpose: the order must come from `created_at`, not from the order
+    // the rows happened to be inserted in. Oldest-first is what lets a budget overrun drain from
+    // the front.
+    let newest = checkpoint(
+        session.id,
+        None,
+        &mine,
+        "c3",
+        CheckpointKind::PreShell,
+        3_000,
+    );
+    let oldest = checkpoint(
+        session.id,
+        None,
+        &mine,
+        "c1",
+        CheckpointKind::PreWrite,
+        1_000,
+    );
+    let between = checkpoint(
+        neighbour.id,
+        None,
+        &mine,
+        "c2",
+        CheckpointKind::Manual,
+        2_000,
+    );
+    let elsewhere = checkpoint(
+        session.id,
+        None,
+        &theirs,
+        "x1",
+        CheckpointKind::PreWrite,
+        1_500,
+    );
+    for record in [&newest, &oldest, &between, &elsewhere] {
+        fixture
+            .store
+            .record_checkpoint(record.clone())
+            .await
+            .expect("record");
+    }
+
+    let rows = fixture
+        .store
+        .checkpoints_for_workspace(&mine)
+        .await
+        .expect("read");
+    assert_eq!(
+        rows.iter()
+            .map(|row| row.commit_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["c1", "c2", "c3"]
+    );
+    // Crossing sessions is the point, not an omission: "does this shadow repository still have an
+    // owner?" is asked per workspace, and answering it needs every session's rows (storage.md §2).
+    assert_eq!(
+        rows.iter().map(|row| row.session).collect::<Vec<_>>(),
+        vec![session.id, neighbour.id, session.id]
+    );
+
+    assert_eq!(
+        fixture
+            .store
+            .checkpoints_for_workspace(&theirs)
+            .await
+            .expect("read"),
+        vec![elsewhere],
+        "another workspace's rows stay out of it"
+    );
+    let unseen = PathBuf::from("/ws/unseen");
+    assert!(
+        fixture
+            .store
+            .checkpoints_for_workspace(&unseen)
+            .await
+            .expect("an unknown workspace is not an error")
+            .is_empty(),
+        "a workspace nothing was ever recorded for has no checkpoints"
+    );
+}
+
+#[tokio::test]
+async fn checkpoints_sharing_a_millisecond_keep_a_deterministic_order() {
+    // The engine promises no row order, and GC drains this list from the front, so the tiebreak is
+    // part of the contract rather than an accident of storage: equal `created_at` sorts by `id`.
+    let (fixture, session) = Fixture::with_session().await;
+    let workspace = PathBuf::from("/ws/ties");
+    let mut records: Vec<CheckpointRecord> = (0..5)
+        .map(|index| {
+            checkpoint(
+                session.id,
+                None,
+                &workspace,
+                &format!("c{index}"),
+                CheckpointKind::PreWrite,
+                4_242,
+            )
+        })
+        .collect();
+    assert!(
+        records.windows(2).all(|pair| pair[0].id < pair[1].id),
+        "UUIDv7 ids ascend, which is what makes `id` a creation-order tiebreak"
+    );
+
+    // Inserted newest-id-first, so insertion order is the *reverse* of the answer: an
+    // implementation that leaves the order to the engine returns these and fails.
+    for record in records.iter().rev() {
+        fixture
+            .store
+            .record_checkpoint(record.clone())
+            .await
+            .expect("record");
+    }
+
+    let rows = fixture
+        .store
+        .checkpoints_for_workspace(&workspace)
+        .await
+        .expect("read");
+    assert_eq!(rows, records, "tied rows come back by id, oldest first");
+    assert_eq!(
+        fixture
+            .store
+            .checkpoints_for_workspace(&workspace)
+            .await
+            .expect("read again"),
+        rows,
+        "and the same way every time"
+    );
+    records.reverse();
+    assert_ne!(
+        rows, records,
+        "the assertion above is about the tiebreak, not about insertion order"
+    );
+}
+
+#[tokio::test]
+async fn delete_checkpoints_reports_how_many_rows_went_away() {
+    let (fixture, session) = Fixture::with_session().await;
+    let workspace = PathBuf::from("/ws/gc");
+    let kept = checkpoint(
+        session.id,
+        None,
+        &workspace,
+        "keep",
+        CheckpointKind::Manual,
+        1_000,
+    );
+    let first = checkpoint(
+        session.id,
+        None,
+        &workspace,
+        "one",
+        CheckpointKind::PreWrite,
+        2_000,
+    );
+    let second = checkpoint(
+        session.id,
+        None,
+        &workspace,
+        "two",
+        CheckpointKind::PreShell,
+        3_000,
+    );
+    for record in [&kept, &first, &second] {
+        fixture
+            .store
+            .record_checkpoint(record.clone())
+            .await
+            .expect("record");
+    }
+
+    // Two rows that are there, one that never was, and one listed twice. The count is the
+    // engine's, not an echo of the request, so the caller can reconcile its own accounting against
+    // it the way `delete_branch` cross-checks its walk (storage.md §5).
+    let removed = fixture
+        .store
+        .delete_checkpoints(&[first.id, second.id, CheckpointId::new(), first.id])
+        .await
+        .expect("delete");
+    assert_eq!(removed, 2, "only rows that existed can go away");
+    assert_eq!(
+        fixture
+            .store
+            .checkpoints_for_workspace(&workspace)
+            .await
+            .expect("read"),
+        vec![kept.clone()]
+    );
+
+    assert_eq!(
+        fixture
+            .store
+            .delete_checkpoints(&[first.id])
+            .await
+            .expect("an id that is not there is not an error"),
+        0,
+        "already gone reads as nothing removed"
+    );
+    assert_eq!(
+        fixture
+            .store
+            .delete_checkpoints(&[])
+            .await
+            .expect("nothing to do"),
+        0
+    );
+    assert_eq!(
+        fixture
+            .store
+            .checkpoints_for_workspace(&workspace)
+            .await
+            .expect("read"),
+        vec![kept],
+        "and the surviving row is untouched"
+    );
+}
+
+#[tokio::test]
+async fn deleting_a_session_takes_its_checkpoints_with_it() {
+    // The cascade is what makes an orphaned shadow repository decidable: once the last session on
+    // a workspace is gone, `WHERE workspace = X` comes back empty, and that empty answer — not a
+    // guess made by walking the filesystem — is the permission to GC (storage.md §2, open
+    // question 3). Two sessions share the workspace so the surviving half is visible.
+    let fixture = Fixture::new().await;
+    let workspace = PathBuf::from("/ws/shared");
+    let doomed = fixture.new_session().await;
+    let survivor = fixture.new_session().await;
+    let goes_with_it = checkpoint(
+        doomed.id,
+        None,
+        &workspace,
+        "aaa",
+        CheckpointKind::PreWrite,
+        1_000,
+    );
+    let stays = checkpoint(
+        survivor.id,
+        None,
+        &workspace,
+        "bbb",
+        CheckpointKind::PreWrite,
+        2_000,
+    );
+    for record in [&goes_with_it, &stays] {
+        fixture
+            .store
+            .record_checkpoint(record.clone())
+            .await
+            .expect("record");
+    }
+
+    fixture
+        .store
+        .delete_session(doomed.id)
+        .await
+        .expect("delete");
+    assert_eq!(
+        fixture
+            .store
+            .checkpoints_for_workspace(&workspace)
+            .await
+            .expect("read"),
+        vec![stays],
+        "the surviving session is still an owner, so the repository is not an orphan yet"
+    );
+
+    fixture
+        .store
+        .delete_session(survivor.id)
+        .await
+        .expect("delete");
+    assert!(
+        fixture
+            .store
+            .checkpoints_for_workspace(&workspace)
+            .await
+            .expect("read")
+            .is_empty(),
+        "no owner left: this is the answer GC waits for"
+    );
+    let conn = open_directly(&fixture.path).await;
+    assert_eq!(
+        count_directly(&conn, "SELECT count(*) FROM checkpoints").await,
+        0,
+        "and the engine agrees, read behind the store's back"
+    );
+}
+
+#[tokio::test]
+async fn deleting_a_branch_takes_its_checkpoint_rows_with_it() {
+    // `item_id` cascades too, and this is the other GC signal: the row going away means no
+    // conversation points at that commit any more. The commit object itself does not disappear
+    // with it — driving the git-side collection is the caller's job (storage.md §5).
+    let (fixture, session) = Fixture::with_session().await;
+    let workspace = PathBuf::from("/ws/branch");
+    let root = say(&fixture.store, &session, "root", None).await;
+    let doomed = say(&fixture.store, &session, "doomed", Some(root.id)).await;
+    let goes_with_it = checkpoint(
+        session.id,
+        Some(doomed.id),
+        &workspace,
+        "aaa",
+        CheckpointKind::PreWrite,
+        1_000,
+    );
+    let stays = checkpoint(
+        session.id,
+        Some(root.id),
+        &workspace,
+        "bbb",
+        CheckpointKind::PreWrite,
+        2_000,
+    );
+    for record in [&goes_with_it, &stays] {
+        fixture
+            .store
+            .record_checkpoint(record.clone())
+            .await
+            .expect("record");
+    }
+
+    // The head must be outside the subtree being deleted, so fork it off the root first.
+    fixture
+        .store
+        .edit_fork(session.id, root.id, Content::text("root, said better"))
+        .await
+        .expect("fork");
+    assert_eq!(
+        fixture
+            .store
+            .delete_branch(session.id, doomed.id)
+            .await
+            .expect("delete the branch"),
+        1
+    );
+
+    assert_eq!(
+        fixture
+            .store
+            .checkpoints_for_workspace(&workspace)
+            .await
+            .expect("read"),
+        vec![stays],
+        "the deleted item took its checkpoint row with it"
+    );
+}
+
+#[tokio::test]
+async fn recording_a_checkpoint_in_a_missing_session_says_the_session_is_missing() {
+    // Left to the foreign key, this surfaces as the engine's own message, which `to_event_error`
+    // maps to a storage failure. A session deleted underneath the caller is a caller error, and
+    // the two must not reach a frontend looking the same (storage.md §1, §3).
+    let fixture = Fixture::new().await;
+    let gone = SessionId::new();
+    let workspace = PathBuf::from("/ws/nobody");
+
+    let error = fixture
+        .store
+        .record_checkpoint(checkpoint(
+            gone,
+            None,
+            &workspace,
+            "aaa",
+            CheckpointKind::PreWrite,
+            1_000,
+        ))
+        .await
+        .expect_err("there is no such session");
+    assert_eq!(error, StoreError::SessionNotFound(gone));
+    assert_eq!(
+        error.to_event_error().code,
+        hatchery_protocol::ErrorCode::SessionNotFound,
+        "so a frontend can tell this apart from a broken disk"
+    );
+    assert!(
+        fixture
+            .store
+            .checkpoints_for_workspace(&workspace)
+            .await
+            .expect("read")
+            .is_empty(),
+        "a refused row does not land"
+    );
+}
+
+#[tokio::test]
+async fn a_checkpoint_item_must_exist_and_belong_to_the_session() {
+    // The foreign key on `item_id` proves the item exists; it cannot prove the item belongs to the
+    // checkpoint's own session, and a cross-session item would leave the row describing a commit
+    // its owner can never reach by walking its chain — the same gap `insert_item` closes for a
+    // cross-session parent (storage.md §5).
+    let (fixture, session) = Fixture::with_session().await;
+    let other = fixture.new_session().await;
+    let foreign = say(&fixture.store, &other, "elsewhere", None).await;
+    let workspace = PathBuf::from("/ws/items");
+
+    let missing = ItemId::new();
+    assert_eq!(
+        fixture
+            .store
+            .record_checkpoint(checkpoint(
+                session.id,
+                Some(missing),
+                &workspace,
+                "aaa",
+                CheckpointKind::PreWrite,
+                1_000,
+            ))
+            .await
+            .expect_err("there is no such item"),
+        StoreError::ItemNotFound(missing)
+    );
+
+    let error = fixture
+        .store
+        .record_checkpoint(checkpoint(
+            session.id,
+            Some(foreign.id),
+            &workspace,
+            "bbb",
+            CheckpointKind::PreWrite,
+            2_000,
+        ))
+        .await
+        .expect_err("the item belongs to another session");
+    assert_eq!(
+        error,
+        StoreError::SessionMismatch {
+            item: foreign.id,
+            session: session.id
+        }
+    );
+    assert_eq!(
+        error.to_event_error().code,
+        hatchery_protocol::ErrorCode::InvalidRequest
+    );
+
+    assert!(
+        fixture
+            .store
+            .checkpoints_for_workspace(&workspace)
+            .await
+            .expect("read")
+            .is_empty(),
+        "neither refused row landed"
+    );
+}
+
+#[tokio::test]
+async fn an_empty_commit_id_is_refused() {
+    // `commit_id TEXT NOT NULL` accepts an empty string, so nothing below the store would catch
+    // this: the row would look healthy to every reader while naming no commit, pinning a shadow
+    // repository that can never be restored to. It is a caller bug and is reported as one.
+    let (fixture, session) = Fixture::with_session().await;
+    let item = say(&fixture.store, &session, "before the write", None).await;
+    let workspace = PathBuf::from("/ws/empty");
+
+    let error = fixture
+        .store
+        .record_checkpoint(checkpoint(
+            session.id,
+            Some(item.id),
+            &workspace,
+            "",
+            CheckpointKind::PreWrite,
+            1_000,
+        ))
+        .await
+        .expect_err("an empty commit id names nothing");
+    assert!(
+        matches!(error, StoreError::Invalid(_)),
+        "a caller bug, not a storage failure: {error}"
+    );
+    assert_eq!(
+        error.to_event_error().code,
+        hatchery_protocol::ErrorCode::InvalidRequest
+    );
+    assert!(
+        fixture
+            .store
+            .checkpoints_for_workspace(&workspace)
+            .await
+            .expect("read")
+            .is_empty(),
+        "the refused row does not land"
     );
 }
 
