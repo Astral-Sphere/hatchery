@@ -7,6 +7,10 @@ startup audit (ADR-0009).
 
 Sessions outlive frontends — closing a terminal does not stop a running turn.
 
-Workspace layer **L3** — see [docs/architecture.md](../../docs/architecture.md) §3.
+This is also where the shadow-git checkpoint *policy* lives (M2 Phase 1): the budget ladder and the
+orphan sweep both need the `checkpoints` table and the shadow repository in one place, and those two
+are siblings at L2, which may not depend on each other.
+
+Workspace layer **L4** — see [docs/architecture.md](../../docs/architecture.md) §3.
 Design: [docs/design/daemon.md](../../docs/design/daemon.md) ·
 Worklog: [docs/worklog/daemon.md](../../docs/worklog/daemon.md)

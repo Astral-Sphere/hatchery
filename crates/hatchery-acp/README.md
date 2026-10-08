@@ -8,6 +8,6 @@
   for: the capability seam lets a session bind its backends to the ACP connection.
 - **Client** — external harnesses orchestrated as subagents through a tool.
 
-Workspace layer **L2** — see [docs/architecture.md](../../docs/architecture.md) §3.
+Workspace layer **L3** — see [docs/architecture.md](../../docs/architecture.md) §3.
 Design: [docs/design/acp.md](../../docs/design/acp.md) ·
 Worklog: [docs/worklog/acp.md](../../docs/worklog/acp.md)
