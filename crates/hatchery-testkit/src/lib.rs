@@ -31,7 +31,7 @@ pub mod wire;
 
 pub use daemon::{ClientProbe, TestDaemon};
 pub use events::{completion, error, finished_items, kinds, reason, states, tool_result_texts};
-pub use fs::{MemoryFs, TempWorkspace};
+pub use fs::{MemoryFs, TempWorkspace, UserRepoState, user_repo_state};
 pub use gate::Gate;
 pub use history::MemoryHistory;
 pub use model::{ChainShape, ReferenceTree};

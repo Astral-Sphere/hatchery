@@ -93,6 +93,10 @@ fn builtin_document() -> toml::Table {
         "daemon".to_owned(),
         toml_value_of(&BuiltinDaemon::default()),
     );
+    document.insert(
+        "checkpoints".to_owned(),
+        toml_value_of(&BuiltinCheckpoints::default()),
+    );
     document.insert("providers".to_owned(), toml::Value::Table(providers));
     document
 }
@@ -149,6 +153,37 @@ impl Default for BuiltinDaemon {
     }
 }
 
+/// The `[checkpoints]` keys M2 reads.
+///
+/// ADR-0006's consequence list requires the circuit breaker to be configurable; these are its
+/// three numbers and the exclusion list. `_mb` means mebibytes (1024²), which is what the ADR's
+/// "500MB / 2GiB / 10MB" are in practice — one unit for all three rather than the ADR's mix.
+#[derive(Clone, Debug, Serialize)]
+pub struct BuiltinCheckpoints {
+    /// Per-workspace shadow-repository budget.
+    pub workspace_budget_mb: u64,
+    /// Budget across every workspace's shadow repository.
+    pub global_budget_mb: u64,
+    /// Files larger than this are left out of a snapshot and reported.
+    pub max_file_mb: u64,
+    /// Extra ignore rules in gitignore syntax, one per line.
+    ///
+    /// Build artefacts belong here. `.git/` is always excluded and cannot be turned off — it is
+    /// what keeps the user's own repository out of every snapshot.
+    pub ignore_rules: String,
+}
+
+impl Default for BuiltinCheckpoints {
+    fn default() -> Self {
+        Self {
+            workspace_budget_mb: 500,
+            global_budget_mb: 2048,
+            max_file_mb: 10,
+            ignore_rules: String::new(),
+        }
+    }
+}
+
 /// Keys whose parse failure must not degrade (M2's approval rules and friends).
 ///
 /// The strict path — drop, log at error level, typed reader falls back to the strictest default —
@@ -166,6 +201,10 @@ pub fn is_known_key(path: &str) -> bool {
         "ui.language",
         "ui.response_language",
         "daemon.idle_timeout_min",
+        "checkpoints.workspace_budget_mb",
+        "checkpoints.global_budget_mb",
+        "checkpoints.max_file_mb",
+        "checkpoints.ignore_rules",
     ];
     if known_static.contains(&path) || STRICT_KEYS.contains(&path) {
         return true;
@@ -192,7 +231,9 @@ pub fn is_known_key(path: &str) -> bool {
         ),
         // Whole-table keys: an assignment like `providers = …` restructures the schema, so it
         // is treated as unknown rather than honoured.
-        (Some("ui") | Some("daemon") | Some("providers"), None, None) => false,
+        (Some("ui") | Some("daemon") | Some("checkpoints") | Some("providers"), None, None) => {
+            false
+        }
         _ => false,
     }
 }
@@ -393,6 +434,52 @@ impl LayeredConfig {
         }
     }
 
+    /// The `[checkpoints]` view.
+    ///
+    /// A zero budget is meaningful rather than rejected: it leaves a workspace with one checkpoint
+    /// and skips every later one, which is how "no checkpoints" is expressible without a separate
+    /// off switch — D9's skip warns, it never refuses the write. A zero `max_file_mb` means no size
+    /// filter at all, because the alternative reading ("exclude every file that has any bytes") would
+    /// silently turn every snapshot into an empty one.
+    #[must_use]
+    pub fn checkpoints(&self) -> CheckpointsConfig {
+        let defaults = BuiltinCheckpoints::default();
+        let inner = self.inner.read().expect("config is not poisoned");
+        let value = &inner.effective;
+        let mib = |key: &str, default: u64| -> u64 {
+            let megabytes = value
+                .get_dotted(key)
+                .and_then(toml::Value::as_integer)
+                .filter(|v| *v >= 0)
+                .map_or(default, |v| v as u64);
+            megabytes.saturating_mul(1024 * 1024)
+        };
+        let max_file_bytes = mib("checkpoints.max_file_mb", defaults.max_file_mb);
+        let rules = value
+            .get_dotted("checkpoints.ignore_rules")
+            .and_then(toml::Value::as_str)
+            .unwrap_or_default()
+            .lines()
+            .map(str::trim)
+            // A blank line matches nothing and a `#` line is a comment, in gitignore's own syntax.
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .map(str::to_owned)
+            .collect();
+        CheckpointsConfig {
+            global_budget: mib("checkpoints.global_budget_mb", defaults.global_budget_mb),
+            ignore_rules: rules,
+            max_file_bytes: if max_file_bytes == 0 {
+                u64::MAX
+            } else {
+                max_file_bytes
+            },
+            workspace_budget: mib(
+                "checkpoints.workspace_budget_mb",
+                defaults.workspace_budget_mb,
+            ),
+        }
+    }
+
     /// Every configured provider, built-ins deep-merged under the user's entries.
     #[must_use]
     pub fn providers(&self) -> BTreeMap<String, ProviderConfig> {
@@ -448,6 +535,19 @@ pub struct UiConfig {
 pub struct DaemonConfig {
     /// How long an unused runtime stays loaded.
     pub idle_timeout: std::time::Duration,
+}
+
+/// The `[checkpoints]` view, typed: ADR-0006's budgets in bytes, and the exclusions.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CheckpointsConfig {
+    /// Per-workspace shadow-repository budget, in bytes.
+    pub workspace_budget: u64,
+    /// Budget across every workspace's shadow repository, in bytes.
+    pub global_budget: u64,
+    /// Files larger than this are left out of a snapshot and reported.
+    pub max_file_bytes: u64,
+    /// Extra ignore rules in gitignore syntax, replayed on every open of a shadow repository.
+    pub ignore_rules: Vec<String>,
 }
 
 /// Per-key validation of a layer document: unknown dotted keys are dropped, loudly, and so are
@@ -512,6 +612,10 @@ fn type_accepts(path: &str, value: &toml::Value) -> bool {
         ("ui.language", toml::Value::is_str),
         ("ui.response_language", toml::Value::is_str),
         ("daemon.idle_timeout_min", toml::Value::is_integer),
+        ("checkpoints.workspace_budget_mb", toml::Value::is_integer),
+        ("checkpoints.global_budget_mb", toml::Value::is_integer),
+        ("checkpoints.max_file_mb", toml::Value::is_integer),
+        ("checkpoints.ignore_rules", toml::Value::is_str),
     ];
     if let Some((_, check)) = static_types.iter().find(|(key, _)| *key == path) {
         return check(value);

@@ -18,10 +18,21 @@ pub struct MemoryFs {
     inner: RwLock<MemoryTree>,
 }
 
-#[derive(Default)]
 struct MemoryTree {
     files: BTreeMap<String, String>,
     dirs: BTreeSet<String>,
+}
+
+impl Default for MemoryTree {
+    fn default() -> Self {
+        // The root always exists. `LocalFs`'s root is a directory it was handed, so `read_dir("")`
+        // answers for a workspace that only ever had files written into it; without this, a
+        // seam-written top-level file would be invisible to `read_dir("")` here and visible there.
+        Self {
+            files: BTreeMap::new(),
+            dirs: BTreeSet::from([String::new()]),
+        }
+    }
 }
 
 impl MemoryFs {
@@ -185,6 +196,35 @@ impl FsBackend for MemoryFs {
         }
         Err(FsError::NotFound(path.to_owned()))
     }
+
+    async fn write_text_file(&self, path: &str, contents: &str) -> Result<(), FsError> {
+        let normalised = normalise(path)?;
+        if normalised.is_empty() {
+            return Err(FsError::WrongKind(
+                "the empty path is the workspace itself, not a file".to_owned(),
+            ));
+        }
+        let mut tree = self.inner.write().expect("memory fs is not poisoned");
+        if tree.dirs.contains(&normalised) {
+            return Err(FsError::WrongKind(format!("{path} is a directory")));
+        }
+        // Every ancestor becomes a directory, mirroring `LocalFs`'s `create_dir_all`: a backend
+        // that disagreed about missing parents would let a tool grow behaviour that only exists on
+        // one of them.
+        let mut ancestor = String::new();
+        for part in normalised.split('/') {
+            if !ancestor.is_empty() {
+                tree.dirs.insert(ancestor.clone());
+            }
+            ancestor = if ancestor.is_empty() {
+                part.to_owned()
+            } else {
+                format!("{ancestor}/{part}")
+            };
+        }
+        tree.files.insert(normalised, contents.to_owned());
+        Ok(())
+    }
 }
 
 /// A real temp directory with a real `LocalFs`, for tests that must exercise the disk path
@@ -231,6 +271,85 @@ impl TempWorkspace {
         std::fs::write(target, content).expect("write fixture");
     }
 
+    /// Chainable [`Self::write`], for arranging a tree in one expression.
+    pub fn file(&self, relative: &str, content: impl AsRef<[u8]>) -> &Self {
+        self.write(relative, content);
+        self
+    }
+
+    /// Creates a directory (and its parents).
+    pub fn dir(&self, relative: &str) -> &Self {
+        std::fs::create_dir_all(self.root.join(relative)).expect("mkdir -p");
+        self
+    }
+
+    /// Stages one path in the workspace's own repository.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the workspace is not a git repository — see [`Self::git`].
+    pub fn stage(&self, relative: &str) -> &Self {
+        let repo = self.user_repo();
+        let mut index = repo.index().expect("user index");
+        index
+            .add_path(Path::new(relative))
+            .unwrap_or_else(|error| panic!("staging {relative}: {error}"));
+        index.write().expect("write index");
+        self
+    }
+
+    /// Commits whatever is staged in the workspace's own repository.
+    ///
+    /// # Panics
+    ///
+    /// Panics when there is nothing to commit, or when the workspace is not a git repository.
+    pub fn commit(&self, message: &str) -> &Self {
+        let repo = self.user_repo();
+        let mut index = repo.index().expect("user index");
+        let tree = repo
+            .find_tree(index.write_tree().expect("write tree"))
+            .expect("find tree");
+        let signature =
+            git2::Signature::now("hatchery-testkit", "testkit@localhost").expect("signature");
+        let parent = repo
+            .head()
+            .ok()
+            .and_then(|head| head.target())
+            .and_then(|oid| repo.find_commit(oid).ok());
+        let parents: Vec<&git2::Commit> = parent.iter().collect();
+        repo.commit(
+            Some("HEAD"),
+            &signature,
+            &signature,
+            message,
+            &tree,
+            &parents,
+        )
+        .unwrap_or_else(|error| panic!("committing {message}: {error}"));
+        self
+    }
+
+    /// The workspace's own repository, if it has one.
+    #[must_use]
+    pub fn repo(&self) -> Option<git2::Repository> {
+        git2::Repository::open(&self.root).ok()
+    }
+
+    /// The workspace's own repository state, for the before/after comparison invariant 6 is.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the workspace is not a git repository — see [`Self::git`].
+    #[must_use]
+    pub fn repo_state(&self) -> UserRepoState {
+        user_repo_state(&self.root)
+    }
+
+    fn user_repo(&self) -> git2::Repository {
+        self.repo()
+            .expect("the workspace is a git repository; use TempWorkspace::git()")
+    }
+
     /// The seam-bound backend.
     pub fn fs(&self) -> &hatchery_capabilities::LocalFs {
         &self.fs
@@ -242,10 +361,156 @@ impl TempWorkspace {
     }
 }
 
+impl TempWorkspace {
+    /// A workspace that is **also a user git repository**, and a dirty one.
+    ///
+    /// The state is the one invariant 6 needs to be interesting: one commit, one staged change, one
+    /// unstaged file and one untracked file. If the workspace were clean, "the shadow repository
+    /// never touched the user's repository" could pass by doing nothing at all.
+    ///
+    /// The repository is hardened the same way the shadow one is (`core.excludesFile` pointing
+    /// nowhere, no autocrlf, no fsmonitor, fixed identity), because libgit2 reads the *developer's*
+    /// global and system configuration and a test whose outcome depends on whose machine it runs on
+    /// is not a test.
+    ///
+    /// # Panics
+    ///
+    /// Panics when git cannot initialise the repository.
+    #[must_use]
+    pub fn git() -> Self {
+        let workspace = Self::new();
+        let repo = git2::Repository::init(workspace.root()).expect("init the user's repository");
+        {
+            let mut config = repo.config().expect("repo config");
+            config
+                .set_str("user.name", "hatchery-testkit")
+                .expect("name");
+            config
+                .set_str("user.email", "testkit@localhost")
+                .expect("email");
+            config.set_str("core.autocrlf", "false").expect("autocrlf");
+            config
+                .set_str("core.excludesFile", "/nonexistent/hatchery-excludes")
+                .expect("excludesFile");
+            config.set_bool("core.fsmonitor", false).expect("fsmonitor");
+        }
+        workspace
+            .file("committed.txt", "committed\n")
+            .stage("committed.txt")
+            .commit("initial");
+        workspace.file("staged.txt", "staged\n").stage("staged.txt");
+        workspace.file("unstaged.txt", "unstaged\n");
+        workspace.file("untracked.txt", "untracked\n");
+        workspace
+    }
+}
+
 impl Default for TempWorkspace {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Everything about a user's own repository that a shadow operation must not change.
+///
+/// The fields are the ones the shadow-git spike measured libgit2 could plausibly touch: HEAD, the
+/// branch, every ref, the index's mtime (the `git status` *binary* rewrites it; libgit2's
+/// `statuses()` does not, which is why the prompt can read the user's branch at all) and the `.git`
+/// directory's entries — a planted gitlink file shows up there before it shows up anywhere else.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UserRepoState {
+    /// One line per status entry, flags then path, sorted: `git status`'s own order is not
+    /// guaranteed, and a comparison that depended on it would flake.
+    pub status: Vec<String>,
+    /// HEAD's commit id, or `unborn`.
+    pub head: String,
+    /// HEAD's branch shorthand, or `none`.
+    pub branch: String,
+    /// Every ref, name and target, sorted.
+    pub refs: Vec<String>,
+    /// When `.git/index` was last modified.
+    pub index_mtime: Option<std::time::SystemTime>,
+    /// The names in `.git`, sorted.
+    pub git_dir_entries: Vec<String>,
+}
+
+/// Reads a workspace's own repository state.
+///
+/// A free function as well as [`TempWorkspace::repo_state`]: the shadow-git spike builds its own
+/// sandbox instead of a `TempWorkspace`, and invariant 6 only means something if both measure the
+/// same fields the same way.
+///
+/// # Panics
+///
+/// Panics when `workspace` is not a git repository — see [`TempWorkspace::git`].
+#[must_use]
+pub fn user_repo_state(workspace: &Path) -> UserRepoState {
+    let repo = git2::Repository::open(workspace).expect("the workspace is a git repository");
+    let mut options = git2::StatusOptions::new();
+    options.include_untracked(true).recurse_untracked_dirs(true);
+    let listed = repo.statuses(Some(&mut options)).expect("statuses");
+    let mut status: Vec<String> = listed
+        .iter()
+        .map(|entry| {
+            format!(
+                "{:?} {}",
+                entry.status(),
+                entry.path().unwrap_or("<unparsable>")
+            )
+        })
+        .collect();
+    status.sort();
+
+    let mut refs: Vec<String> = repo
+        .references()
+        .expect("references")
+        .map(|reference| {
+            let reference = reference.expect("reference");
+            format!(
+                "{} {:?}",
+                reference.name().unwrap_or("<unparsable>"),
+                reference.target()
+            )
+        })
+        .collect();
+    refs.sort();
+
+    UserRepoState {
+        status,
+        head: repo
+            .head()
+            .ok()
+            .and_then(|head| head.target())
+            .map(|oid| oid.to_string())
+            .unwrap_or_else(|| "unborn".to_owned()),
+        branch: repo
+            .head()
+            .ok()
+            .and_then(|head| head.shorthand().ok().map(str::to_owned))
+            .unwrap_or_else(|| "none".to_owned()),
+        refs,
+        index_mtime: mtime(&workspace.join(".git").join("index")),
+        git_dir_entries: sorted_entries(&workspace.join(".git")),
+    }
+}
+
+fn mtime(path: &Path) -> Option<std::time::SystemTime> {
+    std::fs::metadata(path)
+        .and_then(|meta| meta.modified())
+        .ok()
+}
+
+fn sorted_entries(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort();
+    names
 }
 
 #[cfg(test)]

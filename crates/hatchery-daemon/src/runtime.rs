@@ -20,10 +20,10 @@ use hatchery_kernel::{
     Message, Ports, Role, ToolCallRequest, ToolHost,
 };
 use hatchery_protocol::{
-    Content, EventError, ItemId, ItemKind, ReasoningBlock, ServerEvent, Session, SessionEvent,
-    SessionId, SessionStatus,
+    CheckpointId, Content, EventError, ItemId, ItemKind, ReasoningBlock, ServerEvent, Session,
+    SessionEvent, SessionId, SessionStatus,
 };
-use hatchery_store::SessionStore;
+use hatchery_store::{CheckpointRecord, SessionStore};
 
 use crate::hub::LiveHub;
 use crate::prompt::AssembledSection;
@@ -174,6 +174,9 @@ pub struct HubSink {
     generation: u64,
     hub: Arc<LiveHub>,
     store: Arc<dyn SessionStore>,
+    /// The session's workspace, for the `checkpoints` index rows. `None` in Chat, where nothing
+    /// writes and so no checkpoint item can ever arrive.
+    workspace: Option<std::path::PathBuf>,
     /// Cleared when the sink sees a turn end: the manager marks a turn in flight the moment it
     /// submits, which is earlier than the kernel's own state machine can say so, and this is
     /// what hands the truth back.
@@ -188,6 +191,7 @@ impl HubSink {
         generation: u64,
         hub: Arc<LiveHub>,
         store: Arc<dyn SessionStore>,
+        workspace: Option<std::path::PathBuf>,
         in_flight: Arc<AtomicBool>,
     ) -> Self {
         Self {
@@ -195,6 +199,7 @@ impl HubSink {
             generation,
             hub,
             store,
+            workspace,
             in_flight,
         }
     }
@@ -202,6 +207,47 @@ impl HubSink {
     fn publish(&self, event: ServerEvent) {
         self.hub
             .publish(SessionEvent::new(self.session, self.generation, event));
+    }
+
+    /// Indexes a checkpoint item in the `checkpoints` table (D13).
+    ///
+    /// Failures are logged and nothing else: the item already carries the `commit_id`, so a rewind
+    /// can still find it by walking the chain, and the table only serves cross-session budget
+    /// accounting and the orphan sweep. Holding back the item's `ItemFinished` over a lost index
+    /// row would trade a real, model-visible fact for a bookkeeping one.
+    async fn record_checkpoint(
+        &self,
+        item: &hatchery_protocol::Item,
+        commit_id: &str,
+        kind: hatchery_protocol::CheckpointKind,
+    ) {
+        let Some(workspace) = self.workspace.clone() else {
+            // A checkpoint with no workspace has no shadow repository to be found in, so there is
+            // nothing to account for. Logged because it should not happen: only a session with a
+            // workspace gets a checkpointer.
+            tracing::warn!(
+                session = %self.session,
+                item = %item.id,
+                "a checkpoint item arrived for a session with no workspace; not indexed"
+            );
+            return;
+        };
+        let record = CheckpointRecord {
+            id: CheckpointId::new(),
+            session: self.session,
+            item: Some(item.id),
+            workspace,
+            commit_id: commit_id.to_owned(),
+            kind,
+            created_at: item.created_at,
+        };
+        if let Err(error) = self.store.record_checkpoint(record).await {
+            tracing::error!(
+                session = %self.session,
+                item = %item.id,
+                "failed to index a checkpoint; rewind can still find it in the item chain: {error}"
+            );
+        }
     }
 
     /// The session status a kernel state maps to.
@@ -259,6 +305,12 @@ impl EventSink for HubSink {
                         "failed to commit an item; its ItemFinished is withheld: {error}"
                     );
                     return;
+                }
+                // Indexed before the event goes out, for the same reason the item is committed
+                // first: a subscriber that reacts to a checkpoint must be able to find its row.
+                if let ItemKind::Checkpoint(checkpoint) = &item.kind {
+                    self.record_checkpoint(&item, &checkpoint.commit_id, checkpoint.kind)
+                        .await;
                 }
                 self.publish(ServerEvent::ItemFinished { item });
             }
@@ -401,6 +453,12 @@ impl SessionRuntime {
             prompt,
         } = parts;
         let in_flight = Arc::new(AtomicBool::new(false));
+        // Spelled the one way the orphan sweep can find it — see `recorded_workspace`. A row the
+        // sweep cannot see makes its workspace look abandoned, and the sweep deletes the repository.
+        let workspace = session
+            .workspace
+            .as_ref()
+            .map(|path| crate::checkpoints::recorded_workspace(path));
         let ports = Ports::new(
             provider,
             tools,
@@ -415,6 +473,7 @@ impl SessionRuntime {
                 generation,
                 hub,
                 store,
+                workspace,
                 Arc::clone(&in_flight),
             )),
         );
@@ -703,6 +762,137 @@ mod tests {
             second.messages[1..],
             first.messages[1..],
             "and the history behind it is rebuilt the same way"
+        );
+    }
+
+    /// D13's daemon half: the Checkpoint item lands first, and the index row follows it.
+    ///
+    /// The row is not what a rewind reads — the item carries its own `commit_id` and the chain
+    /// locates it. What the row adds is *ownership*: which workspace the commit belongs to, so a
+    /// budget can be totalled across the sessions that share one working tree, and which session
+    /// claimed it, so the orphan sweep can tell a live shadow repository from an abandoned one.
+    #[tokio::test]
+    async fn a_checkpoint_item_is_indexed_with_its_item_id() {
+        let (dir, store) = store().await;
+        let workspace = dir.path().join("workspace");
+        std::fs::create_dir_all(&workspace).expect("mkdir");
+        let mut session = session_row();
+        session.workspace = Some(workspace.clone());
+        store.create_session(session.clone()).await.expect("create");
+
+        let sink = HubSink::new(
+            session.id,
+            3,
+            Arc::new(LiveHub::new()),
+            Arc::clone(&store),
+            Some(workspace.clone()),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let item = Item::new(
+            session.id,
+            ItemKind::Checkpoint(hatchery_protocol::Checkpoint {
+                commit_id: "abc123".to_owned(),
+                kind: hatchery_protocol::CheckpointKind::PreWrite,
+            }),
+        );
+        sink.emit(KernelEvent::ItemFinished { item: item.clone() })
+            .await;
+
+        let rows = store
+            .checkpoints_for_workspace(&workspace)
+            .await
+            .expect("rows");
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        let row = &rows[0];
+        assert_eq!(row.session, session.id);
+        assert_eq!(
+            row.item,
+            Some(item.id),
+            "the row must point at the item that carries the commit id"
+        );
+        assert_eq!(row.commit_id, "abc123");
+        assert_eq!(row.kind, hatchery_protocol::CheckpointKind::PreWrite);
+        assert_eq!(row.workspace, workspace);
+        assert_eq!(
+            row.created_at, item.created_at,
+            "the index is ordered by the item's own time, not by when the row was written"
+        );
+    }
+
+    /// The `item_id = NULL` case has no producer yet — the pre-restore safety snapshot arrives with
+    /// `session/rewind` in Phase 3 — but the column and the record type already have to carry it, or
+    /// Phase 3 would have to reach back into a schema that is frozen at v1.
+    #[tokio::test]
+    async fn a_checkpoint_can_be_recorded_without_an_item() {
+        let (dir, store) = store().await;
+        let workspace = dir.path().join("workspace");
+        std::fs::create_dir_all(&workspace).expect("mkdir");
+        let session = session_row();
+        store.create_session(session.clone()).await.expect("create");
+
+        let record = CheckpointRecord {
+            id: CheckpointId::new(),
+            session: session.id,
+            item: None,
+            workspace: workspace.clone(),
+            commit_id: "safety".to_owned(),
+            kind: hatchery_protocol::CheckpointKind::Manual,
+            created_at: hatchery_protocol::Timestamp::now(),
+        };
+        store
+            .record_checkpoint(record.clone())
+            .await
+            .expect("a safety snapshot has no item to point at");
+
+        let rows = store
+            .checkpoints_for_workspace(&workspace)
+            .await
+            .expect("rows");
+        assert_eq!(rows, vec![record]);
+    }
+
+    /// A session with no workspace has no shadow repository, so there is nothing to index — and the
+    /// event still goes out, because the item is committed and the transcript is the truth.
+    #[tokio::test]
+    async fn a_checkpoint_for_a_session_without_a_workspace_is_committed_but_not_indexed() {
+        let (dir, store) = store().await;
+        let session = session_row();
+        assert!(session.workspace.is_none(), "a Chat session");
+        store.create_session(session.clone()).await.expect("create");
+
+        let hub = Arc::new(LiveHub::new());
+        let mut events = hub.subscribe(session.id);
+        let sink = HubSink::new(
+            session.id,
+            1,
+            Arc::clone(&hub),
+            Arc::clone(&store),
+            None,
+            Arc::new(AtomicBool::new(false)),
+        );
+        let item = Item::new(
+            session.id,
+            ItemKind::Checkpoint(hatchery_protocol::Checkpoint {
+                commit_id: "nowhere".to_owned(),
+                kind: hatchery_protocol::CheckpointKind::PreWrite,
+            }),
+        );
+        sink.emit(KernelEvent::ItemFinished { item: item.clone() })
+            .await;
+
+        let published = events.try_recv().expect("the event still goes out");
+        assert!(
+            matches!(published.event, ServerEvent::ItemFinished { .. }),
+            "{:?}",
+            published.event
+        );
+        assert!(
+            store
+                .checkpoints_for_workspace(dir.path())
+                .await
+                .expect("rows")
+                .is_empty(),
+            "nothing to index without a workspace"
         );
     }
 }

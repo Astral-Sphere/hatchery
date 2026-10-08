@@ -24,6 +24,9 @@ thiserror.workspace = true
 tokio = { workspace = true, features = ["fs"] }
 tokio-util.workspace = true
 tracing.workspace = true
+# `v5` only: the shadow-repository directory name is a name-based UUID of the workspace path, so
+# that the same workspace always maps to the same git dir without a hash dependency of our own.
+uuid.workspace = true
 
 [dev-dependencies]
 hatchery-testkit.workspace = true

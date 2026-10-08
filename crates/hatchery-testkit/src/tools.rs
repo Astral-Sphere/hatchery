@@ -9,10 +9,12 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio_util::sync::CancellationToken;
 
 use hatchery_kernel::{
-    AgentCommand, AgentHandle, KernelError, KernelEvent, ToolDef, ToolHost, ToolInvocation,
+    AgentCommand, AgentHandle, CheckpointCollector, KernelError, KernelEvent, ToolDef, ToolHost,
+    ToolInvocation,
 };
 use hatchery_protocol::{
-    ApprovalOption, ApprovalRequest, RiskLevel, ToolCallSummary, ToolOutput, ToolProgress,
+    ApprovalOption, ApprovalRequest, Checkpoint, CheckpointKind, RiskLevel, ToolCallSummary,
+    ToolOutput, ToolProgress,
 };
 
 use crate::gate::Gate;
@@ -47,6 +49,7 @@ pub struct ScriptedToolHost {
     approvals: Mutex<HashMap<String, ApprovalRequest>>,
     results: Mutex<HashMap<String, VecDeque<ScriptedResult>>>,
     calls: Mutex<Vec<RecordedCall>>,
+    checkpoints: Mutex<HashMap<String, Vec<Checkpoint>>>,
     gate: Option<Gate>,
 }
 
@@ -59,6 +62,7 @@ impl ScriptedToolHost {
             approvals: Mutex::new(HashMap::new()),
             results: Mutex::new(HashMap::new()),
             calls: Mutex::new(Vec::new()),
+            checkpoints: Mutex::new(HashMap::new()),
             gate: None,
         }
     }
@@ -125,6 +129,27 @@ impl ScriptedToolHost {
     #[must_use]
     pub fn erroring(self, name: &str, message: &str) -> Self {
         self.script(name, ScriptedResult::Error(message.to_owned()))
+    }
+
+    /// Makes this tool report that its writes took these undo points.
+    ///
+    /// Pushed into the kernel's collector **on entry**, before any gate and before the scripted
+    /// result — which is what a real pre-write checkpoint does, and the only ordering that lets a
+    /// test ask what survived an interrupt. Every call to `name` pushes the same set.
+    #[must_use]
+    pub fn checkpointing(self, name: &str, commit_ids: &[&str]) -> Self {
+        let checkpoints = commit_ids
+            .iter()
+            .map(|commit_id| Checkpoint {
+                commit_id: (*commit_id).to_owned(),
+                kind: CheckpointKind::PreWrite,
+            })
+            .collect();
+        self.checkpoints
+            .lock()
+            .expect("the mutex is never poisoned")
+            .insert(name.to_owned(), checkpoints);
+        self
     }
 
     /// Makes every invocation wait for a permit, so a test can interrupt mid-tool.
@@ -199,11 +224,27 @@ impl ToolHost for ScriptedToolHost {
         args: Value,
         cancel: CancellationToken,
         progress: UnboundedSender<ToolProgress>,
+        checkpoints: CheckpointCollector,
     ) -> Result<ToolInvocation, KernelError> {
         let scripted = {
             let mut results = self.results.lock().expect("the mutex is never poisoned");
             results.get_mut(name).and_then(VecDeque::pop_front)
         };
+
+        // Undo points first, before the gate: a pre-write checkpoint exists from the moment the
+        // write is attempted, and a test that interrupts mid-call has to find it in the collector.
+        // This is the reason the collector is lent in rather than returned — see
+        // `CheckpointCollector`.
+        for checkpoint in self
+            .checkpoints
+            .lock()
+            .expect("the mutex is never poisoned")
+            .get(name)
+            .into_iter()
+            .flatten()
+        {
+            checkpoints.push(checkpoint.clone());
+        }
 
         // Progress before any waiting, so a test can observe the forwarding without having to
         // release the gate first.

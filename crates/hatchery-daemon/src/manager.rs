@@ -91,6 +91,12 @@ pub struct SessionManager {
     /// rather than inheriting whatever the machine running them happens to have configured —
     /// the same reason `LayeredConfig` is built from injected layers in a test.
     prompts_dir: Option<std::path::PathBuf>,
+    /// Shadow repositories and the budget that guards them.
+    ///
+    /// Built from `data_dir` rather than injected: the location is not a choice a caller should be
+    /// able to make per session, and a test isolates it the way it isolates everything else, by
+    /// pointing `data_dir` at a temp dir.
+    checkpoints: Arc<crate::checkpoints::Checkpoints>,
 }
 
 impl SessionManager {
@@ -103,6 +109,11 @@ impl SessionManager {
         data_dir: std::path::PathBuf,
         prompts_dir: Option<std::path::PathBuf>,
     ) -> Self {
+        let checkpoints = Arc::new(crate::checkpoints::Checkpoints::new(
+            &data_dir,
+            &config.checkpoints(),
+            Arc::clone(&store),
+        ));
         Self {
             store,
             config,
@@ -113,6 +124,7 @@ impl SessionManager {
             watchers: Mutex::new(HashMap::new()),
             providers: Mutex::new(ProviderRegistry::new()),
             prompts_dir,
+            checkpoints,
         }
     }
 
@@ -617,7 +629,7 @@ impl SessionManager {
             provider_id,
             echo_reasoning,
         } = self.provider_for(&session.model.model)?;
-        let tools = self.chat_tools(session)?;
+        let tools = self.chat_tools(session).await?;
         // Rendered here and frozen for the runtime's life (D15): re-rendering per turn would move
         // the `environment` section's date and cwd under the provider's prefix cache, which is the
         // stability the rest of the request is built to preserve. Freezing is also what the model
@@ -717,8 +729,20 @@ impl SessionManager {
         })
     }
 
-    /// The Chat toolset over the session's workspace (or the daemon's cwd).
-    fn chat_tools(
+    /// The toolset over the session's workspace (or the daemon's cwd).
+    ///
+    /// Still mode-blind (capabilities.md §4): nothing here reads `session.mode`, so a Code session
+    /// gets the same read-only tools as a Chat one, and the write tools that would use a checkpoint
+    /// arrive in Phase 2. What this does add is the seam they will need — a checkpointer bound to
+    /// this session's workspace — attached on `session.workspace` rather than on the mode, because a
+    /// Chat session has no workspace and so nothing it could write to.
+    ///
+    /// # Errors
+    ///
+    /// Propagates a backend or checkpoint failure. Failing the assembly rather than degrading to "no
+    /// checkpoints" is deliberate: a session whose writes cannot be undone must not look like one
+    /// that can, and the alternative discovers this on the user's first `write_file`.
+    async fn chat_tools(
         &self,
         session: &Session,
     ) -> Result<hatchery_capabilities::ToolRegistry, ManagerError> {
@@ -728,15 +752,33 @@ impl SessionManager {
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| self.data_dir.clone()));
         let fs = hatchery_capabilities::LocalFs::new(root)
             .map_err(|error| ManagerError::new(ErrorCode::InternalError, error.to_string()))?;
+        let checkpointer = match &session.workspace {
+            Some(workspace) => Some(
+                self.checkpoints
+                    .checkpointer_for(workspace)
+                    .await
+                    .map_err(|error| {
+                        ManagerError::new(ErrorCode::InternalError, error.to_string())
+                    })?,
+            ),
+            None => None,
+        };
         let backends = hatchery_capabilities::Backends {
             fs: Arc::new(fs),
             terminal: Arc::new(hatchery_capabilities::NoTerminal),
+            checkpointer,
         };
         let mut registry = hatchery_capabilities::ToolRegistry::new(backends);
         for tool in hatchery_tools::chat_tools() {
             registry.register(tool);
         }
         Ok(registry)
+    }
+
+    /// The checkpoint facilities: shadow repositories, budgets and the orphan sweep.
+    #[must_use]
+    pub fn checkpoints(&self) -> &Arc<crate::checkpoints::Checkpoints> {
+        &self.checkpoints
     }
 
     /// The prompt for a session, or for a bare mode when there is none.

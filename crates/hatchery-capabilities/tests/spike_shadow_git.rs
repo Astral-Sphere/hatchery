@@ -6,6 +6,11 @@
 //! user's own repository — not its HEAD, not its index, not its refs, and not even by planting a
 //! `.git` gitlink file in their workspace.
 //!
+//! The `invariant_` tests themselves moved to `checkpoint.rs` in M2 Phase 1, where they run against
+//! the promoted [`hatchery_capabilities::CheckpointStore`] instead of the private `Sandbox` below.
+//! What is left here is deliberately the *backend* half: the facts about libgit2 that a dependency
+//! upgrade could change without any of our code changing, and that `CheckpointStore` is built on.
+//!
 //! Everything runs in a tempdir. libgit2 reads the developer's global/system git configuration and
 //! template directory, which would make these tests depend on the machine running them, so the
 //! helper below disables external templates and pins the config keys that change snapshot or
@@ -153,57 +158,6 @@ impl Sandbox {
         mtime(&self.workspace.join(".git").join("index"))
     }
 
-    /// Everything about the user's repository that shadow operations must not change.
-    fn user_repo_state(&self) -> UserRepoState {
-        let repo = self.open_user_repo();
-        let mut options = StatusOptions::new();
-        options.include_untracked(true).recurse_untracked_dirs(true);
-        let status_list = repo.statuses(Some(&mut options)).expect("statuses");
-        let mut status: Vec<String> = status_list
-            .iter()
-            .map(|entry| {
-                format!(
-                    "{:?} {}",
-                    entry.status(),
-                    entry.path().unwrap_or("<unparsable>")
-                )
-            })
-            .collect();
-        status.sort();
-
-        let mut refs: Vec<String> = repo
-            .references()
-            .expect("references")
-            .map(|reference| {
-                let reference = reference.expect("reference");
-                format!(
-                    "{} {:?}",
-                    reference.name().unwrap_or("<unparsable>"),
-                    reference.target()
-                )
-            })
-            .collect();
-        refs.sort();
-
-        UserRepoState {
-            status,
-            head: repo
-                .head()
-                .ok()
-                .and_then(|head| head.target())
-                .map(|oid| oid.to_string())
-                .unwrap_or_else(|| "unborn".to_owned()),
-            branch: repo
-                .head()
-                .ok()
-                .and_then(|head| head.shorthand().ok().map(str::to_owned))
-                .unwrap_or_else(|| "none".to_owned()),
-            refs,
-            index_mtime: self.user_index_mtime(),
-            git_dir_entries: sorted_entries(&self.workspace.join(".git")),
-        }
-    }
-
     /// Creates a user repository with one commit, plus staged, unstaged and untracked changes.
     fn make_user_repo(&self) {
         let repo = Repository::init(&self.workspace).expect("init the user's repository");
@@ -345,33 +299,10 @@ impl Sandbox {
     }
 }
 
-#[derive(Debug)]
-struct UserRepoState {
-    status: Vec<String>,
-    head: String,
-    branch: String,
-    refs: Vec<String>,
-    index_mtime: Option<SystemTime>,
-    git_dir_entries: Vec<String>,
-}
-
 fn mtime(path: &Path) -> Option<SystemTime> {
     std::fs::metadata(path)
         .and_then(|meta| meta.modified())
         .ok()
-}
-
-fn sorted_entries(dir: &Path) -> Vec<String> {
-    let mut names: Vec<String> = std::fs::read_dir(dir)
-        .map(|entries| {
-            entries
-                .filter_map(Result::ok)
-                .map(|entry| entry.file_name().to_string_lossy().into_owned())
-                .collect()
-        })
-        .unwrap_or_default();
-    names.sort();
-    names
 }
 
 fn dir_bytes(dir: &Path) -> u64 {
@@ -402,87 +333,13 @@ fn write_files(sandbox: &Sandbox, prefix: &str, count: usize) {
 }
 
 // ---------------------------------------------------------------------------
-// Invariant 6: the shadow repository must not touch the user's repository.
+// What the shadow repository sees, and does not see.
+//
+// The three `invariant_` tests that used to live in this section now run against the promoted
+// `CheckpointStore` in `checkpoint.rs` — same names, same assertions, real code under test. What
+// stays here is the measured behaviour of **libgit2**, which is what a git2 upgrade could change
+// under us (ADR-0012).
 // ---------------------------------------------------------------------------
-
-#[test]
-fn invariant_shadow_git_never_touches_user_repo() {
-    let sandbox = Sandbox::new(true);
-    let before = sandbox.user_repo_state();
-    assert!(
-        !before.status.is_empty(),
-        "the user repo should start out dirty, otherwise the test proves nothing"
-    );
-
-    let first = sandbox.snapshot("checkpoint 1");
-    sandbox.write("agent-writes.txt", "second\n");
-    sandbox.write("agent-adds.txt", "new\n");
-    let _second = sandbox.snapshot("checkpoint 2");
-    sandbox.restore(first, false);
-
-    let after = sandbox.user_repo_state();
-
-    // The agent's own writes legitimately appear in the user's status as untracked files; what
-    // invariant 6 forbids is the shadow repository changing anything else.
-    let agent_files = ["agent-writes.txt", "agent-adds.txt"];
-    let without_agent_files = |status: &[String]| -> Vec<String> {
-        status
-            .iter()
-            .filter(|line| !agent_files.iter().any(|name| line.contains(name)))
-            .cloned()
-            .collect()
-    };
-    assert_eq!(
-        without_agent_files(&before.status),
-        without_agent_files(&after.status),
-        "the user's status changed beyond the agent's own file writes"
-    );
-    assert_eq!(before.head, after.head, "user HEAD moved");
-    assert_eq!(before.branch, after.branch, "user branch changed");
-    assert_eq!(before.refs, after.refs, "user refs changed");
-    assert_eq!(
-        before.index_mtime, after.index_mtime,
-        "the user's index was rewritten"
-    );
-    assert_eq!(
-        before.git_dir_entries, after.git_dir_entries,
-        "the user's .git directory gained or lost entries"
-    );
-
-    assert_eq!(sandbox.read("staged.txt").as_deref(), Some("staged\n"));
-    assert_eq!(sandbox.read("unstaged.txt").as_deref(), Some("unstaged\n"));
-    assert_eq!(
-        sandbox.read("committed.txt").as_deref(),
-        Some("committed\n")
-    );
-}
-
-/// `RepositoryInitOptions::workdir_path` documents that it creates a `.git` gitlink in the work
-/// tree. Planting one in the user's workspace would corrupt a non-git workspace and collide with a
-/// real `.git` directory, so this pins the `set_workdir(.., false)` route instead.
-#[test]
-fn invariant_no_gitlink_is_planted_in_the_user_workspace() {
-    let plain = Sandbox::new(false);
-    assert!(!plain.workspace.join(".git").exists());
-    plain.snapshot("checkpoint");
-    assert!(
-        !plain.workspace.join(".git").exists(),
-        "the shadow repository planted a .git gitlink in a workspace that had none"
-    );
-
-    let with_repo = Sandbox::new(true);
-    let entries_before = sorted_entries(&with_repo.workspace.join(".git"));
-    with_repo.snapshot("checkpoint");
-    assert!(
-        with_repo.workspace.join(".git").is_dir(),
-        "the user's .git must stay a directory, not be replaced by a gitlink file"
-    );
-    assert_eq!(
-        entries_before,
-        sorted_entries(&with_repo.workspace.join(".git")),
-        "the shadow repository added or removed entries inside the user's .git"
-    );
-}
 
 #[test]
 fn shadow_repo_does_not_track_the_users_git_directory() {
@@ -532,27 +389,6 @@ fn restore_rolls_back_tracked_files_and_leaves_never_tracked_ones_alone() {
         sandbox.read("never-tracked.txt").as_deref(),
         Some("created after the last checkpoint\n"),
         "a default restore must not delete files no checkpoint ever tracked"
-    );
-}
-
-/// The `--purge` half of `RestoreOptions`: explicit, approval-gated, and it does remove files that
-/// no checkpoint ever tracked.
-#[test]
-fn invariant_purge_restore_also_removes_never_tracked_files() {
-    let sandbox = Sandbox::new(false);
-    sandbox.write("file.txt", "version 1\n");
-    let first = sandbox.snapshot("checkpoint 1");
-
-    sandbox.write("file.txt", "version 2\n");
-    sandbox.write("never-tracked.txt", "created after the last checkpoint\n");
-
-    sandbox.restore(first, true);
-
-    assert_eq!(sandbox.read("file.txt").as_deref(), Some("version 1\n"));
-    assert_eq!(
-        sandbox.read("never-tracked.txt"),
-        None,
-        "purge must remove files that no checkpoint ever tracked"
     );
 }
 

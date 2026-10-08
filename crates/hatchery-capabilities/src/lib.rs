@@ -7,9 +7,13 @@
 //!
 //! A session binds exactly one backend set at `session/new`: local ([`LocalFs`], plus M2's
 //! `LocalPty` and `DaemonApproval`) or ACP-delegated (`AcpClientFs` and friends, M3) — the same
-//! tools run over either, which is the whole point of the seam. The M1 subset is read-only:
-//! write paths arrive with the shadow-git checkpoints that must precede them (M2), and the
-//! shadow-git `CheckpointStore` itself is built on the spike findings in `tests/spike_shadow_git.rs`.
+//! tools run over either, which is the whole point of the seam.
+//!
+//! Writes go through [`CheckpointedFs`], a decorator that takes a shadow-git snapshot before each
+//! one and collects it in the kernel's [`hatchery_kernel::CheckpointCollector`] — so an agent's edit
+//! to a workspace is undoable even when the workspace is not a git repository, and even when it is
+//! one that we must not touch (invariant 6). [`CheckpointStore`] is that shadow repository, built on
+//! the findings measured in `tests/spike_shadow_git.rs`.
 //!
 //! The [`ToolRegistry`] is the session's tool table: it advertises the catalogue the model sees
 //! and dispatches calls through the seams, implementing the kernel's `ToolHost` — one registry
@@ -30,6 +34,8 @@
 //! let backends = Backends {
 //!     fs,
 //!     terminal: Arc::new(hatchery_capabilities::NoTerminal),
+//!     // `None` is Chat: nothing writes, so there is nothing to checkpoint.
+//!     checkpointer: None,
 //! };
 //! let mut registry = ToolRegistry::new(backends);
 //! // registry.register(Arc::new(hatchery_tools::read_file())); — in the daemon's assembly
@@ -41,6 +47,8 @@
 //! Design: `docs/design/capabilities.md`.
 
 mod approval;
+mod checkpoint;
+mod checkpointed_fs;
 mod fs;
 mod local_fs;
 mod registry;
@@ -48,6 +56,11 @@ mod terminal;
 mod tool;
 
 pub use approval::ApprovalGate;
+pub use checkpoint::{
+    CheckpointError, CheckpointOptions, CheckpointPool, CheckpointStore, DEFAULT_MAX_FILE_BYTES,
+    RestoreOptions, RestoreReport, SnapshotReport,
+};
+pub use checkpointed_fs::{CheckpointedFs, Checkpointer, PreWrite};
 pub use fs::{FsBackend, FsEntry, FsError, FsMetadata};
 pub use local_fs::LocalFs;
 pub use registry::{Backends, ToolRegistry};

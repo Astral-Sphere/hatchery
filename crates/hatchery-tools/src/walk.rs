@@ -62,10 +62,11 @@ pub(crate) async fn walk(ctx: &ToolCtx<'_>, dir: &str) -> Result<(Vec<String>, u
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hatchery_capabilities::{FsEntry, FsError, FsMetadata};
     use hatchery_testkit::MemoryFs;
     use tokio_util::sync::CancellationToken;
 
-    fn ctx(fs: &MemoryFs) -> ToolCtx<'_> {
+    fn ctx(fs: &dyn hatchery_capabilities::FsBackend) -> ToolCtx<'_> {
         ToolCtx {
             fs,
             terminal: &hatchery_capabilities::NoTerminal,
@@ -98,12 +99,47 @@ mod tests {
         assert_eq!(skipped, 0);
     }
 
+    /// The root of a walk is fatal where a subtree is not: no root, no search, and the caller has
+    /// to hear that rather than receive an empty result that looks like "nothing matched".
+    ///
+    /// Needs a backend that refuses, which `MemoryFs` no longer does — its root always exists now,
+    /// matching `LocalFs` over an empty tempdir.
     #[tokio::test]
     async fn a_directory_refusal_is_a_backend_error_not_a_panic() {
-        // An empty MemoryFs has no root directory entry, so walking "" fails at the seam.
-        let fs = MemoryFs::new();
-        let error = walk(&ctx(&fs), "").await.expect_err("no root");
+        struct Refusing;
+        #[async_trait::async_trait]
+        impl hatchery_capabilities::FsBackend for Refusing {
+            async fn read_text_file(&self, path: &str) -> Result<String, FsError> {
+                Err(FsError::Io(format!("{path}: permission denied")))
+            }
+            async fn read_dir(&self, path: &str) -> Result<Vec<FsEntry>, FsError> {
+                Err(FsError::Io(format!("{path}: permission denied")))
+            }
+            async fn metadata(&self, path: &str) -> Result<FsMetadata, FsError> {
+                Err(FsError::Io(format!("{path}: permission denied")))
+            }
+            async fn write_text_file(&self, path: &str, _: &str) -> Result<(), FsError> {
+                Err(FsError::Io(format!("{path}: permission denied")))
+            }
+        }
+
+        let refusing = Refusing;
+        let error = walk(&ctx(&refusing), "")
+            .await
+            .expect_err("no root, no search");
         assert!(matches!(error, ToolError::Backend(_)), "{error}");
+        assert!(error.to_string().contains("permission denied"), "{error}");
+    }
+
+    /// An empty workspace is walkable and empty, on both backends: `LocalFs`'s root is a directory
+    /// it was handed, so `read_dir("")` answers `Ok([])` for it, and a fake that instead failed
+    /// would let a tool grow behaviour that only exists on one backend.
+    #[tokio::test]
+    async fn an_empty_workspace_walks_to_nothing() {
+        let fs = MemoryFs::new();
+        let (files, skipped) = walk(&ctx(&fs), "").await.expect("the root always exists");
+        assert!(files.is_empty(), "{files:?}");
+        assert_eq!(skipped, 0);
     }
 
     #[tokio::test]

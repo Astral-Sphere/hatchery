@@ -1210,6 +1210,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -1341,6 +1342,7 @@ version = "0.0.0"
 dependencies = [
  "async-trait",
  "futures",
+ "git2",
  "hatchery-capabilities",
  "hatchery-daemon",
  "hatchery-kernel",

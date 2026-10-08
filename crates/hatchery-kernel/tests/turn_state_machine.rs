@@ -1000,6 +1000,178 @@ async fn interrupt_during_tool_execution_cancels_the_tool() {
     );
 }
 
+/// The half of a cancelled call that is *not* cancelled: the writes it already made are still on
+/// the user's disk, and the undo points for them have to reach the transcript anyway.
+///
+/// This is why the collector is lent to the tool host instead of returned inside the invocation —
+/// an interrupted invocation is dropped without another poll (the comment above is the host side of
+/// the same fact), so anything it was going to return is lost. Without these items a Code rewind
+/// aimed at the cancelled call would scan forward past it and restore a state that *includes* the
+/// damage.
+#[tokio::test]
+async fn an_interrupted_call_keeps_the_checkpoints_it_already_took() {
+    let (tools, _gate) = ScriptedToolHost::new()
+        .advertising(&["slow_write"])
+        // Pushed on entry, before the gate: a pre-write checkpoint exists from the moment the write
+        // is attempted, which is exactly the window an interrupt lands in.
+        .checkpointing("slow_write", &["shadow-commit"])
+        .answering("slow_write", ToolOutput::text("finished"))
+        .gated();
+    let provider = ScriptedProvider::new(vec![ScriptedProvider::tool_round(
+        "call-1",
+        "slow_write",
+        json!({}),
+    )]);
+    let harness = Harness::new(
+        provider,
+        tools,
+        MemoryHistory::empty(),
+        TurnLimits::default(),
+    );
+    harness.prompt("run it").await;
+
+    harness
+        .sink
+        .wait_for("the tool call to start", |event| {
+            matches!(event, KernelEvent::ToolCallStarted { .. })
+        })
+        .await;
+    harness
+        .handle
+        .interrupt()
+        .await
+        .expect("the agent is running");
+    let events = harness.finish().await;
+
+    assert_eq!(reason(&events), Some(StopReason::Interrupted));
+    let items = finished_items(&events);
+    let recorded = kinds(&events);
+
+    let call = recorded
+        .iter()
+        .position(|kind| *kind == ItemKindTag::ToolCall)
+        .expect("the cancelled call is recorded");
+    let checkpoint = recorded
+        .iter()
+        .position(|kind| *kind == ItemKindTag::Checkpoint)
+        .expect("its undo point survives the interrupt");
+    assert!(
+        checkpoint > call,
+        "the checkpoint follows the call it belongs to: {recorded:?}"
+    );
+    assert!(
+        !recorded.contains(&ItemKindTag::ToolResult),
+        "a cancelled call has no result: {recorded:?}"
+    );
+
+    let payload = items.iter().find_map(|item| match &item.kind {
+        ItemKind::Checkpoint(checkpoint) => Some(checkpoint),
+        _ => None,
+    });
+    assert_eq!(
+        payload
+            .expect("the checkpoint item carries its payload")
+            .commit_id,
+        "shadow-commit"
+    );
+    assert_eq!(
+        items[checkpoint].parent,
+        Some(items[call].id),
+        "the chain runs through the checkpoint"
+    );
+}
+
+/// D13's ordering on the ordinary path: the checkpoint items sit between the call and its result,
+/// which is what lets a rewind find "the state before this call" by scanning forward from the call.
+#[tokio::test]
+async fn a_call_that_wrote_records_its_checkpoints_before_its_result() {
+    let tools = ScriptedToolHost::new()
+        .advertising(&["write_file"])
+        .checkpointing("write_file", &["first-commit", "second-commit"])
+        .answering("write_file", ToolOutput::text("written"));
+    let provider = ScriptedProvider::new(vec![
+        ScriptedProvider::tool_round("call-1", "write_file", json!({})),
+        ScriptedProvider::text_round("done"),
+    ]);
+    let harness = Harness::new(
+        provider,
+        tools,
+        MemoryHistory::empty(),
+        TurnLimits::default(),
+    );
+    harness.prompt("write it").await;
+    let events = harness.finish().await;
+
+    let recorded = kinds(&events);
+    let call = recorded
+        .iter()
+        .position(|kind| *kind == ItemKindTag::ToolCall)
+        .expect("a call");
+    let result = recorded
+        .iter()
+        .position(|kind| *kind == ItemKindTag::ToolResult)
+        .expect("a result");
+    let checkpoints: Vec<usize> = recorded
+        .iter()
+        .enumerate()
+        .filter(|(_, kind)| **kind == ItemKindTag::Checkpoint)
+        .map(|(index, _)| index)
+        .collect();
+    assert_eq!(
+        checkpoints.len(),
+        2,
+        "one item per undo point: {recorded:?}"
+    );
+    assert!(
+        checkpoints
+            .iter()
+            .all(|index| call < *index && *index < result),
+        "… → ToolCall → Checkpoint → ToolResult, got {recorded:?}"
+    );
+
+    let items = finished_items(&events);
+    let commit_ids: Vec<&str> = items
+        .iter()
+        .filter_map(|item| match &item.kind {
+            ItemKind::Checkpoint(checkpoint) => Some(checkpoint.commit_id.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        commit_ids,
+        ["first-commit", "second-commit"],
+        "the write order is preserved"
+    );
+}
+
+/// A read-only call collects nothing, so a session without a shadow repository produces exactly the
+/// items it always did. Without this, the two tests above could pass because every call emits a
+/// checkpoint item somehow.
+#[tokio::test]
+async fn a_call_that_collected_nothing_records_no_checkpoint_item() {
+    let tools = ScriptedToolHost::new()
+        .advertising(&["read_file"])
+        .answering("read_file", ToolOutput::text("contents"));
+    let provider = ScriptedProvider::new(vec![
+        ScriptedProvider::tool_round("call-1", "read_file", json!({})),
+        ScriptedProvider::text_round("done"),
+    ]);
+    let harness = Harness::new(
+        provider,
+        tools,
+        MemoryHistory::empty(),
+        TurnLimits::default(),
+    );
+    harness.prompt("read it").await;
+    let events = harness.finish().await;
+
+    assert!(
+        !kinds(&events).contains(&ItemKindTag::Checkpoint),
+        "{:?}",
+        kinds(&events)
+    );
+}
+
 #[tokio::test]
 async fn interrupt_while_awaiting_approval_ends_the_turn() {
     let provider = ScriptedProvider::new(vec![ScriptedProvider::tool_round(

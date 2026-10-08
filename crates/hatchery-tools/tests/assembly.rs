@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use hatchery_capabilities::{Backends, ToolRegistry};
-use hatchery_kernel::ToolHost;
+use hatchery_kernel::{CheckpointCollector, ToolHost};
 use hatchery_testkit::MemoryFs;
 use tokio_util::sync::CancellationToken;
 
@@ -15,6 +15,9 @@ fn registry_on_disk(root: &std::path::Path) -> ToolRegistry {
     let backends = Backends {
         fs: Arc::new(hatchery_capabilities::LocalFs::new(root).expect("a valid workspace root")),
         terminal: Arc::new(hatchery_capabilities::NoTerminal),
+        // None, as in a Chat session: these tools only read, so there is nothing to checkpoint.
+        // The write path's checkpoint wiring is covered in `hatchery-capabilities`.
+        checkpointer: None,
     };
     let mut registry = ToolRegistry::new(backends);
     for tool in hatchery_tools::chat_tools() {
@@ -27,6 +30,7 @@ fn registry_on(fs: Arc<MemoryFs>) -> ToolRegistry {
     let backends = Backends {
         fs,
         terminal: Arc::new(hatchery_capabilities::NoTerminal),
+        checkpointer: None,
     };
     let mut registry = ToolRegistry::new(backends);
     for tool in hatchery_tools::chat_tools() {
@@ -71,6 +75,7 @@ async fn a_turn_round_trip_through_toolhost_reads_a_file() {
             serde_json::json!({"path": "guide.md"}),
             CancellationToken::new(),
             progress_tx,
+            CheckpointCollector::new(),
         )
         .await
         .expect("dispatched");
@@ -96,6 +101,7 @@ async fn glob_and_grep_see_the_same_workspace_through_the_same_backend() {
             serde_json::json!({"pattern": "**/*.rs"}),
             CancellationToken::new(),
             tx.clone(),
+            CheckpointCollector::new(),
         )
         .await
         .expect("glob runs");
@@ -111,6 +117,7 @@ async fn glob_and_grep_see_the_same_workspace_through_the_same_backend() {
             serde_json::json!({"pattern": "fn main", "include": "*.rs"}),
             CancellationToken::new(),
             tx,
+            CheckpointCollector::new(),
         )
         .await
         .expect("grep runs");
@@ -137,7 +144,13 @@ async fn chat_mode_approves_nothing_and_refuses_unknown_tools() {
 
     let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
     let error = registry
-        .invoke("shell", serde_json::json!({}), CancellationToken::new(), tx)
+        .invoke(
+            "shell",
+            serde_json::json!({}),
+            CancellationToken::new(),
+            tx,
+            CheckpointCollector::new(),
+        )
         .await
         .expect_err("not a Chat tool");
     assert!(error.to_string().contains("shell"), "{error}");
@@ -180,6 +193,7 @@ async fn the_disk_backend_serves_the_tools_and_refuses_a_symlink_escape() {
             serde_json::json!({"path": "src/lib.rs"}),
             CancellationToken::new(),
             tx.clone(),
+            CheckpointCollector::new(),
         )
         .await
         .expect("read inside");
@@ -192,6 +206,7 @@ async fn the_disk_backend_serves_the_tools_and_refuses_a_symlink_escape() {
             serde_json::json!({"path": "outside"}),
             CancellationToken::new(),
             tx,
+            CheckpointCollector::new(),
         )
         .await
         .expect("dispatched");
@@ -218,6 +233,7 @@ async fn glob_and_grep_walk_the_real_disk() {
             serde_json::json!({"pattern": "src/*.rs"}),
             CancellationToken::new(),
             tx.clone(),
+            CheckpointCollector::new(),
         )
         .await
         .expect("glob");
@@ -234,6 +250,7 @@ async fn glob_and_grep_walk_the_real_disk() {
             serde_json::json!({"pattern": "needle", "include": "*.rs"}),
             CancellationToken::new(),
             tx,
+            CheckpointCollector::new(),
         )
         .await
         .expect("grep");
@@ -259,6 +276,7 @@ async fn a_symlink_loop_is_skipped_not_fatal_for_the_walk() {
             serde_json::json!({"pattern": "**/*.txt"}),
             CancellationToken::new(),
             tx,
+            CheckpointCollector::new(),
         )
         .await
         .expect("the walk survives the loop");

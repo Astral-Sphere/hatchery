@@ -115,6 +115,15 @@ pub async fn run_until(options: RunOptions, external: CancellationToken) -> Resu
     if recovered > 0 {
         tracing::warn!("{recovered} interrupted turn(s) marked from a previous run");
     }
+    // Reclaims the shadow repositories whose sessions are all gone (storage.md open question 3).
+    // Deleting a session cascades its `checkpoints` rows away, and nothing else ever goes back to
+    // look at the directory those rows pointed into, so this is the only place an orphan can be
+    // noticed. Startup rather than a timer: it is one directory scan plus one query per entry, and
+    // the budget ladder runs it again whenever a workspace is over its limit.
+    let reclaimed = manager.checkpoints().sweep_orphans().await;
+    if reclaimed > 0 {
+        tracing::info!("{reclaimed} orphan shadow repositories reclaimed");
+    }
 
     let boot_token = format!("boot-{}", SessionId::new());
     let core = Arc::new(DaemonCore::new(

@@ -18,6 +18,7 @@
 //! Design: `docs/design/daemon.md`. Status: M1 — configuration layering, the prompt pipeline,
 //! transport, session manager, hub and the production entry (`entry`) are in.
 
+pub mod checkpoints;
 pub mod clock;
 pub mod config;
 pub mod core;

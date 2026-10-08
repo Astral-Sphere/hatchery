@@ -65,7 +65,9 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 # allocator is fine) and fts (tantivy is a heavy dependency we do not use). The engine's measured
 # behaviour is pinned by crates/hatchery-store/tests/spike_engine.rs — rerun it on any upgrade.
 turso = { version = "0.7.2", default-features = false }
-uuid = { version = "1.27", features = ["v7", "serde"] }
+# v7 mints the ids; v5 derives the shadow-repository directory name from a workspace path, which
+# needs a hash and would otherwise mean a hash dependency (uuid's v5 pulls sha1_smol, one crate).
+uuid = { version = "1.27", features = ["v5", "v7", "serde"] }
 
 proptest = "1.11.0"
 tempfile = "3.27.0"

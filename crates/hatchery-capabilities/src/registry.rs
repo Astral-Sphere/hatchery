@@ -13,9 +13,10 @@ use serde_json::Value;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio_util::sync::CancellationToken;
 
-use hatchery_kernel::{KernelError, ToolHost, ToolInvocation};
+use hatchery_kernel::{CheckpointCollector, KernelError, ToolHost, ToolInvocation};
 use hatchery_protocol::{ToolCallSummary, ToolProgress};
 
+use crate::checkpointed_fs::{CheckpointedFs, Checkpointer};
 use crate::fs::FsBackend;
 use crate::terminal::TerminalBackend;
 use crate::tool::{Tool, ToolCtx, ToolError};
@@ -27,6 +28,11 @@ pub struct Backends {
     pub fs: Arc<dyn FsBackend>,
     /// Process execution (absent in Chat mode; see [`crate::terminal::TerminalBackend`]).
     pub terminal: Arc<dyn TerminalBackend>,
+    /// The undo point taken before each write, absent when nothing in this session can write.
+    ///
+    /// `None` for a Chat session. For a Code one the daemon supplies an implementation that owns the
+    /// budget decision (D9) and delegates to the workspace's [`crate::CheckpointStore`].
+    pub checkpointer: Option<Arc<dyn Checkpointer>>,
 }
 
 /// The tools of one session, keyed by name.
@@ -96,12 +102,24 @@ impl ToolHost for ToolRegistry {
         args: Value,
         cancel: CancellationToken,
         progress: UnboundedSender<ToolProgress>,
+        checkpoints: CheckpointCollector,
     ) -> Result<ToolInvocation, KernelError> {
         let Some(tool) = self.tools.get(name) else {
             return Err(KernelError::tool(name, "not in this session's tool table"));
         };
+        // Wrapped per call, so two calls can never mix their undo points even if the kernel ever
+        // runs them concurrently. The collector itself is the kernel's and outlives this future:
+        // a cancelled call is dropped without another poll, and its writes still need their
+        // checkpoints (see `CheckpointCollector`).
+        let checkpointed = self.backends.checkpointer.as_deref().map(|checkpointer| {
+            CheckpointedFs::new(self.backends.fs.as_ref(), checkpointer, &checkpoints)
+        });
+        let fs: &dyn FsBackend = match &checkpointed {
+            Some(wrapper) => wrapper,
+            None => self.backends.fs.as_ref(),
+        };
         let ctx = ToolCtx {
-            fs: self.backends.fs.as_ref(),
+            fs,
             terminal: self.backends.terminal.as_ref(),
             cancel: cancel.clone(),
             emit: &move |chunk: ToolProgress| {
@@ -134,6 +152,7 @@ impl ToolHost for ToolRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::checkpointed_fs::PreWrite;
     use crate::fs::{FsEntry, FsError, FsMetadata};
     use crate::terminal::{
         TermError, TerminalBackend, TerminalHandle, TerminalOutcome, TerminalSpec,
@@ -152,6 +171,9 @@ mod tests {
             Ok(Vec::new())
         }
         async fn metadata(&self, path: &str) -> Result<FsMetadata, FsError> {
+            Err(FsError::NotFound(path.to_owned()))
+        }
+        async fn write_text_file(&self, path: &str, _contents: &str) -> Result<(), FsError> {
             Err(FsError::NotFound(path.to_owned()))
         }
     }
@@ -198,10 +220,7 @@ mod tests {
     }
 
     fn registry() -> ToolRegistry {
-        let mut reg = ToolRegistry::new(Backends {
-            fs: Arc::new(NoFs),
-            terminal: Arc::new(NoTerminal),
-        });
+        let mut reg = ToolRegistry::new(backends_only());
         reg.register(Arc::new(Echo));
         reg
     }
@@ -210,6 +229,7 @@ mod tests {
         Backends {
             fs: Arc::new(NoFs),
             terminal: Arc::new(NoTerminal),
+            checkpointer: None,
         }
     }
 
@@ -232,6 +252,7 @@ mod tests {
                 json!({"path": "src/main.rs"}),
                 CancellationToken::new(),
                 tx,
+                CheckpointCollector::new(),
             )
             .await
             .expect("runs");
@@ -240,12 +261,112 @@ mod tests {
         assert!(rx.try_recv().is_err(), "echo emits no progress");
     }
 
+    /// The registry's half of D13: the collector the kernel lends is the one the decorator fills.
+    /// Nothing else in the chain can see the write, so if this threading were wrong the checkpoints
+    /// would be collected into a buffer nobody drains and every rewind target would silently vanish.
+    ///
+    /// `NoFs` refuses the write, and the checkpoint is still there — which is the intended order of
+    /// operations: the undo point describes the state *before*, and a write that failed halfway has
+    /// still left something behind to undo.
+    #[tokio::test]
+    async fn a_checkpointer_on_the_backends_fills_the_callers_collector() {
+        struct Writes;
+        #[async_trait]
+        impl Tool for Writes {
+            fn def(&self) -> hatchery_kernel::ToolDef {
+                hatchery_kernel::ToolDef {
+                    name: "writes".to_owned(),
+                    description: String::new(),
+                    parameters: json!({}),
+                }
+            }
+            fn needs_approval(&self, _args: &Value) -> Option<hatchery_protocol::ApprovalRequest> {
+                None
+            }
+            fn summarize(&self, _args: &Value) -> ToolCallSummary {
+                ToolCallSummary::new("writes")
+            }
+            async fn execute(
+                &self,
+                ctx: ToolCtx<'_>,
+                _args: Value,
+            ) -> Result<hatchery_protocol::ToolOutput, ToolError> {
+                ctx.fs
+                    .write_text_file("a.txt", "content")
+                    .await
+                    .map_err(ToolError::from)?;
+                Ok(hatchery_protocol::ToolOutput::text("written"))
+            }
+        }
+
+        struct OneCheckpoint;
+        #[async_trait]
+        impl Checkpointer for OneCheckpoint {
+            async fn pre_write(&self) -> Result<PreWrite, crate::CheckpointError> {
+                Ok(PreWrite::Taken(hatchery_protocol::Checkpoint {
+                    commit_id: "shadow-commit".to_owned(),
+                    kind: hatchery_protocol::CheckpointKind::PreWrite,
+                }))
+            }
+        }
+
+        let mut reg = ToolRegistry::new(Backends {
+            fs: Arc::new(NoFs),
+            terminal: Arc::new(NoTerminal),
+            checkpointer: Some(Arc::new(OneCheckpoint)),
+        });
+        reg.register(Arc::new(Writes));
+
+        let collector = CheckpointCollector::new();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let invocation = reg
+            .invoke(
+                "writes",
+                json!({}),
+                CancellationToken::new(),
+                tx,
+                collector.clone(),
+            )
+            .await
+            .expect("dispatches");
+
+        assert!(invocation.is_error, "NoFs refused the write");
+        let collected = collector.drain();
+        assert_eq!(collected.len(), 1, "the caller's collector was filled");
+        assert_eq!(collected[0].commit_id, "shadow-commit");
+    }
+
+    /// Without a checkpointer there is no decorator either, so a Chat session's registry behaves
+    /// exactly as it did before the write path existed.
+    #[tokio::test]
+    async fn no_checkpointer_means_nothing_is_collected() {
+        let reg = registry();
+        let collector = CheckpointCollector::new();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        reg.invoke(
+            "zz_echo",
+            json!({"path": "a.txt"}),
+            CancellationToken::new(),
+            tx,
+            collector.clone(),
+        )
+        .await
+        .expect("runs");
+        assert!(collector.is_empty());
+    }
+
     #[tokio::test]
     async fn an_unknown_tool_is_a_kernel_tool_error_naming_it() {
         let reg = registry();
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let error = reg
-            .invoke("nope", json!({}), CancellationToken::new(), tx)
+            .invoke(
+                "nope",
+                json!({}),
+                CancellationToken::new(),
+                tx,
+                CheckpointCollector::new(),
+            )
             .await
             .expect_err("unknown");
         let KernelError::Tool { name, .. } = &error else {
@@ -298,7 +419,7 @@ mod tests {
         cancel.cancel();
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let invocation = reg
-            .invoke("slow", json!({}), cancel, tx)
+            .invoke("slow", json!({}), cancel, tx, CheckpointCollector::new())
             .await
             .expect("returns, does not hang");
         assert!(

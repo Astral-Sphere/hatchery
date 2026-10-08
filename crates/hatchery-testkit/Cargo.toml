@@ -14,6 +14,9 @@ authors.workspace = true
 [dependencies]
 async-trait.workspace = true
 futures.workspace = true
+# `TempWorkspace::git()` builds the dirty user repository invariant 6 needs, which means real git
+# plumbing in the harness rather than in every test that wants one.
+git2.workspace = true
 hatchery-capabilities.workspace = true
 hatchery-daemon.workspace = true
 hatchery-kernel.workspace = true

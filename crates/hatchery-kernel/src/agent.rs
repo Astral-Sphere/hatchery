@@ -20,7 +20,7 @@ use crate::message::{
 };
 use crate::sink::KernelEvent;
 use crate::state::{Ports, TurnCompletion, TurnLimits, TurnState};
-use crate::tools::ToolInvocation;
+use crate::tools::{CheckpointCollector, ToolInvocation};
 
 /// How many commands may queue before a submitter is made to wait.
 const COMMAND_CAPACITY: usize = 64;
@@ -582,6 +582,9 @@ impl Agent {
     ) -> Result<Option<ToolInvocation>, KernelError> {
         let id = ItemId::new();
         let parent = self.tail;
+        // Created here rather than inside `invoke_tool` so that it outlives the call: an interrupt
+        // drops the invocation future, and the undo points it collected must still be reachable.
+        let collector = CheckpointCollector::new();
         let stub = hatchery_protocol::ItemStub {
             id,
             parent,
@@ -631,12 +634,18 @@ impl Agent {
                 ToolStatus::Denied,
             ),
             Some(_) => match self
-                .invoke_tool(&request.name, request.args.clone(), id)
+                .invoke_tool(&request.name, request.args.clone(), id, &collector)
                 .await?
             {
                 ToolRun::Interrupted => {
                     self.commit_call(id, parent, request, ToolStatus::Cancelled)
                         .await;
+                    // The call is abandoned but its writes are not: whatever it managed to change
+                    // before the interrupt is still on the user's disk, and this is the only
+                    // moment at which the undo points for it can still be recorded. Without them a
+                    // Code rewind aimed at this call scans forward past it and restores a state
+                    // that includes the damage.
+                    self.append_checkpoints(&collector).await;
                     return Ok(None);
                 }
                 ToolRun::Done(invocation) => {
@@ -651,6 +660,11 @@ impl Agent {
         };
 
         self.commit_call(id, parent, request, status).await;
+        // D13: the undo points this call's writes left behind become items here, between the call
+        // and its result. The kernel already builds both ends of that pair, so the order is correct
+        // by construction rather than by agreement between two layers — and inserting between them
+        // is safe because a result is matched to its call by `ToolResult.call`, never by parenthood.
+        self.append_checkpoints(&collector).await;
         self.append(ItemKind::ToolResult(ToolResult {
             call: id,
             output: invocation.output.clone(),
@@ -658,6 +672,18 @@ impl Agent {
         }))
         .await;
         Ok(Some(invocation))
+    }
+
+    /// Turns the undo points one call collected into [`ItemKind::Checkpoint`] items.
+    ///
+    /// Called on every path out of a dispatch — finished, failed, denied and interrupted — because
+    /// a checkpoint describes what a write did to the workspace, and that is true whether or not
+    /// the call survived to report it. Empty for a read-only call and for a session with no shadow
+    /// repository, so this is a no-op in the cases that used to be the only cases.
+    async fn append_checkpoints(&mut self, collector: &CheckpointCollector) {
+        for checkpoint in collector.drain() {
+            self.append(ItemKind::Checkpoint(checkpoint)).await;
+        }
     }
 
     /// Invokes a tool, forwarding progress and watching for an interrupt.
@@ -670,10 +696,17 @@ impl Agent {
         name: &str,
         args: Value,
         call_item: ItemId,
+        checkpoints: &CheckpointCollector,
     ) -> Result<ToolRun, KernelError> {
         let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<ToolProgress>();
         let tools = Arc::clone(&self.ports.tools);
-        let invoke = tools.invoke(name, args, self.cancel.clone(), progress_tx);
+        let invoke = tools.invoke(
+            name,
+            args,
+            self.cancel.clone(),
+            progress_tx,
+            checkpoints.clone(),
+        );
         tokio::pin!(invoke);
 
         loop {

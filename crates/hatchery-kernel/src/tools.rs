@@ -4,12 +4,14 @@
 //! (L2). If the kernel named any of them it would depend upwards and cycle, so the whole tool
 //! layer is hidden behind these three methods (M0a correction, `docs/architecture.md` §3).
 
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+
 use async_trait::async_trait;
 use serde_json::Value;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio_util::sync::CancellationToken;
 
-use hatchery_protocol::{ApprovalRequest, ToolCallSummary, ToolOutput, ToolProgress};
+use hatchery_protocol::{ApprovalRequest, Checkpoint, ToolCallSummary, ToolOutput, ToolProgress};
 
 use crate::error::KernelError;
 use crate::message::ToolDef;
@@ -46,6 +48,63 @@ impl ToolInvocation {
     }
 }
 
+/// Where one call's undo points are collected, owned by the kernel and lent to the tool host.
+///
+/// The obvious shape is a `Vec<Checkpoint>` field on [`ToolInvocation`], and that is what D13
+/// originally specified. It does not survive cancellation, and cancellation is ordinary: the
+/// kernel's tool select is cancel-first, so an interrupted invocation is **dropped without ever
+/// being polled again** (the fact is already load-bearing in `hatchery-testkit`'s fake host, which
+/// needs a drop guard to observe it at all). Anything the call was going to return dies with it —
+/// while the writes it already made to the user's workspace do not. A cancelled `write_file` would
+/// then leave a half-written file that no item points at, and a Code rewind aimed at that call
+/// would scan forward past it and restore a state that *includes* the damage.
+///
+/// Handing the host a shared collector instead means the kernel keeps the checkpoints whether or
+/// not the call ever returns, which is the only arrangement in which "interrupt" and "undoable"
+/// can both be true.
+#[derive(Clone, Debug, Default)]
+pub struct CheckpointCollector {
+    inner: Arc<Mutex<Vec<Checkpoint>>>,
+}
+
+impl CheckpointCollector {
+    /// An empty collector.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Records one undo point, in the order the writes happened.
+    pub fn push(&self, checkpoint: Checkpoint) {
+        self.slots().push(checkpoint);
+    }
+
+    /// Takes everything collected so far, leaving the collector empty.
+    #[must_use]
+    pub fn drain(&self) -> Vec<Checkpoint> {
+        std::mem::take(&mut *self.slots())
+    }
+
+    /// True when nothing has been collected — every read-only call, and every session without a
+    /// shadow repository.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.slots().is_empty()
+    }
+
+    /// How many undo points are waiting.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.slots().len()
+    }
+
+    /// Pushing cannot leave the vector half-updated, so a panic somewhere else in the process is
+    /// not a reason to lose the undo points collected before it.
+    fn slots(&self) -> MutexGuard<'_, Vec<Checkpoint>> {
+        self.inner.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
 /// The tools available to one turn.
 #[async_trait]
 pub trait ToolHost: Send + Sync {
@@ -74,6 +133,10 @@ pub trait ToolHost: Send + Sync {
     /// this call *and* forward progress asynchronously while it runs, which a synchronous
     /// callback cannot do.
     ///
+    /// `checkpoints` is the kernel's, lent for the duration of the call: every undo point a write
+    /// takes belongs in it, pushed as the write happens. See [`CheckpointCollector`] for why this
+    /// is a shared collector rather than a field on the returned invocation.
+    ///
     /// # Errors
     ///
     /// Only for failures that stop the loop — the backend is gone, the call could not be
@@ -85,5 +148,6 @@ pub trait ToolHost: Send + Sync {
         args: Value,
         cancel: CancellationToken,
         progress: UnboundedSender<ToolProgress>,
+        checkpoints: CheckpointCollector,
     ) -> Result<ToolInvocation, KernelError>;
 }

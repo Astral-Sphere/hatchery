@@ -7,6 +7,14 @@
 //!   pointing out is caught by the second check, which the lexical one cannot see.
 //! * **No text from binaries.** A NUL byte in the first kilobyte means the file is refused, not
 //!   lossily mangled: a model that asks to read a PNG should hear so, not receive mojibake.
+//!
+//! Writes obey the same two rules and add a third problem of their own: a write target usually does
+//! not exist yet, so it cannot be canonicalised. `resolve_write` therefore anchors on the deepest
+//! ancestor that *does* resolve, which is also what keeps `create_dir_all` from building directories
+//! on the far side of a symlinked ancestor.
+//!
+//! What this backend does **not** do is checkpoint. That is [`crate::CheckpointedFs`]'s job, so the
+//! snapshot precedes a write through *any* backend and the local one stays a filesystem.
 
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
@@ -54,10 +62,23 @@ impl LocalFs {
     /// The two-stage check (lexical, then on-disk) is the whole security story: absolute paths
     /// and `..` are rejected before touching the disk, and symlink escapes after.
     fn resolve(&self, path: &str) -> Result<PathBuf, FsError> {
-        let relative = Path::new(path);
         if path.is_empty() {
             return Ok(self.root.as_ref().clone());
         }
+        let joined = self.lexical(path)?;
+        let resolved = std::fs::canonicalize(&joined).map_err(|error| match error.kind() {
+            std::io::ErrorKind::NotFound => FsError::NotFound(path.to_owned()),
+            _ => FsError::Io(format!("{path}: {error}")),
+        })?;
+        self.confine(&resolved, path)
+    }
+
+    /// The lexical half of path resolution: workspace-relative in, root-joined out.
+    ///
+    /// Shared with [`Self::resolve_write`], which cannot canonicalise its way through a path that
+    /// does not exist yet.
+    fn lexical(&self, path: &str) -> Result<PathBuf, FsError> {
+        let relative = Path::new(path);
         if relative.is_absolute() {
             return Err(FsError::OutsideWorkspace(format!(
                 "{path} is absolute; paths are workspace-relative"
@@ -82,19 +103,88 @@ impl LocalFs {
                 }
             }
         }
+        Ok(self.root.join(&lexical))
+    }
 
-        let joined = self.root.join(&lexical);
-        let resolved = std::fs::canonicalize(&joined).map_err(|error| match error.kind() {
-            std::io::ErrorKind::NotFound => FsError::NotFound(path.to_owned()),
-            _ => FsError::Io(format!("{path}: {error}")),
-        })?;
+    /// Refuses a resolved path that is not inside the root.
+    fn confine(&self, resolved: &Path, path: &str) -> Result<PathBuf, FsError> {
         if !resolved.starts_with(self.root.as_ref()) {
             return Err(FsError::OutsideWorkspace(format!(
                 "{path} resolves to {} via a symlink, outside the workspace",
                 resolved.display()
             )));
         }
-        Ok(resolved)
+        Ok(resolved.to_path_buf())
+    }
+
+    /// Resolves a path that may not exist yet, which is the normal case for a write.
+    ///
+    /// [`Self::resolve`] cannot be reused: `canonicalize` fails on a missing file, so the write
+    /// path anchors on the deepest ancestor that *does* resolve and rebuilds the rest below it.
+    /// Two escapes this has to close, both of which the lexical check cannot see:
+    ///
+    /// * a **symlinked ancestor** — `link/` pointing at `/etc` would let `create_dir_all` build
+    ///   `/etc/new/` before anything was verified, so the ancestor is canonicalised *first* and
+    ///   the missing components are only appended once it is inside the root;
+    /// * a **dangling symlink** at the target — writing "through" it creates the file at the
+    ///   link's destination, outside the workspace and outside every checkpoint, so an entry that
+    ///   exists but does not resolve is refused rather than followed.
+    fn resolve_write(&self, path: &str) -> Result<PathBuf, FsError> {
+        let joined = self.lexical(path)?;
+
+        if std::fs::symlink_metadata(&joined).is_ok() {
+            let resolved = std::fs::canonicalize(&joined).map_err(|error| {
+                FsError::Io(format!(
+                    "{path} exists but does not resolve (a broken symlink?): {error}"
+                ))
+            })?;
+            return self.confine(&resolved, path);
+        }
+
+        let name = joined
+            .file_name()
+            .ok_or_else(|| {
+                FsError::WrongKind(format!("{path} is the workspace itself, not a file"))
+            })?
+            .to_os_string();
+        let parent = joined.parent().unwrap_or(self.root.as_ref()).to_path_buf();
+        let (ancestor, missing) = self.canonical_ancestor(&parent, path)?;
+        let mut target = self.confine(&ancestor, path)?;
+        for component in &missing {
+            target.push(component);
+        }
+        target.push(name);
+        Ok(target)
+    }
+
+    /// Canonicalises the deepest ancestor of `path` that resolves, returning it together with the
+    /// component names below it that do not exist yet.
+    fn canonical_ancestor(
+        &self,
+        path: &Path,
+        original: &str,
+    ) -> Result<(PathBuf, Vec<std::ffi::OsString>), FsError> {
+        let mut candidate = path.to_path_buf();
+        let mut missing: Vec<std::ffi::OsString> = Vec::new();
+        loop {
+            match std::fs::canonicalize(&candidate) {
+                Ok(canonical) => {
+                    missing.reverse();
+                    return Ok((canonical, missing));
+                }
+                Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                    return Err(FsError::Io(format!("{original}: {error}")));
+                }
+                Err(_) => {}
+            }
+            let name = candidate.file_name().ok_or_else(|| {
+                FsError::NotFound(format!(
+                    "{original} has no ancestor inside the workspace that exists"
+                ))
+            })?;
+            missing.push(name.to_os_string());
+            candidate.pop();
+        }
     }
 
     fn sniff_text(resolved: &Path, path: &str) -> Result<(), FsError> {
@@ -182,6 +272,35 @@ impl crate::fs::FsBackend for LocalFs {
             is_file: meta.is_file(),
             len: meta.len(),
         })
+    }
+
+    async fn write_text_file(&self, path: &str, contents: &str) -> Result<(), FsError> {
+        if path.is_empty() {
+            return Err(FsError::WrongKind(
+                "the empty path is the workspace itself, not a file".to_owned(),
+            ));
+        }
+        let target = self.resolve_write(path)?;
+        // Checked before the parents are created: a directory in the way is a wrong kind, not an
+        // io accident, and `create_dir_all` on its parent would otherwise succeed and leave the
+        // real failure to surface from `write` as EISDIR.
+        if tokio::fs::metadata(&target)
+            .await
+            .map(|meta| meta.is_dir())
+            .unwrap_or(false)
+        {
+            return Err(FsError::WrongKind(format!(
+                "{path} is a directory, not a file"
+            )));
+        }
+        if let Some(parent) = target.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|error| FsError::Io(format!("{path}: {error}")))?;
+        }
+        tokio::fs::write(&target, contents)
+            .await
+            .map_err(|error| FsError::Io(format!("{path}: {error}")))
     }
 }
 
