@@ -50,9 +50,7 @@ pub fn run(args: &[String]) -> Result<()> {
         ));
     }
 
-    let json_path = std::env::current_dir()
-        .context("current dir")?
-        .join("target/llvm-cov/coverage.json");
+    let json_path = report_path_under(&std::env::current_dir().context("current dir")?)?;
     let report = Command::new(env!("CARGO"))
         .args([
             "llvm-cov",
@@ -128,6 +126,23 @@ pub fn run(args: &[String]) -> Result<()> {
         "coverage below the floors (docs/design/testing.md §8):\n  {}",
         deficits.join("\n  ")
     ))
+}
+
+/// Where the JSON report goes, with its parent directory created first.
+///
+/// `--output-path` does not create parents, and `cargo llvm-cov` keeps its instrumented build in
+/// `target/llvm-cov-target/` — it never makes `target/llvm-cov/`. So handing it that path failed
+/// with "No such file or directory" *after* the whole instrumented test run had already succeeded,
+/// which reads like a coverage problem and is a missing `mkdir`. Taking the base directory as an
+/// argument is what makes this testable without touching the real target directory.
+fn report_path_under(base: &std::path::Path) -> Result<std::path::PathBuf> {
+    let path = base.join("target/llvm-cov/coverage.json");
+    let parent = path
+        .parent()
+        .context("the report path always has a parent")?
+        .to_path_buf();
+    std::fs::create_dir_all(&parent).with_context(|| format!("creating {}", parent.display()))?;
+    Ok(path)
 }
 
 /// Executable-line totals for one crate.
@@ -239,6 +254,29 @@ fn ensure_installed() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The gate must not fail *after* the instrumented run has already succeeded: `--output-path`
+    /// does not create its parent directory, and nothing else in the pipeline does either.
+    #[test]
+    fn the_report_path_creates_its_own_parent() {
+        let base = std::env::temp_dir().join(format!(
+            "hatchery-xtask-coverage-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+
+        let path = report_path_under(&base).expect("creates the parent");
+        assert!(path.parent().expect("a parent").is_dir(), "{path:?}");
+        assert_eq!(path.file_name().expect("a name"), "coverage.json");
+        // Idempotent: the gate runs repeatedly against one target directory.
+        assert_eq!(report_path_under(&base).expect("again"), path);
+
+        std::fs::remove_dir_all(&base).expect("cleanup");
+    }
 
     #[test]
     fn files_fold_into_crates_and_tests_do_not_count() {
