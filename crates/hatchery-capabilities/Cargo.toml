@@ -1,0 +1,36 @@
+[package]
+name = "hatchery-capabilities"
+description = "Capability seam: filesystem, terminal and approval backends, shadow-git checkpoints, tool registry"
+keywords = ["agent", "sandbox", "checkpoint", "git", "hatchery"]
+categories = ["filesystem"]
+readme = "README.md"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+git2.workspace = true
+hatchery-kernel.workspace = true
+hatchery-protocol.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+# `fs` drives the LocalFs read path; the workspace tokio default features cover it.
+tokio = { workspace = true, features = ["fs"] }
+tokio-util.workspace = true
+tracing.workspace = true
+# `v5` only: the shadow-repository directory name is a name-based UUID of the workspace path, so
+# that the same workspace always maps to the same git dir without a hash dependency of our own.
+uuid.workspace = true
+
+[dev-dependencies]
+hatchery-testkit.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

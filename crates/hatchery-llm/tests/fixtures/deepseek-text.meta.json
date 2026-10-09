@@ -1,0 +1,12 @@
+{
+  "http_status": 200,
+  "model": "deepseek-flash",
+  "provenance": "recorded",
+  "provider": "deepseek",
+  "recorded_at_unix": 1790843639,
+  "recorded_at_utc": "2026-10-01T08:33:59Z",
+  "recorder": "cargo xtask record-fixtures",
+  "sanitizer": "exact-key and sk-pattern scan passed",
+  "shape": "plain streaming text with a trailing usage-only chunk",
+  "wire": "chat-completions"
+}

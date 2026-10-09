@@ -1,31 +1,168 @@
 # 工作记录：存储与分支（hatchery-store）
 
-- 范围：SessionStore trait、libSQL schema、writer actor、分支查询、迁移、JSONL 导出
+- 范围：SessionStore trait、引擎 schema、writer actor、分支查询、迁移、JSONL 导出
 - 设计文档：[../design/storage.md](../design/storage.md)
-- 相关 ADR：0002、0003、0006
+- 相关 ADR：0002、0003、0006、**0010**
 
 ## 当前状态
 
-设计稿完成，未实现。schema v1 与 writer actor 命令表已定。
+**M0b 完成（2026-09-28），评审后的两轮修复已入库（2026-09-29 / 2026-09-30）**：schema v1 迁移、writer actor、`SessionStore` 全量实现（含分支操作与 JSONL 导出）、属性测试与 kill -9 崩溃恢复测试全部落地；评审发现的契约缺口（错误分类、事务边界、导出原子性、迁移死支）与测试可信度问题已修完。设计文档 `docs/design/storage.md` 已按实现重写。
+
+**M1 期间 trait 又长了两个方法**：`bump_generation`（2026-10-01，Phase 3）与 `open_turns`（2026-10-03，de8b743；daemon 启动时把没人再跑的 turn 行收成失败，manager.rs:113，store 侧直接测试 `open_turns_lists_only_open_turns_across_sessions`）。`open_turns` 此前**没有变更日志条目**，2026-10-07 对账时补记。设计文档 §1 的 trait 代码块与 §3 的 `StoreCmd` 列表都只列到 M0b 的形状，本次已补齐。
+
+**分支三原语是 M0b 的交付物，不是 M2 的增量**：`edit_fork`（actor.rs:744-769）、`switch_branch`（:771-785）、`delete_branch`（:787-841）、`branch_tree` 全部实现，有专测 + 属性测试对拍独立 `ReferenceTree` + kill -9 探针。M2 在 store 侧的增量是：rewind 三 scope 的**组合逻辑**（Phase 3）、`checkpoints` 与 `approval_rules` 两张表的 **API 层**（Phase 1 / Phase 2）、以及级联删除驱动的**影子 git commit GC**（Phase 1）。
+
+**`checkpoints` 与 `approval_rules` 两张表零 Rust 代码**（2026-10-07 勘察）：无 `StoreCmd` 变体、无 trait 方法、无 `sql.rs` 行转换，**也没有一行测试写入过它们**——引擎 spike 只断言两张表存在（spike_engine.rs:276-277）与 checkpoint 随 item 级联删除（`delete_branch_cascades_and_refuses_while_head_is_inside`，:395 起，断言在 :440-444）。两张表都在 v1 schema 里，schema 版本仍是 1、`MIGRATIONS`（migrations.rs:17）只有一项，所以 **M2 不需要新迁移**，缺的只是 API 层。读路径今天仍全部串行经单写者 actor（正确优先）；只读连接池 2026-10-03 已由 M1 改标 **M3**。
 
 ## 待办
 
-- [ ] (M0) **libSQL spike（实测，勿靠文档推断）**：embedded WAL 多读连接并发、busy 行为、append-only 触发器、`user_version`/迁移、崩溃后 WAL 恢复；结论写回本文件
-- [ ] (M0) schema v1 落地 + 迁移框架（schema_meta）
-- [ ] (M0) writer actor + StoreCmd 全量实现 + 有界背压
-- [ ] (M0) rebuild_history（递归 CTE + compaction 区间应用）+ 属性测试（随机编辑序列 vs 纯 Vec 参考实现）
-- [ ] (M0) EditFork / SwitchBranch / DeleteBranch（级联 + active_head 校验）+ 崩溃测试（kill -9）
-- [ ] (M2) checkpoints 表与 CheckpointStore 的联动（级联删除时 GC）
-- [ ] (M2) JSONL 导出
+- [x] (M0) **引擎 spike（实测，勿靠文档推断）**：turso 0.7.2 全门槛实测 → 选中；结论落 ADR-0010，测试沉淀为常驻回归（见下「实测记录」）
+- [x] (M0b) schema v1 落成 `include_str!` 迁移脚本 + 迁移框架（`user_version` + `schema_meta` 双记录，每迁移一个事务，拒绝新版本库）
+- [x] (M0b) writer actor + StoreCmd 全量实现 + 有界背压（1024）
+- [x] (M0b) rebuild_chain（**内存走树**，引擎无递归 CTE）+ 属性测试（随机编辑序列 vs testkit 里独立写的 `ReferenceTree`）
+- [x] (M0b) EditFork / SwitchBranch / DeleteBranch（内存 BFS 收子树 + active_head 校验 + 级联删 + **数量交叉校验**）
+- [x] (M0b) kill -9 崩溃测试（**测试二进制自重入**，不新增 target；五种 StoreCmd 各一次 + 恢复后仍可用）
+- [x] (M0b) ExportJsonl（从 M2 提前：逃生通道成本低、测试便宜）
+- [ ] (M3) 只读连接池与 spawn_blocking 读路径接线（2026-10-03 由 M1 改标 M3：M1 未排期此项，读一直走单写者 actor；等读吞吐成为实测瓶颈再做）。**design/storage.md §3 与开放问题 6 此前仍写 M1，2026-10-07 已改为 M3**
+- [ ] (M2 · Phase 1) checkpoints 表与 CheckpointStore 联动（级联删除时 GC；checkpoint **行**随 session/item 级联删已由引擎门槛测试锁定，但影子仓库里的 **commit 对象不会自己消失**，删分支要显式驱动 git 侧 GC）
+- [ ] (M2 · Phase 1) `checkpoints` 表的 API 层：记录一行 + 按 workspace 列举（供跨会话的预算核算与 GC）。表已在 v1 schema 里，**M2 不需要新迁移**
+- [ ] (M2 · Phase 1) 孤儿影子仓库 GC（设计文档开放问题 3，「会话删了但影子仓库残留」）。可行是因为 checkpoint 行随会话级联删——「workspace X 还有行吗？」就是那个判据
+- [ ] (M2 · Phase 1) **D9**：检查点超预算时的行为（GC 最旧 vs 拒写）
+- [ ] (M2 · Phase 2) `approval_rules` 的读写 API，随 **D8** 定的 scope/matcher/decision 文法与求值顺序。表只有 `id/scope/matcher/decision/created_at`——**无排序列、无 enabled 列、`scope` 是裸 TEXT、无 session 外键**，所以求值顺序与匹配语义必须由 D8 定义，不能指望从 schema 读出来
+- [ ] (M2 · Phase 3) rewind 三 scope 的组合逻辑（store 侧今天只有原语）：`Both` 的顺序是**先 restore 代码、成功再移 head**（restore 失败绝不能已经把历史移走）；restore 前的安全快照记进 `checkpoints` 表、`item_id = NULL`、**不建 item**（它是 undo-of-undo，不属于对话历史——该列可空正是为此留的）
+- [ ] (M2 · Phase 7) `bump_generation` 在 store crate 内的直接测试（现仅 daemon 侧调用方覆盖：manager.rs:529 / :732）
+- [ ] (M5) compaction 的 span 解析：`ItemIdRange` 是**位置**语义，要在树遍历里按链定位两端点（protocol 侧不提供 `contains`，理由见 worklog/protocol.md 2026-09-30 条）
 - [ ] (M5) 导入
+
+## 实测记录（2026-09-28，turso 0.7.2，Linux x86_64）
+
+除标注「推测」的两条解释外全部为**实测**；`cargo nextest run -p hatchery-store --nocapture` 可复现。
+
+通过的门槛：
+
+- schema v1 全量 DDL 一批 `execute_batch` 生效（6 表 + 2 索引 + 触发器 + FK）
+- `items_no_update` 触发器 `RAISE(ABORT,'items are append-only')` 真拦 UPDATE，错误带我们的消息，行内容不变；INSERT/DELETE 仍合法 → **不变量 3 由数据库强制**
+- `PRAGMA foreign_keys = ON` 真强制（引用不存在 session 的 item 被拒）
+- `ON DELETE CASCADE` 沿 `parent_id` 链删整棵子树 + 关联 checkpoint
+- active_head 指向待删子树时删除被外键拒绝 → testing.md §3.4 `delete_branch_refuses_when_active_head_inside` 白拿一层数据库兜底
+- WAL：写事务开启时另一连接读已提交 ✅、读不到未提交 ✅、commit 后立即可见 ✅
+- `PRAGMA user_version` 跨重开保留（迁移钩子可用）
+- 重开后 20 条已提交 item 全在；**关闭后留下 `-wal`，没有生成 `-shm`**
+- `PRAGMA synchronous = NORMAL` 被接受且回读 1 → **上游 COMPAT.md 的「只支持 OFF/FULL」是过时的**
+
+不通过 / 需要绕开：
+
+- `WITH RECURSIVE` 不支持（与 COMPAT.md 一致）→ `rebuild_history` 与 `DeleteBranch` 改内存走树；tripwire 常量 `SPIKE_RECURSIVE_CTE_SUPPORTED = false`，上游补上后测试会主动失败
+
+性能（WAL，每 item 边界一次提交）：
+
+- `synchronous` NORMAL / FULL / OFF：500 次提交各 1251 / 1222 / 1351 µs 每次 —— 差异在噪声内，OFF 反而最慢。**推测**：pragma 被解析并回读，但不改变 fsync 行为
+- 单个事务批量 500 insert：1212 µs/insert，**比逐条自动提交（771 µs/commit）更慢** → ADR-0002 的「item 边界即提交」不必为性能妥协
+- 1000 行骨架查询 `(id, parent_id)`：3.4–6.9 ms
+
+API 怪癖（写 store 实现时一定会踩）：
+
+- `PRAGMA journal_mode = WAL` 返回一行 → 必须走 `query()`；用 `execute()` 报 `Misuse("unexpected row during execution")`
+- `commit` 是保留字，不能作列名（`near "commit": syntax error`）→ 改 `commit_id`
+- `sessions.active_head NOT NULL` 与 `items.session_id NOT NULL` 互为外键 → 两边都插不进去；`active_head` 必须可空（NULL = 尚无 item）
+- `Value` 只有 `Null/Integer(i64)/Real(f64)/Text(String)/Blob(Vec<u8>)`：UUID 走 TEXT，时间戳走 INTEGER
+- `Connection::transaction()` 要 `&mut self`，`unchecked_transaction()` 只要 `&self`；`Transaction` Deref 到 `Connection`，drop 默认回滚
+- `Builder::experimental_triggers(bool)` 是 no-op，源码注释写着 "Triggers are now always enabled"（`experimental_strict` 同理）
+- `default-features = false` 去掉 mimalloc 与 fts（tantivy）后，整棵依赖树增量编译约 25 s
+
+## 实测记录 · M0b（2026-09-28，turso 0.7.2）
+
+写 store 时必然要碰的 API 事实。前两条是**读上游源码**得到的（`~/.cargo/registry/.../turso-0.7.2/src/params.rs` 与 `connection.rs`），其余由本 crate 的测试覆盖：
+
+- **绑定参数的类型与方法**：`Connection::{execute,query}(sql, impl IntoParams)`；`IntoParams` 是 sealed trait，可用形态为 ≤16 项的**元组**（异构）、同类型数组、`Vec<T>`，以及动态个数的 `params_from_iter`。`IntoValue` 由 `TryInto<Value>` 统一实现，`Value` 本身也可直接绑。
+- **`Option<T>` 绑成 NULL**：`impl<T: Into<Value>> From<Option<T>> for Value`，所以可空列直接绑 `Option<&str>`/`Option<i64>`，不必拼 SQL。
+- **`Connection::unchecked_transaction()` 是 `async`**，要 `.await`；`Transaction` Deref 到 `Connection`，drop 默认回滚。
+- **DDL 可以放在事务里**：`migrate()` 把 `execute_batch(DDL)` + 写 `user_version` + 写 `schema_meta` 放进同一个 `unchecked_transaction` 并提交，全部测试通过（`migrations_run_once_and_both_records_agree`）——半套 schema 的隐患因此不存在。
+- **必须把 `Rows` 读到结束**：上游源码注释写着「Discard remaining rows ... Otherwise Drop of the statement will cause transaction rollback」。所有行读取辅助函数末尾都 `drain` 到空，否则一条半读的查询会让**后续**写入失败，错误现场与病因毫无关系。
+- **`execute` 的返回值只算直接删除的行**（M0a 已测）：所以 `delete_branch` 的计数必须来自我们自己的走树，并与删除前后的行数差交叉校验。
+- **`Builder::new_local(path: &str)` 收 `&str`**（不是 `AsRef<Path>`），`Database` 要与连接一起保活：`Writer` 持有 `_database` 字段。
+- **payload 分块取 200 个 id 一批**：引擎的参数上限没有文档，300 条链的测试（两次分块）证明可行；上限不是实测出来的，因此选了保守值。
+- **`cargo-llvm-cov` 不在本机**，`cargo xtask coverage` 按设计 fail-loud 报安装命令。覆盖率数字因此**未测**（阈值 enforcement 本来就排在 M1）。
 
 ## 开放问题
 
-见设计文档末尾 3 条（libsql crate 选型、payload 二级索引、孤儿仓库 GC）。解决过程记录于此：
+见设计文档末尾**仍开放的 5 条**（payload 二级索引、孤儿影子仓库 GC、断电级 durability 无证据、10k items 加载策略、只读连接池）。选型问题已关闭。解决过程记录于此：
 
-- （暂无）
+- 2026-10-07 **孤儿影子仓库 GC（开放问题 3）→ 排定 M2 Phase 1**，并确认它**可判**：`checkpoints.session_id` 带 `ON DELETE CASCADE`（v1.sql:55-63），删会话后该会话的行一行不剩，所以「`workspace = X` 还有行吗？」就是「这个影子仓库还有没有主」的判据，不必在文件系统上反向扫描去猜。
+- 2026-10-07 **只读连接池（开放问题 6）→ M3**：2026-10-03 已把待办由 M1 改标 M3，但设计文档 §3 的「M1 才接只读连接池」与开放问题 6 的「worklog 排在 M1」当时没跟上，本次一并改为 M3。读全部串行经 writer actor，正确优先。
+- 2026-10-07 **`checkpoints` 表不是 rewind 的主索引**（此前文档把它写得像主索引）。rewind 定位 commit 走 item 链：`ItemKind::Checkpoint { commit_id, kind }` 自己带着 commit id，`rebuild_chain` → 定位 `target_item` → **向后**扫第一个 Checkpoint item → 读 `commit_id` → restore。表的职责只剩**跨会话的预算核算与 GC**；`item_id` 可空（v1.sql:58）是为了让 restore 前的安全快照能记进去而不建 item。完整理由见 design/storage.md §5。
+- 2026-09-28 选型关闭：候选优先级 turso > libsql(`features=["core"]`) > rusqlite(bundled)。turso 首轮门槛全过（唯一缺口 `WITH RECURSIVE` 有廉价绕法），故未评估后两者。**libsql 0.9.30 保留为第一顺位替代**——若 turso 出现阻塞性回归就切回，并把 ADR-0010 标 superseded。选 turso 的决定性理由之一是纯 Rust：CI 三平台（含 windows MSYS2 ucrt64 + `x86_64-pc-windows-gnu`）不必背 mingw。
 
 ## 变更日志
 
+### 2026-10-08 · M2 Phase 1：`checkpoints` 表终于有 Rust 代码
+
+表从 schema v1 起就在，此前**零 Rust 代码**。新增 `CheckpointRecord` + 三个方法（`StoreCmd` 从 19 个变体到 22 个）：
+
+- `record_checkpoint`：写入前认会话（`SessionNotFound` 而不是把外键错误包成 `Database`）、认 item 存在**且属于同一会话**（复用 `insert_item` 为跨会话父节点准备的那类校验）、拒空 `commit_id`（`Invalid`）。这三条是 §3 那句「写入前先认会话」纪律的延伸。
+- `checkpoints_for_workspace(&Path)`：**最旧优先**，因为调用方是从前端 drain 的（D9 的阶梯）；`created_at` 同毫秒时按 `id` 定序——引擎的行序不保证，留一个平局就是留一个不确定性。参数收 `&Path` 并用与 `sessions.workspace` 完全相同的 `to_string_lossy()` 拼写，这样一个路径在这个库里只有一种文本形式，按工作区查不会因为拼写差异漏行。
+- `delete_checkpoints(&[CheckpointId]) -> u64`：回报**真实**消失的行数，让调用方能拿自己的账与引擎对账（`delete_branch` 已有的那条交叉校验纪律）。删一个不存在的 id 回报 0 而不是报错。
+
+`item_id` 可空这条在读取侧是承重的：`read_checkpoint` 把 NULL 原样带成 `None`，**不修补成一个 id**——安全快照（undo-of-undo）没有 item，那一列可空正是为了它。写 SQL 的 kind 拼写进了 `the_spellings_written_into_sql_are_pinned`（Rust 的重命名与 SQL 字符串会各自漂移，这条测试就是为此存在的）。**没有新迁移**：schema 停在 v1，`MIGRATIONS` 仍是一条，`migrations/v1.sql` 已冻结。
+
+9 条新测试，其中两条是级联：删**会话**带走它的检查点行（这正是「影子仓库还有没有主」变成一句查询的原因），删**分支**也带走挂在被删 item 上的行。每条校验规则都做了变异验证（临时摘掉实现里的那次检查，确认对应测试转红）。覆盖率 93.6%（地板 85%）。
+
+设计侧同时关闭了**开放问题 3**（孤儿影子仓库的清扫策略），并记下一条做不到的事：同一问题里那半句「级联删除驱动的 git 侧 commit GC」**不可实现**——libgit2 没有对象级 GC，而丢弃链上的提交必须重提交幸存者、重提交会改 commit id，那些 id 已经在 append-only 的 items 表里（`items_no_update` 拒绝修正）。回收因此只有「整个仓库」一种粒度，见 design/storage.md §5 与 design/capabilities.md §2。
+
+### 2026-10-07 · M2 重新规划对账
+
+roadmap 的 M2 段按一次全仓库勘察重写为 Phase 0–8，本 worklog 与 design/storage.md 随之对账。四件事：
+
+**① 补记一个从没进过变更日志的方法。** `open_turns`（store.rs:123）是 2026-10-03 的 de8b743「List the turns a crash left open」加的：daemon 启动时一次读出所有还没收尾的 turn 行，`recover_crashed_sessions`（manager.rs:112）逐条按失败关掉——重启后一行「还在跑」的 turn 描述的是没人在做的工作。一次读全是刻意的：恢复跑在任何 runtime 存在之前，答案不会在它脚下变。store 侧有直接测试 `open_turns_lists_only_open_turns_across_sessions`（tests/session_store.rs:920）。设计文档 §1 的 trait 代码块此前既没有它也没有 `bump_generation`，本次补齐；§3 的 `StoreCmd` 注释列表同样缺 `OpenTurns` 与 `BumpGeneration`，也补齐。
+
+**② 设计更正：rewind 不靠 `checkpoints` 表定位 commit。** 文档此前把那张表写得像 rewind 的主索引，实际不需要：`ItemKind::Checkpoint { commit_id, kind }` 自己带着 commit id，而 `ItemKind::is_conversation()`（protocol/src/item.rs:175-185）**不含** Checkpoint，所以检查点 item 永远不会进模型请求。Code scope 的实现是「`rebuild_chain(session, old_head)` → 定位 `target_item` → **向后**扫第一个 Checkpoint item → 读它的 `commit_id` → restore」。这条规则的正确性靠一件事：pre-write 快照恰好等于 target_item 时刻的工作区状态，所以**扫不到就是 target_item 之后没有写过东西，Code rewind 是 no-op**。`checkpoints` 表的职责因此只剩跨会话的预算核算与 GC；`item_id` 可空正是为了让 restore 前的安全快照记进表里而**不建 item**（它是 undo-of-undo，不属于对话历史）。
+
+**③ D13 定案：检查点怎么成为 item。** `ToolCtx` 加一个检查点收集器，`LocalFs` 在写之前 push；`ToolInvocation`（kernel 类型）把收集到的 `Vec<Checkpoint>` 带出来；**kernel 在 ToolResult item 之前追加 Checkpoint item**，链变成 `… → ToolCall → Checkpoint → ToolResult`。这样做安全，是因为工具结果靠 `ToolResult.call: ItemId` 与其调用配对，不靠父子关系。daemon 的 HubSink 在 Checkpoint item 落库后补写 `checkpoints` 行；**行写失败只记日志**——item 里已经有 commit_id，rewind 可以回退到走链。store 在这一阶段只出「记一行 + 按 workspace 列举」的 API。
+
+**④ 里程碑与措辞更正。** 只读连接池：待办 2026-10-03 已由 M1 改标 M3，但设计文档 §3 的「M1 才接只读连接池」与开放问题 6 的「worklog 排在 M1」没跟上，本次都改成 M3。孤儿影子仓库 GC（开放问题 3）排定 M2 Phase 1。级联删分支要**同时驱动影子 git 的 commit GC**——原待办「checkpoints 表与 CheckpointStore 联动（级联删除时 GC）」留在 M2 Phase 1，措辞改明确：数据库的级联已由引擎门槛测试锁定，git 侧的对象不会自己消失。**两张表 M2 都不需要新迁移**（schema 版本仍是 1，`MIGRATIONS`（migrations.rs:17）只有一项）。
+
+### 2026-10-01 · `bump_generation`（M1 Phase 3）
+
+manager 组装 runtime 需要把 generation 落库（不变量 1），而 `SessionPatch` 有意不含它。新增加性 trait 方法 `SessionStore::bump_generation(session)`（`UPDATE ... SET generation = generation + 1` + 读回），payload JSON 列不受影响、无迁移。deepseek 录制期间顺手核实：`rebuild_chain` 的父链行走对同一父多子（分叉）的行为已由 M0 属性测试覆盖，daemon 的链上重建直接受益。
+
+### （此前为 M0b 条目）
+
+### 2026-09-30 · 评审后的两轮修复（2026-09-29 与 2026-09-30）
+
+**「会话不存在」必须是 `SessionNotFound`，不能让外键代答。** append（单条与批量）、`start_turn`、`finish_turn` 原本都把这件事交给 `items.session_id`/`turns.session_id` 的外键：引擎的约束消息被裹成 `StoreError::Database`，而按 design/storage.md §1 的映射，「调用方指了一个不存在的会话」是 `SessionNotFound`（调用方错误），「引擎拒绝了一条合法写入」才是 `StoreError`（存储故障）——两者到前端是两个错误码。turso 0.7.2 的错误类型只有 `Constraint(String)`，**不区分是哪条约束**（外键、非空、`items_no_update` 触发器全走它），所以按错误变体分类不可靠；改成写前一次 `SELECT id FROM sessions` 显式确认（在正要写的路径上，一次主键查询的代价可忽略）。`finish_turn` 尤其要说清楚：删会话会 cascade 掉它的 `turns` 行，那条 `UPDATE ... WHERE id AND session_id` 于是什么都匹配不到，原本报 `UnknownTurn`——把「会话没了」说成「你从没起过这个 turn」。
+
+**一批 item 必须同属一个会话。** 本轮新发现的洞：`append_items` 的 head 推进只认**最后一个** item 的会话，混批会把另一个会话的 item 插进去却永不推进它的 head，那些 item 从任何 head 都走不到。`sessions.active_head` 的外键看不见这件事（它只证明 item 存在），与 M0b 已经补过的「跨会话父节点」是同一类洞。改动前先把新测试跑红确认过：混批原本返回 `Ok(())`。
+
+**`drain` 纪律要覆盖失败路径。** 行循环原本是 `while let Some(row) = rows.next().await? { out.push(read(&row)?) }`——解析失败就带着未读完的结果集提前返回，正是 `sql::drain` 要防的形状，而最容易踩它的就是「链中间有一条坏 payload」。`sql::collect` 现在无论成功失败都排空。**实测**：在 turso 0.7.2 上这个形状是良性的（上游那句「否则 drop 语句会回滚事务」的注释挂在 `Statement::query_row` 的实现上，这些查询不走那条路），但纪律在引擎升级时是承重的，失败形态是「此后每次写入都报错直到重启」，所以照修，并补一条 tripwire 测试把引擎契约本身钉住。
+
+**校验要在事务里面做。** `delete_branch` 的走树/级联交叉校验原本在 `commit` **之后**：不一致时报的是一个已经不复存在的数据库状态。两个计数现在都在事务内取，不一致就靠 drop 掉 `tx` 回滚。它的测试也才第一次有可能触发——唯一能让两种走法不一致的形状是跨会话三明治（背后用第二条连接插进去）；第一次构造时先撞上的是 `sessions.active_head` 的外键（引擎自己的防线比我们的交叉校验先响），把 head 停到待删子树外面才对。
+
+**原子性靠 `create_new`，不靠「先看再写」。** 导出的「绝不悄悄覆盖上一份」原本是 exists-then-write 的 TOCTOU，而写文件发生在 writer actor **之外**（`std::fs`），并发导出同一会话真能撞上。改 `OpenOptions::create_new`（O_EXCL）；写失败时删掉自己的半截文件，否则重试会被自己的残骸挡住。
+
+**`export_jsonl(all_branches)` 必须一次快照。** 原本 item 与 tip 是两条命令：并发写入的会话会得到两个快照，审计文件里的 branches 标注可能与它自己的 item 行自相矛盾。合成一条 `ExportBody`，顺带拒绝不存在的会话（原本会写一个空文件，然后拿正确 id 的重试被「不许覆盖」挡住）。
+
+**`shutdown` 既等回复也等任务结束。** 回复成功只证明 actor 处理了 Shutdown；writer 在回复之后 panic 或被 abort 原本是 `let _ = writer.await` 静默吞掉，调用方无从得知。
+
+**迁移不给「没有 schema」留成功路径。** `migrate` 原本有一条 `None if recorded == 0 => Ok(0)`：`schema_meta` 没有版本行且 `user_version` 是 0 就算开库成功。实际不可达（迁移表从 1 开始，走到这一步必然写过两个记录），但它的存在意味着「一个没有 schema 的库算打开成功」；删掉之后缺行一律报 `Migration`，并补了测试（背后删掉那一行 → 重开被拒）。
+
+**崩溃测试的超时必须真的能触发。** 30 s 的 ready 期限原本只在两次 `read_line` **之间**检查，而 `read_line` 是阻塞的：子进程在打印就绪行之前挂住，父进程会一直停在那里，直到 CI 作业超时。读线程化 + `recv_timeout` 之后，超时与 EOF 两条路都会杀掉子进程并报出它打印了什么、怎么退出的。同一处还有：`Child::kill()` 不再因为「子进程报完就绪就自己死了」而 panic——那是一次成功的实验，不该报成测试失败。
+
+**空 patch 不写库。** `SessionPatch::is_empty` 的文档写着「store 会跳过这次写」，实现却照样 bump `updated_at` 并重写整行：一次心跳 patch 会把这个会话重新顶到所有「最近优先」列表的最前面。
+
 ### 2026-09-28
-- 初稿。关键取舍：数据库做主存储（四家参考都用 JSONL，hatchery 因「历史可编辑」需求反向选择）；单写者 actor 规避 libSQL 多写者限制（用户最初的「并发写入」诉求以此方式满足，见 ADR-0002 理由节）。
+
+**M0b 落地**（64 测试全绿）。要点：
+
+- `migrations/v1.sql` = spike 的 DDL 原样搬入（三处修正已内建），此后只能新增文件；迁移**双记录**版本并拒绝更新版本的库。
+- writer actor：有界通道 1024 + reply slot；单条 append 也走事务（插 item + 推进 head + 更新 updated_at 同事务，正确性而非速度）；批量 append 一个事务——测试 `a_batch_commits_atomically` 用「父节点属于别的会话」让整批失败，断言**一条都没落**且 head 未动。
+- **`rebuild_history` 改名 `rebuild_chain` 并改语义**：返回有序 `Vec<Item>`，不做 reasoning 过滤/compaction/裁剪——那些需要 provider 能力表，属 daemon 的装配器（M0b 裁决，见 design/storage.md §4）。
+- **交叉校验**：`delete_branch` 用 BFS 收子树计数（引擎只回报直接删除的行），删完后比对行数差，不一致即报错。
+- **跨会话父节点**：schema 的外键证明不了父节点属于同一会话，`insert_item` 自己校验（`SessionMismatch`）。
+- **崩溃测试形态**：测试二进制自重入（`current_exe()` + `HATCHERY_CRASH_PROBE` + `#[ignore]` 入口），不新增 target、不发布二进制、三平台同一份代码；父进程 `Child::kill()`（unix SIGKILL / Windows TerminateProcess）后重开断言，并额外断言 `-wal` 存在、恢复后数据库**可用**。
+- **属性测试**：随机脚本对拍 testkit 的 `ReferenceTree`，每步比对链形态、head、active 集合、行数。它先抓出的是**参考模型**的错（哪些 kind 可编辑），而不是 store 的。
+- `SessionStore` trait 17 个方法全部实现；`StoreError` 12 个变体并映射到 wire 错误码（「必须先切分支」是 `InvalidRequest`，「磁盘坏了」才是 `StoreError`）。
+
+### 2026-09-28（M0a）
+- 初稿。关键取舍：数据库做主存储（四家参考都用 JSONL，hatchery 因「历史可编辑」需求反向选择）；单写者 actor 规避多写者限制（ADR-0002）。
+- **M0a 引擎 spike 完成**：12 项门槛测试落地全绿；选 turso 0.7.2 → 新增 **ADR-0010**（supersedes ADR-0002 的引擎部分），design/storage.md 同步（引擎与 async API 形态、内存走树、`active_head` 可空、`commit_id`、journal_mode 走 query、性能/durability 实测结论、开放问题 4/5）。
+- spike 抓出三处 schema 缺陷，都是读设计文档看不出来、只有真跑引擎才会暴露的：`commit` 保留字、`active_head NOT NULL` 与 `items.session_id` 互锁、`journal_mode` 需要 `query()`。

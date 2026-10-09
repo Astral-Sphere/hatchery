@@ -1,0 +1,18 @@
+# LF everywhere: scripts/ci.sh is executed by bash on the Windows runner (MSYS2 UCRT64), and a
+# CRLF checkout would make it fail with `$'\r': command not found`. Normalising also keeps
+# `git status` clean after a test run, which the determinism gate depends on.
+* text=auto eol=lf
+
+*.sh text eol=lf
+*.toml text eol=lf
+*.rs text eol=lf
+*.md text eol=lf
+*.yml text eol=lf
+*.json text eol=lf
+*.snap text eol=lf
+*.po text eol=lf
+*.pot text eol=lf
+
+*.png binary
+*.ico binary
+*.db binary

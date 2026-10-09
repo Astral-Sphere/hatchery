@@ -1,0 +1,15 @@
+{
+  "completion": {
+    "reason": "model_done",
+    "usage": {
+      "completion_tokens": 678,
+      "prompt_tokens": 12345,
+      "reasoning_tokens": 400,
+      "requests": 3
+    }
+  },
+  "generation": 3,
+  "session": "01890f47-0000-7000-8000-000000000001",
+  "turn": "01890f47-0000-7000-8000-000000000004",
+  "type": "turn_finished"
+}

@@ -1,0 +1,1 @@
+{"provenance":"synthetic","provider":"deepseek","model":"deepseek-chat","shape":"plain streaming text with a trailing usage-only chunk","recorded_at":null,"note":"byte shapes mirror the providers documented stream examples; replaced by real recordings via cargo xtask record-fixtures"}

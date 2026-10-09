@@ -1,0 +1,48 @@
+[package]
+name = "hatchery-tools"
+description = "Built-in agent tools executed exclusively through the capability seam"
+keywords = ["agent", "tools", "hatchery"]
+categories = ["command-line-utilities"]
+readme = "README.md"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+globset.workspace = true
+hatchery-capabilities.workspace = true
+hatchery-kernel.workspace = true
+hatchery-protocol.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+regex.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+hatchery-testkit.workspace = true
+tempfile.workspace = true
+tokio-util.workspace = true
+
+# This crate does NOT inherit the workspace lints, on purpose: inherited and local lint tables
+# cannot mix (cargo refuses the manifest), and invariant 4 (ADR-0004) needs the two
+# `disallowed_*` lints DENIED here while the workspace allows them for every other crate -
+# source-level `#![deny]` attributes lose to Cargo's command-line lint flags, so a table is the
+# only real enforcement (measured 2026-10-01). The table below mirrors the workspace's; when the
+# workspace table grows a lint, add it here too.
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+dbg_macro = "warn"
+todo = "warn"
+disallowed_methods = "deny"
+disallowed_types = "deny"

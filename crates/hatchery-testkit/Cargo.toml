@@ -1,0 +1,35 @@
+[package]
+name = "hatchery-testkit"
+description = "Test infrastructure for the hatchery workspace: fakes, harnesses and fixture loading"
+readme = "README.md"
+publish = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+futures.workspace = true
+# `TempWorkspace::git()` builds the dirty user repository invariant 6 needs, which means real git
+# plumbing in the harness rather than in every test that wants one.
+git2.workspace = true
+hatchery-capabilities.workspace = true
+hatchery-daemon.workspace = true
+hatchery-kernel.workspace = true
+hatchery-llm.workspace = true
+hatchery-store.workspace = true
+toml.workspace = true
+hatchery-protocol.workspace = true
+tempfile.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+wiremock.workspace = true
+
+[lints]
+workspace = true

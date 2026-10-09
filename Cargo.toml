@@ -1,6 +1,100 @@
 [workspace]
 resolver = "3"
-edition = "2024"
-members = []
+members = ["crates/*", "xtask"]
 
-[dependencies]
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+# Measured, not copied from dependency metadata: `cargo +1.90.0 check --workspace --all-targets`
+# passes, 1.88 fails (roaring 0.11.5 needs 1.90) and 1.85 fails (turso's icu_*/aristo need 1.88).
+# Declaring it also makes resolver 3 pick MSRV-compatible dependency versions.
+rust-version = "1.90"
+license = "GPL-3.0-only"
+repository = "https://github.com/Astral-Sphere/hatchery"
+homepage = "https://github.com/Astral-Sphere/hatchery#readme"
+authors = ["Hatchery contributors"]
+
+[workspace.dependencies]
+hatchery-protocol = { path = "crates/hatchery-protocol", version = "0.0.0" }
+hatchery-kernel = { path = "crates/hatchery-kernel", version = "0.0.0" }
+hatchery-llm = { path = "crates/hatchery-llm", version = "0.0.0" }
+hatchery-store = { path = "crates/hatchery-store", version = "0.0.0" }
+hatchery-capabilities = { path = "crates/hatchery-capabilities", version = "0.0.0" }
+hatchery-tools = { path = "crates/hatchery-tools", version = "0.0.0" }
+hatchery-acp = { path = "crates/hatchery-acp", version = "0.0.0" }
+hatchery-daemon = { path = "crates/hatchery-daemon", version = "0.0.0" }
+hatchery-cli = { path = "crates/hatchery-cli", version = "0.0.0" }
+hatchery-gui = { path = "crates/hatchery-gui", version = "0.0.0" }
+hatchery-testkit = { path = "crates/hatchery-testkit", version = "0.0.0" }
+
+anyhow = "1.0.104"
+# Tool-layer matching (D6, 2026-10-01): ripgrep's pattern engines, matching only — the walking
+# itself goes through the FsBackend seam so tools stay fs-free and MemoryFs-testable.
+globset = "0.4.20"
+regex = "1.13.1"
+async-trait = "0.1.92"
+futures = "0.3.34"
+# ADR-0013: the daemon's local socket on the platform tokio cannot give one to. tokio gates
+# `net::unix` behind `cfg(unix)`, and `x86_64-pc-windows-gnu` is not `cfg(unix)` — MSYS2 UCRT64
+# builds native Windows binaries, so there is no AF_UNIX there. interprocess is UDS on unix and
+# named pipes on Windows behind one API; stable Rust (no `--cfg tokio_unstable`, which the
+# "portable by default" rule in .cargo/config.toml keeps out of CI) and no C toolchain (the same
+# reason ADR-0010 picked turso). It is referenced from exactly one module,
+# crates/hatchery-protocol/src/transport.rs, so no other crate names a platform socket type.
+interprocess = { version = "2.4.4", features = ["tokio"] }
+# The sole wire layer for hatchery-llm (ADR-0007): no hand-written HTTP/SSE this side. Feature
+# flags pick the provider families we probe in M1; `reasoning` rides along with each of them.
+# `ferritls` adds the pure-Rust TLS backend plus its installer, so no other crate has to pick one.
+openai-interface = { version = "0.14.0", features = ["deepseek", "qwen", "ferritls"] }
+# Vendored libgit2 on purpose: shadow-git checkpoints must work on machines with no git binary
+# installed (ADR-0012). git2's default features are empty, so no https/ssh and no openssl.
+git2 = { version = "0.21.0", features = ["vendored-libgit2"] }
+# Advisory file locks: daemon single-instance and per-session runtime leases (ADR-0001).
+fs2 = "0.4.3"
+# CLI frontend (D5, 2026-09-30): ratatui 0.30 owns the terminal via crossterm 0.29; markdown is
+# parsed by minimad (termimad's own parser) and mapped to ratatui lines by hand — see the spike
+# record in docs/worklog/cli.md for why termimad itself is not in the tree.
+minimad = "0.16.0"
+ratatui = "0.30.2"
+crossterm = { version = "0.29.0", features = ["event-stream"] }
+# Transcript wrapping is the TUI's own (ratatui's Paragraph wrap cannot report where a wrapped
+# line landed, which scroll offsets and message jumps need); minimad already depends on it.
+unicode-width = "0.2.2"
+# Layered configuration files (platform.md §1): TOML in, per-key validated.
+toml = "1.1.6"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+thiserror = "2.0"
+tokio = { version = "1.53", features = ["macros", "rt", "rt-multi-thread", "sync", "time"] }
+tokio-util = "0.7.19"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+# Chosen by the M0 storage spike (ADR-0010). default-features off drops mimalloc (system
+# allocator is fine) and fts (tantivy is a heavy dependency we do not use). The engine's measured
+# behaviour is pinned by crates/hatchery-store/tests/spike_engine.rs — rerun it on any upgrade.
+turso = { version = "0.7.2", default-features = false }
+# v7 mints the ids; v5 derives the shadow-repository directory name from a workspace path, which
+# needs a hash and would otherwise mean a hash dependency (uuid's v5 pulls sha1_smol, one crate).
+uuid = { version = "1.27", features = ["v5", "v7", "serde"] }
+
+proptest = "1.11.0"
+tempfile = "3.27.0"
+# Dev/test-only HTTP doubles: wiremock assembles the SSE replay server (testing.md §2) and is a
+# dependency of hatchery-testkit alone, never of a product crate.
+wiremock = "0.6.5"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+dbg_macro = "warn"
+todo = "warn"
+# clippy.toml's disallowed lists are workspace-wide, but only tool implementations must go
+# through the capability seam (invariant 4, ADR-0004). daemon, store, capabilities and xtask touch
+# the OS legitimately, and hatchery-acp spawns external agent processes, so the lint is allowed
+# here and denied in hatchery-tools only - by that crate's own local `[lints]` table,
+# because Cargo lint tables are command-line flags that beat any source-level
+# `#![deny]`, and a workspace inheritance cannot mix with a local table.
+disallowed_methods = "allow"
+disallowed_types = "allow"

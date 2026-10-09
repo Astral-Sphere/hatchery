@@ -1,0 +1,1266 @@
+//! The writer actor: one task, one connection, one transaction per command.
+//!
+//! The engine has no multi-writer mode (ADR-0002), so every write goes through a single task that
+//! owns the connection and consumes a bounded channel. Submitters wait on a reply slot, which
+//! means backpressure is the channel filling up rather than unbounded queueing.
+//!
+//! Reads go through the same actor in M0b. A read pool is M1's work (`docs/worklog/storage.md`).
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+
+use tokio::sync::{mpsc, oneshot};
+use turso::{Connection, params_from_iter};
+
+use hatchery_protocol::method::{SessionListParams, SessionListResult};
+use hatchery_protocol::{
+    CheckpointId, Content, Item, ItemId, ItemKind, Session, SessionId, SessionPatch, Timestamp,
+    TurnId,
+};
+
+use crate::error::StoreError;
+use crate::sql::{
+    self, CHECKPOINT_COLUMNS, ITEM_COLUMNS, SESSION_COLUMNS, SKELETON_COLUMNS, as_int, as_text,
+    checkpoint_kind_text, status_text,
+};
+use crate::store::CheckpointRecord;
+use crate::tree::{self, SkeletonRow};
+
+/// How many commands may queue before submitters wait.
+///
+/// Bounded on purpose: a frontend that floods the store should slow down rather than grow the
+/// daemon's memory (`docs/design/storage.md` §3).
+pub const COMMAND_CAPACITY: usize = 1024;
+
+/// How many item ids go into one payload lookup.
+///
+/// Conservative rather than maximal: the engine's parameter limit is not documented, and a chain
+/// longer than this simply takes several statements. `many_items_rebuild_in_order` covers the
+/// chunk boundary.
+const PAYLOAD_CHUNK: usize = 200;
+
+/// How many ids go into one `IN (...)` list.
+///
+/// The same undocumented parameter limit bounds a delete as a select, and a GC sweep can easily
+/// hand over more ids than that. Chunking keeps the statement shape identical whichever way the
+/// caller batches.
+const ID_CHUNK: usize = PAYLOAD_CHUNK;
+
+/// A reply slot.
+pub type Reply<T> = oneshot::Sender<Result<T, StoreError>>;
+
+/// One consistent read of everything a whole-tree export needs: every item oldest-first, and
+/// each item's descendant tips.
+pub type ExportSnapshot = (Vec<Item>, HashMap<ItemId, Vec<ItemId>>);
+
+/// A session's whole tree: positions, plus which items are on the active branch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BranchTree {
+    /// The active branch head.
+    pub head: Option<ItemId>,
+    /// Every item of the session, oldest first.
+    pub nodes: Vec<BranchNode>,
+}
+
+/// One node of a session's tree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BranchNode {
+    /// Position in the tree.
+    pub row: SkeletonRow,
+    /// When it was appended.
+    pub created_at: Timestamp,
+    /// True when the item is on the active branch, i.e. an ancestor of the head.
+    pub active: bool,
+}
+
+/// Everything the store can be asked to do.
+pub enum StoreCmd {
+    /// Insert a session row. The branch head starts NULL.
+    CreateSession {
+        /// The session to store.
+        session: Session,
+        /// The stored session.
+        reply: Reply<Session>,
+    },
+    /// Read one session.
+    Session {
+        /// Which one.
+        session: SessionId,
+        /// The session.
+        reply: Reply<Session>,
+    },
+    /// Apply a metadata patch.
+    UpdateSession {
+        /// Which session.
+        session: SessionId,
+        /// What to change.
+        patch: SessionPatch,
+        /// The session as it is now.
+        reply: Reply<Session>,
+    },
+    /// Increment the runtime generation (invariant 1).
+    BumpGeneration {
+        /// Which session.
+        session: SessionId,
+        /// The session as it is now.
+        reply: Reply<Session>,
+    },
+    /// List sessions, newest first.
+    ListSessions {
+        /// Paging and filtering.
+        params: SessionListParams,
+        /// One page.
+        reply: Reply<SessionListResult>,
+    },
+    /// Delete a session and everything under it.
+    DeleteSession {
+        /// Which one.
+        session: SessionId,
+        /// How many items went with it.
+        reply: Reply<u64>,
+    },
+    /// Append one item and advance the active head.
+    AppendItem {
+        /// The item.
+        item: Item,
+        /// Its id, echoed back.
+        reply: Reply<ItemId>,
+    },
+    /// Append a batch atomically.
+    AppendItems {
+        /// The items, in order.
+        items: Vec<Item>,
+        /// Done.
+        reply: Reply<()>,
+    },
+    /// Read one item.
+    Item {
+        /// Which session it must belong to.
+        session: SessionId,
+        /// Which item.
+        item: ItemId,
+        /// The item.
+        reply: Reply<Item>,
+    },
+    /// The active branch, root first, payloads included.
+    RebuildChain {
+        /// Which session.
+        session: SessionId,
+        /// Where the branch ends; `None` means the session's active head.
+        head: Option<ItemId>,
+        /// The chain.
+        reply: Reply<Vec<Item>>,
+    },
+    /// Every item of a session, for a branch view.
+    BranchTree {
+        /// Which session.
+        session: SessionId,
+        /// The tree.
+        reply: Reply<BranchTree>,
+    },
+    /// Edit an item by forking: a new item with the same parent becomes the head (ADR-0003).
+    EditFork {
+        /// Which session.
+        session: SessionId,
+        /// The item being edited.
+        item: ItemId,
+        /// The replacement content.
+        new_content: Content,
+        /// The new branch head.
+        reply: Reply<Item>,
+    },
+    /// Point the active head at an existing item.
+    SwitchBranch {
+        /// Which session.
+        session: SessionId,
+        /// Where to point.
+        head: ItemId,
+        /// The session as it is now.
+        reply: Reply<Session>,
+    },
+    /// Delete a subtree, refusing while the active head is inside it.
+    DeleteBranch {
+        /// Which session.
+        session: SessionId,
+        /// Root of the subtree.
+        head: ItemId,
+        /// How many items were removed.
+        reply: Reply<u64>,
+    },
+    /// Record that a turn started.
+    StartTurn {
+        /// Which session.
+        session: SessionId,
+        /// The turn.
+        turn: TurnId,
+        /// When it started.
+        at: Timestamp,
+        /// Done.
+        reply: Reply<()>,
+    },
+    /// Record how a turn ended.
+    FinishTurn {
+        /// Which session.
+        session: SessionId,
+        /// The turn.
+        turn: TurnId,
+        /// Its outcome.
+        completion: Option<hatchery_protocol::TurnCompletion>,
+        /// Done.
+        reply: Reply<()>,
+    },
+    /// Every turn whose row is still open, across all sessions (startup recovery reads this).
+    OpenTurns {
+        /// The open turns, keyed by their session.
+        reply: Reply<Vec<(SessionId, TurnId)>>,
+    },
+    /// Insert one `checkpoints` row.
+    RecordCheckpoint {
+        /// The row. Its session must exist; its item, when it has one, must belong to it.
+        record: CheckpointRecord,
+        /// Done.
+        reply: Reply<()>,
+    },
+    /// Every checkpoint of one workspace, oldest first.
+    CheckpointsForWorkspace {
+        /// Which workspace. Spelled into SQL the way `sessions.workspace` is.
+        workspace: PathBuf,
+        /// The rows.
+        reply: Reply<Vec<CheckpointRecord>>,
+    },
+    /// Delete `checkpoints` rows by id, in one transaction.
+    DeleteCheckpoints {
+        /// Which rows. An id that is not there is not an error — it is a row already gone.
+        ids: Vec<CheckpointId>,
+        /// How many rows actually went away.
+        reply: Reply<u64>,
+    },
+    /// Everything a whole-tree export needs, read in one pass: every item oldest-first, and
+    /// each item's descendant tips.
+    ///
+    /// One command rather than two (`AllItems` + `Tips`) so the export cannot describe two
+    /// different snapshots of a session that is being written while it runs — an audit artifact
+    /// whose `branches` annotations contradict its own item rows is worse than no artifact.
+    ExportBody {
+        /// Which session. Refused with `SessionNotFound` when it does not exist.
+        session: SessionId,
+        /// The items and the tips map.
+        reply: Reply<ExportSnapshot>,
+    },
+    /// Flush and stop.
+    Shutdown {
+        /// Done.
+        reply: Reply<()>,
+    },
+}
+
+/// The task that owns the write connection.
+pub struct Writer {
+    /// Held so the connection stays valid for the task's lifetime: the engine's `Database` owns
+    /// the file, and the spike kept both alive rather than assuming either can outlive the other.
+    _database: turso::Database,
+    conn: Connection,
+}
+
+impl Writer {
+    /// Wraps a connection that already has its pragmas and migrations applied.
+    #[must_use]
+    pub const fn new(database: turso::Database, conn: Connection) -> Self {
+        Self {
+            _database: database,
+            conn,
+        }
+    }
+
+    /// Runs until the channel closes or a shutdown arrives.
+    pub async fn run(self, mut commands: mpsc::Receiver<StoreCmd>) {
+        while let Some(command) = commands.recv().await {
+            match command {
+                StoreCmd::CreateSession { session, reply } => {
+                    reply_send(reply, self.create_session(session).await);
+                }
+                StoreCmd::Session { session, reply } => {
+                    reply_send(reply, self.session(session).await);
+                }
+                StoreCmd::UpdateSession {
+                    session,
+                    patch,
+                    reply,
+                } => {
+                    reply_send(reply, self.update_session(session, patch).await);
+                }
+                StoreCmd::BumpGeneration { session, reply } => {
+                    reply_send(reply, self.bump_generation(session).await);
+                }
+                StoreCmd::ListSessions { params, reply } => {
+                    reply_send(reply, self.list_sessions(params).await);
+                }
+                StoreCmd::DeleteSession { session, reply } => {
+                    reply_send(reply, self.delete_session(session).await);
+                }
+                StoreCmd::AppendItem { item, reply } => {
+                    let id = item.id;
+                    reply_send(reply, self.append_items(&[item]).await.map(|()| id));
+                }
+                StoreCmd::AppendItems { items, reply } => {
+                    reply_send(reply, self.append_items(&items).await);
+                }
+                StoreCmd::Item {
+                    session,
+                    item,
+                    reply,
+                } => {
+                    reply_send(reply, self.item(session, item).await);
+                }
+                StoreCmd::RebuildChain {
+                    session,
+                    head,
+                    reply,
+                } => {
+                    reply_send(reply, self.rebuild_chain(session, head).await);
+                }
+                StoreCmd::BranchTree { session, reply } => {
+                    reply_send(reply, self.branch_tree(session).await);
+                }
+                StoreCmd::EditFork {
+                    session,
+                    item,
+                    new_content,
+                    reply,
+                } => {
+                    reply_send(reply, self.edit_fork(session, item, new_content).await);
+                }
+                StoreCmd::SwitchBranch {
+                    session,
+                    head,
+                    reply,
+                } => {
+                    reply_send(reply, self.switch_branch(session, head).await);
+                }
+                StoreCmd::DeleteBranch {
+                    session,
+                    head,
+                    reply,
+                } => {
+                    reply_send(reply, self.delete_branch(session, head).await);
+                }
+                StoreCmd::StartTurn {
+                    session,
+                    turn,
+                    at,
+                    reply,
+                } => {
+                    reply_send(reply, self.start_turn(session, turn, at).await);
+                }
+                StoreCmd::FinishTurn {
+                    session,
+                    turn,
+                    completion,
+                    reply,
+                } => {
+                    reply_send(reply, self.finish_turn(session, turn, completion).await);
+                }
+                StoreCmd::OpenTurns { reply } => {
+                    reply_send(reply, self.open_turns().await);
+                }
+                StoreCmd::RecordCheckpoint { record, reply } => {
+                    reply_send(reply, self.record_checkpoint(record).await);
+                }
+                StoreCmd::CheckpointsForWorkspace { workspace, reply } => {
+                    reply_send(reply, self.checkpoints_for_workspace(&workspace).await);
+                }
+                StoreCmd::DeleteCheckpoints { ids, reply } => {
+                    reply_send(reply, self.delete_checkpoints(&ids).await);
+                }
+                StoreCmd::ExportBody { session, reply } => {
+                    reply_send(reply, self.export_body(session).await);
+                }
+                StoreCmd::Shutdown { reply } => {
+                    reply_send(reply, Ok(()));
+                    break;
+                }
+            }
+        }
+        tracing::debug!("the store writer has stopped");
+    }
+
+    // ------------------------------------------------------------- sessions
+
+    async fn create_session(&self, session: Session) -> Result<Session, StoreError> {
+        let config_patch = session
+            .config_patch
+            .as_ref()
+            .map(sql::to_json)
+            .transpose()?;
+        self.conn
+            .execute(
+                "INSERT INTO sessions (id, title, mode, workspace, model_provider, model_id, \
+                 config_patch, active_head, generation, status, created_at, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, ?8, ?9, ?10, ?11)",
+                (
+                    session.id.to_string(),
+                    session.title,
+                    session.mode.as_str(),
+                    session
+                        .workspace
+                        .as_ref()
+                        .map(|path| path.to_string_lossy().into_owned()),
+                    session.model.provider,
+                    session.model.model,
+                    config_patch,
+                    i64::try_from(session.generation).unwrap_or(i64::MAX),
+                    status_text(session.status),
+                    session.created_at.as_unix_millis(),
+                    session.updated_at.as_unix_millis(),
+                ),
+            )
+            .await
+            .map_err(StoreError::database)?;
+        self.session(session.id).await
+    }
+
+    async fn session(&self, session: SessionId) -> Result<Session, StoreError> {
+        let sql = format!("SELECT {SESSION_COLUMNS} FROM sessions WHERE id = ?1");
+        let mut rows = self
+            .conn
+            .query(sql, [session.to_string()])
+            .await
+            .map_err(StoreError::database)?;
+        // The parse result is carried out of the match so the drain runs on every path: an
+        // early `?` inside the arm would drop the statement with rows still pending, the shape
+        // `sql::collect` exists to prevent.
+        let found = rows
+            .next()
+            .await
+            .map_err(StoreError::database)?
+            .map(|row| sql::read_session(&row, 0));
+        sql::drain(rows).await?;
+        found
+            .transpose()?
+            .ok_or(StoreError::SessionNotFound(session))
+    }
+
+    async fn bump_generation(&self, session: SessionId) -> Result<Session, StoreError> {
+        self.conn
+            .execute(
+                "UPDATE sessions SET generation = generation + 1, updated_at = ?2 WHERE id = ?1",
+                (session.to_string(), Timestamp::now().as_unix_millis()),
+            )
+            .await
+            .map_err(StoreError::database)?;
+        self.session(session).await
+    }
+
+    async fn update_session(
+        &self,
+        session: SessionId,
+        patch: SessionPatch,
+    ) -> Result<Session, StoreError> {
+        let mut current = self.session(session).await?;
+        // The patch type promises this — `SessionPatch::is_empty` documents "the store skips the
+        // write". Honouring it keeps a no-op patch from bumping `updated_at`, which would
+        // reorder the session in every newest-first list for no reason.
+        if patch.is_empty() {
+            return Ok(current);
+        }
+        if let Some(title) = patch.title {
+            current.title = title;
+        }
+        if let Some(mode) = patch.mode {
+            current.mode = mode;
+        }
+        if let Some(model) = patch.model {
+            current.model = model;
+        }
+        if let Some(status) = patch.status {
+            current.status = status;
+        }
+        if let Some(config_patch) = patch.config_patch {
+            current.config_patch = Some(config_patch);
+        }
+        current.updated_at = Timestamp::now();
+
+        let config_patch = current
+            .config_patch
+            .as_ref()
+            .map(sql::to_json)
+            .transpose()?;
+        self.conn
+            .execute(
+                "UPDATE sessions SET title = ?1, mode = ?2, model_provider = ?3, model_id = ?4, \
+                 config_patch = ?5, status = ?6, updated_at = ?7 WHERE id = ?8",
+                (
+                    current.title.clone(),
+                    current.mode.as_str(),
+                    current.model.provider.clone(),
+                    current.model.model.clone(),
+                    config_patch,
+                    status_text(current.status),
+                    current.updated_at.as_unix_millis(),
+                    session.to_string(),
+                ),
+            )
+            .await
+            .map_err(StoreError::database)?;
+        Ok(current)
+    }
+
+    async fn list_sessions(
+        &self,
+        params: SessionListParams,
+    ) -> Result<SessionListResult, StoreError> {
+        let limit = params.limit.unwrap_or(50).clamp(1, 200);
+        let filter = params.filter.unwrap_or_default();
+        let cursor = params.cursor.as_deref().map(parse_cursor).transpose()?;
+
+        // Built rather than bound with NULL checks: `(?1 IS NULL OR mode = ?1)` reads worse and makes
+        // the query planner guess. Every value is bound; only placeholders are formatted in.
+        let mut sql = format!("SELECT {SESSION_COLUMNS} FROM sessions");
+        let mut clauses: Vec<String> = Vec::new();
+        let mut args: Vec<turso::Value> = Vec::new();
+
+        if let Some(mode) = &filter.mode {
+            args.push(turso::Value::Text(mode.as_str().to_owned()));
+            clauses.push(format!("mode = ?{}", args.len()));
+        }
+        if let Some(workspace) = &filter.workspace {
+            args.push(turso::Value::Text(workspace.to_string_lossy().into_owned()));
+            clauses.push(format!("workspace = ?{}", args.len()));
+        }
+        if let Some(needle) = &filter.title_contains {
+            args.push(turso::Value::Text(format!("%{needle}%")));
+            clauses.push(format!("title LIKE ?{}", args.len()));
+        }
+        if let Some((updated_at, id)) = &cursor {
+            // Strictly older, or equally old and a larger id: the id tiebreak makes the order
+            // total, which is what keeps paging from skipping rows that share a millisecond.
+            args.push(turso::Value::Integer(*updated_at));
+            let millis = args.len();
+            args.push(turso::Value::Text(id.to_string()));
+            let tie = args.len();
+            clauses.push(format!(
+                "(updated_at < ?{millis} OR (updated_at = ?{millis} AND id > ?{tie}))"
+            ));
+        }
+
+        if !clauses.is_empty() {
+            sql.push_str(" WHERE ");
+            sql.push_str(&clauses.join(" AND "));
+        }
+        // The id tiebreak keeps the order total, which is what makes the cursor exact.
+        sql.push_str(" ORDER BY updated_at DESC, id ASC");
+        sql.push_str(&format!(" LIMIT {}", limit + 1));
+
+        let rows = self
+            .conn
+            .query(sql, params_from_iter(args))
+            .await
+            .map_err(StoreError::database)?;
+        let mut sessions = sql::collect(rows, |row| sql::read_session(row, 0)).await?;
+
+        let next_cursor = if sessions.len() > limit as usize {
+            sessions.pop();
+            sessions
+                .last()
+                .map(|session| format!("{}:{}", session.updated_at.as_unix_millis(), session.id))
+        } else {
+            None
+        };
+        Ok(SessionListResult {
+            sessions,
+            next_cursor,
+        })
+    }
+
+    async fn delete_session(&self, session: SessionId) -> Result<u64, StoreError> {
+        let items = self.count(session, "items").await?;
+        let deleted = self
+            .conn
+            .execute("DELETE FROM sessions WHERE id = ?1", [session.to_string()])
+            .await
+            .map_err(StoreError::database)?;
+        if deleted == 0 {
+            return Err(StoreError::SessionNotFound(session));
+        }
+        Ok(items.max(0) as u64)
+    }
+
+    // ---------------------------------------------------------------- items
+
+    async fn append_items(&self, items: &[Item]) -> Result<(), StoreError> {
+        if items.is_empty() {
+            return Ok(());
+        }
+        let first = items.first().expect("checked not empty");
+        let session = first.session;
+        // One batch, one session. The head advance below names the *last* item's session, so a
+        // mixed batch would insert into two sessions and advance only one of them, leaving the
+        // other's items unreachable from any head. `sessions.active_head`'s foreign key cannot
+        // catch that: it proves the item exists, not that it belongs to the session being
+        // advanced — the same gap `insert_item` closes for a cross-session parent.
+        if items.iter().any(|item| item.session != session) {
+            return Err(StoreError::Invalid(
+                "a batch of items must belong to one session".to_owned(),
+            ));
+        }
+        self.session_exists(session).await?;
+
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .await
+            .map_err(StoreError::database)?;
+        for item in items {
+            self.insert_item(&tx, item).await?;
+        }
+        let last = items.last().expect("not empty");
+        self.advance_head(&tx, last.session, last.id, last.created_at)
+            .await?;
+        tx.commit().await.map_err(StoreError::database)?;
+        Ok(())
+    }
+
+    async fn insert_item(&self, conn: &Connection, item: &Item) -> Result<(), StoreError> {
+        // The schema's foreign key proves the parent *exists*; it cannot prove the parent belongs
+        // to the same session, and a cross-session parent would build a tree nobody can walk.
+        if let Some(parent) = item.parent {
+            let actual = self.item_session(parent).await?;
+            match actual {
+                Some(owner) if owner == item.session => {}
+                Some(_) => {
+                    return Err(StoreError::SessionMismatch {
+                        item: parent,
+                        session: item.session,
+                    });
+                }
+                None => return Err(StoreError::ItemNotFound(parent)),
+            }
+        }
+
+        let payload = sql::to_json(&item.kind.to_payload())?;
+        conn.execute(
+            "INSERT INTO items (id, session_id, parent_id, turn_id, kind, payload, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            (
+                item.id.to_string(),
+                item.session.to_string(),
+                item.parent.map(|parent| parent.to_string()),
+                item.turn.map(|turn| turn.to_string()),
+                item.kind_tag().as_str(),
+                payload,
+                item.created_at.as_unix_millis(),
+            ),
+        )
+        .await
+        .map_err(StoreError::database)?;
+        Ok(())
+    }
+
+    async fn advance_head(
+        &self,
+        conn: &Connection,
+        session: SessionId,
+        head: ItemId,
+        at: Timestamp,
+    ) -> Result<(), StoreError> {
+        let changed = conn
+            .execute(
+                "UPDATE sessions SET active_head = ?1, updated_at = ?2 WHERE id = ?3",
+                (head.to_string(), at.as_unix_millis(), session.to_string()),
+            )
+            .await
+            .map_err(StoreError::database)?;
+        if changed == 0 {
+            return Err(StoreError::SessionNotFound(session));
+        }
+        Ok(())
+    }
+
+    async fn item(&self, session: SessionId, item: ItemId) -> Result<Item, StoreError> {
+        let sql = format!("SELECT {ITEM_COLUMNS} FROM items WHERE id = ?1");
+        let mut rows = self
+            .conn
+            .query(sql, [item.to_string()])
+            .await
+            .map_err(StoreError::database)?;
+        // Parse result carried out of the match, drain on every path — see `session`.
+        let found = rows
+            .next()
+            .await
+            .map_err(StoreError::database)?
+            .map(|row| sql::read_item(&row, 0));
+        sql::drain(rows).await?;
+        let found = found.transpose()?.ok_or(StoreError::ItemNotFound(item))?;
+        if found.session != session {
+            return Err(StoreError::SessionMismatch { item, session });
+        }
+        Ok(found)
+    }
+
+    async fn rebuild_chain(
+        &self,
+        session: SessionId,
+        head: Option<ItemId>,
+    ) -> Result<Vec<Item>, StoreError> {
+        let head = match head {
+            Some(head) => {
+                // Validate ownership BEFORE the walk: the skeleton is filtered by session, so a
+                // foreign or unknown head would surface as `MissingHead` and be misreported as a
+                // corrupt tree. A caller naming the wrong item is the caller's mistake, not the
+                // database's — `switch_branch` and `delete_branch` already classify it this way.
+                match self.item_session(head).await? {
+                    None => return Err(StoreError::ItemNotFound(head)),
+                    Some(owner) if owner == session => Some(head),
+                    Some(_) => {
+                        return Err(StoreError::SessionMismatch {
+                            item: head,
+                            session,
+                        });
+                    }
+                }
+            }
+            None => self.session(session).await?.active_branch_head,
+        };
+        let skeleton = self.skeleton(session).await?;
+        let ids = tree::chain(&skeleton, head).map_err(|error| self.tree_error(error))?;
+
+        let mut items = Vec::with_capacity(ids.len());
+        for chunk in ids.chunks(PAYLOAD_CHUNK) {
+            let placeholders = (1..=chunk.len())
+                .map(|index| format!("?{index}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!("SELECT {ITEM_COLUMNS} FROM items WHERE id IN ({placeholders})");
+            let params = params_from_iter(chunk.iter().map(ToString::to_string));
+            let rows = self
+                .conn
+                .query(sql, params)
+                .await
+                .map_err(StoreError::database)?;
+            items.extend(sql::collect(rows, |row| sql::read_item(row, 0)).await?);
+        }
+
+        // The rows come back in whatever order the engine chose; the chain's order is the point.
+        let mut by_id: std::collections::HashMap<ItemId, Item> =
+            items.into_iter().map(|item| (item.id, item)).collect();
+        ids.into_iter()
+            .map(|id| by_id.remove(&id).ok_or(StoreError::ItemNotFound(id)))
+            .collect()
+    }
+
+    async fn branch_tree(&self, session: SessionId) -> Result<BranchTree, StoreError> {
+        let sql = format!(
+            "SELECT {SKELETON_COLUMNS}, created_at FROM items WHERE session_id = ?1 \
+             ORDER BY created_at ASC, id ASC"
+        );
+        let rows = self
+            .conn
+            .query(sql, [session.to_string()])
+            .await
+            .map_err(StoreError::database)?;
+        let mut nodes = sql::collect(rows, |row| {
+            Ok(BranchNode {
+                row: sql::read_skeleton(row)?,
+                created_at: Timestamp::from_unix_millis(
+                    as_int(&row.get_value(4).map_err(StoreError::database)?).unwrap_or_default(),
+                ),
+                active: false,
+            })
+        })
+        .await?;
+
+        let session_row = self.session(session).await?;
+        let head = session_row.active_branch_head;
+        let skeleton: Vec<SkeletonRow> = nodes.iter().map(|node| node.row).collect();
+        let active: std::collections::HashSet<ItemId> = tree::chain(&skeleton, head)
+            .map_err(|error| self.tree_error(error))?
+            .into_iter()
+            .collect();
+        for node in &mut nodes {
+            node.active = active.contains(&node.row.id);
+        }
+        Ok(BranchTree { head, nodes })
+    }
+
+    async fn edit_fork(
+        &self,
+        session: SessionId,
+        target: ItemId,
+        new_content: Content,
+    ) -> Result<Item, StoreError> {
+        let original = self.item(session, target).await?;
+        let replacement = match &original.kind {
+            ItemKind::UserMessage(_) => ItemKind::UserMessage(new_content),
+            ItemKind::AssistantMessage(_) => ItemKind::AssistantMessage(new_content),
+            _ => return Err(StoreError::NotEditable(target)),
+        };
+
+        // Same parent, same kind: the new item *is* the edited one, and the original stays where it
+        // is (ADR-0003).
+        let mut forked = Item::with_id(ItemId::new(), session, replacement);
+        if let Some(turn) = original.turn {
+            forked = forked.with_turn(turn);
+        }
+        if let Some(parent) = original.parent {
+            forked = forked.with_parent(parent);
+        }
+
+        self.append_items(&[forked.clone()]).await?;
+        Ok(forked)
+    }
+
+    async fn switch_branch(&self, session: SessionId, head: ItemId) -> Result<Session, StoreError> {
+        match self.item_session(head).await? {
+            None => return Err(StoreError::ItemNotFound(head)),
+            Some(owner) if owner == session => {}
+            Some(_) => {
+                return Err(StoreError::SessionMismatch {
+                    item: head,
+                    session,
+                });
+            }
+        }
+        self.advance_head(&self.conn, session, head, Timestamp::now())
+            .await?;
+        self.session(session).await
+    }
+
+    async fn delete_branch(&self, session: SessionId, head: ItemId) -> Result<u64, StoreError> {
+        match self.item_session(head).await? {
+            None => return Err(StoreError::ItemNotFound(head)),
+            Some(owner) if owner == session => {}
+            Some(_) => {
+                return Err(StoreError::SessionMismatch {
+                    item: head,
+                    session,
+                });
+            }
+        }
+
+        let skeleton = self.skeleton(session).await?;
+        let doomed = tree::subtree(&skeleton, head);
+        let active = self.session(session).await?.active_branch_head;
+        if active.is_some_and(|active| doomed.contains(&active)) {
+            return Err(StoreError::ActiveHeadInside(session));
+        }
+
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .await
+            .map_err(StoreError::database)?;
+        // The cascade walks parent_id for us; the walk above exists to know what it will do and
+        // to refuse a dangling head before the database has to. Both counts are taken INSIDE the
+        // transaction so the cross-check runs before the commit: a disagreement means one of the
+        // two walks is wrong, and the answer is to keep the database as it was, not to report a
+        // count that no longer describes it after an irreversible delete.
+        let before = self.count(session, "items").await?;
+        tx.execute("DELETE FROM items WHERE id = ?1", [head.to_string()])
+            .await
+            .map_err(StoreError::database)?;
+        tx.execute(
+            "UPDATE sessions SET updated_at = ?1 WHERE id = ?2",
+            (Timestamp::now().as_unix_millis(), session.to_string()),
+        )
+        .await
+        .map_err(StoreError::database)?;
+        let after = self.count(session, "items").await?;
+        let removed = before - after;
+        if removed != doomed.len() as i64 {
+            // Dropping `tx` uncommitted is the rollback.
+            return Err(StoreError::Database(format!(
+                "the cascade removed {removed} items but the tree walk expected {}; \
+                 the delete was rolled back",
+                doomed.len()
+            )));
+        }
+        tx.commit().await.map_err(StoreError::database)?;
+        Ok(removed as u64)
+    }
+
+    // ---------------------------------------------------------------- turns
+
+    async fn start_turn(
+        &self,
+        session: SessionId,
+        turn: TurnId,
+        at: Timestamp,
+    ) -> Result<(), StoreError> {
+        // Checked rather than left to the foreign key: "that session is gone" is a caller error on
+        // the wire and "the engine refused the insert" is a storage failure (see `session_exists`).
+        self.session_exists(session).await?;
+        self.conn
+            .execute(
+                "INSERT INTO turns (id, session_id, started_at) VALUES (?1, ?2, ?3)",
+                (turn.to_string(), session.to_string(), at.as_unix_millis()),
+            )
+            .await
+            .map_err(StoreError::database)?;
+        Ok(())
+    }
+
+    async fn finish_turn(
+        &self,
+        session: SessionId,
+        turn: TurnId,
+        completion: Option<hatchery_protocol::TurnCompletion>,
+    ) -> Result<(), StoreError> {
+        // A session deleted under a running turn takes its `turns` rows with it, and the update
+        // below would then match nothing: reporting `UnknownTurn` would tell the daemon it never
+        // started a turn it did start. Say which thing is actually missing.
+        self.session_exists(session).await?;
+        let (reason, usage) = match &completion {
+            Some(completion) => (
+                Some(completion.reason.to_string()),
+                completion
+                    .usage
+                    .map(|usage| sql::to_json(&usage))
+                    .transpose()?,
+            ),
+            // A failed turn keeps `stop_reason` NULL and sets `ended_at`: "still running" and
+            // "failed" must be distinguishable without a pseudo reason (docs/design/protocol.md §4).
+            None => (None, None),
+        };
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE turns SET ended_at = ?1, stop_reason = ?2, usage = ?3 \
+                 WHERE id = ?4 AND session_id = ?5",
+                (
+                    Timestamp::now().as_unix_millis(),
+                    reason,
+                    usage,
+                    turn.to_string(),
+                    session.to_string(),
+                ),
+            )
+            .await
+            .map_err(StoreError::database)?;
+        if changed == 0 {
+            return Err(StoreError::UnknownTurn(turn));
+        }
+        Ok(())
+    }
+
+    /// Reads every open turn, for startup recovery.
+    ///
+    /// A whole-table read on purpose: recovery runs before any runtime exists, so the answer
+    /// cannot go stale under it. A turn row whose session row is gone cannot appear — the delete
+    /// cascades — so no per-row existence check belongs here.
+    async fn open_turns(&self) -> Result<Vec<(SessionId, TurnId)>, StoreError> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT session_id, id FROM turns WHERE ended_at IS NULL",
+                (),
+            )
+            .await
+            .map_err(StoreError::database)?;
+        let mut open = Vec::new();
+        while let Some(row) = rows.next().await.map_err(StoreError::database)? {
+            fn text_of(
+                column: Result<turso::Value, StoreError>,
+                what: &str,
+            ) -> Result<String, StoreError> {
+                let value = column?;
+                as_text(&value).map(str::to_owned).ok_or_else(|| {
+                    StoreError::Database(format!("an open turn's {what} is not text"))
+                })
+            }
+            let session: SessionId =
+                text_of(row.get_value(0).map_err(StoreError::database), "session id")?
+                    .parse()
+                    .map_err(|_| {
+                        StoreError::Database("an open turn's session id does not parse".to_owned())
+                    })?;
+            let turn: TurnId = text_of(row.get_value(1).map_err(StoreError::database), "id")?
+                .parse()
+                .map_err(|_| StoreError::Database("an open turn's id does not parse".to_owned()))?;
+            open.push((session, turn));
+        }
+        sql::drain(rows).await?;
+        Ok(open)
+    }
+
+    // ---------------------------------------------------------- checkpoints
+
+    async fn record_checkpoint(&self, record: CheckpointRecord) -> Result<(), StoreError> {
+        // An empty commit id names no commit: the row would look healthy to every reader while
+        // pinning a shadow repository that can never be restored to, and GC would keep paying for
+        // it. That is a caller bug, so it is refused as one rather than stored — a caller mistake
+        // and a storage failure must not reach a frontend looking the same
+        // (`docs/design/storage.md` §3).
+        if record.commit_id.is_empty() {
+            return Err(StoreError::Invalid(
+                "a checkpoint must name the commit it records".to_owned(),
+            ));
+        }
+        // Checked rather than left to the foreign key, for the reason `session_exists` gives.
+        self.session_exists(record.session).await?;
+        // The foreign key on `item_id` proves the item *exists*; it cannot prove the item belongs
+        // to the checkpoint's own session, and a cross-session item would make the row describe a
+        // commit its owner can never reach by walking its chain — the same gap `insert_item`
+        // closes for a cross-session parent.
+        if let Some(item) = record.item {
+            match self.item_session(item).await? {
+                Some(owner) if owner == record.session => {}
+                Some(_) => {
+                    return Err(StoreError::SessionMismatch {
+                        item,
+                        session: record.session,
+                    });
+                }
+                None => return Err(StoreError::ItemNotFound(item)),
+            }
+        }
+        // `item_id` stays NULL when the record has no item: the pre-restore safety snapshot is
+        // recorded precisely so it can be undone, and it must not enter the conversation
+        // (docs/design/storage.md §2).
+        self.conn
+            .execute(
+                "INSERT INTO checkpoints (id, session_id, item_id, workspace, commit_id, kind, \
+                 created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                (
+                    record.id.to_string(),
+                    record.session.to_string(),
+                    record.item.map(|item| item.to_string()),
+                    record.workspace.to_string_lossy().into_owned(),
+                    record.commit_id,
+                    checkpoint_kind_text(record.kind),
+                    record.created_at.as_unix_millis(),
+                ),
+            )
+            .await
+            .map_err(StoreError::database)?;
+        Ok(())
+    }
+
+    async fn checkpoints_for_workspace(
+        &self,
+        workspace: &Path,
+    ) -> Result<Vec<CheckpointRecord>, StoreError> {
+        // `id` breaks `created_at` ties: two snapshots inside one millisecond are ordinary when a
+        // write and a shell command follow each other, and the caller drains this list from the
+        // front to free budget, so an order the engine is free to choose would make GC pick
+        // victims arbitrarily. UUIDv7 ids sort by creation time, which keeps the tiebreak on the
+        // same axis as the primary key rather than merely making the order stable.
+        let sql = format!(
+            "SELECT {CHECKPOINT_COLUMNS} FROM checkpoints WHERE workspace = ?1 \
+             ORDER BY created_at ASC, id ASC"
+        );
+        // Bound with the same lossy spelling `sessions.workspace` is written and read with, so one
+        // path has one text form in this database and a lookup cannot miss rows over a spelling
+        // difference.
+        let rows = self
+            .conn
+            .query(sql, [workspace.to_string_lossy().into_owned()])
+            .await
+            .map_err(StoreError::database)?;
+        sql::collect(rows, |row| sql::read_checkpoint(row, 0)).await
+    }
+
+    async fn delete_checkpoints(&self, ids: &[CheckpointId]) -> Result<u64, StoreError> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        // One transaction for the whole sweep: GC reconciles its own accounting against the count
+        // returned here, and a half-applied batch would hand it a number describing neither its
+        // request nor the table.
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .await
+            .map_err(StoreError::database)?;
+        let mut removed: u64 = 0;
+        for chunk in ids.chunks(ID_CHUNK) {
+            let placeholders = (1..=chunk.len())
+                .map(|index| format!("?{index}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!("DELETE FROM checkpoints WHERE id IN ({placeholders})");
+            let params = params_from_iter(chunk.iter().map(ToString::to_string));
+            // Summed rather than echoed back: `execute` reports the rows that went away, so an id
+            // that was already gone (or listed twice) contributes nothing and the caller's
+            // reconciliation stays honest.
+            removed += tx
+                .execute(sql, params)
+                .await
+                .map_err(StoreError::database)?;
+        }
+        tx.commit().await.map_err(StoreError::database)?;
+        Ok(removed)
+    }
+
+    // ------------------------------------------------------------- plumbing
+
+    async fn skeleton(&self, session: SessionId) -> Result<Vec<SkeletonRow>, StoreError> {
+        let sql = format!("SELECT {SKELETON_COLUMNS} FROM items WHERE session_id = ?1");
+        let rows = self
+            .conn
+            .query(sql, [session.to_string()])
+            .await
+            .map_err(StoreError::database)?;
+        sql::collect(rows, sql::read_skeleton).await
+    }
+
+    /// Every item of a session, oldest first, for a whole-tree export.
+    async fn all_items(&self, session: SessionId) -> Result<Vec<Item>, StoreError> {
+        let sql = format!(
+            "SELECT {ITEM_COLUMNS} FROM items WHERE session_id = ?1 ORDER BY created_at ASC, id ASC"
+        );
+        let rows = self
+            .conn
+            .query(sql, [session.to_string()])
+            .await
+            .map_err(StoreError::database)?;
+        sql::collect(rows, |row| sql::read_item(row, 0)).await
+    }
+
+    /// Every item's descendant tips, for a whole-tree export.
+    async fn tips(&self, session: SessionId) -> Result<HashMap<ItemId, Vec<ItemId>>, StoreError> {
+        let skeleton = self.skeleton(session).await?;
+        tree::tips_map(&skeleton).map_err(|error| self.tree_error(error))
+    }
+
+    /// The items and tips for a whole-tree export, read in one pass.
+    ///
+    /// Validates the session first: an all-branches export of a session that does not exist must
+    /// fail the way the active-branch export does, not silently produce an empty file that a
+    /// retry with the correct id is then refused from overwriting.
+    async fn export_body(&self, session: SessionId) -> Result<ExportSnapshot, StoreError> {
+        self.session(session).await?;
+        let items = self.all_items(session).await?;
+        let tips = self.tips(session).await?;
+        Ok((items, tips))
+    }
+
+    async fn item_session(&self, item: ItemId) -> Result<Option<SessionId>, StoreError> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT session_id FROM items WHERE id = ?1",
+                [item.to_string()],
+            )
+            .await
+            .map_err(StoreError::database)?;
+        let found = match rows.next().await.map_err(StoreError::database)? {
+            Some(row) => {
+                let value = row.get_value(0).map_err(StoreError::database)?;
+                as_text(&value)
+                    .map(str::to_owned)
+                    .and_then(|text| text.parse().ok())
+            }
+            None => None,
+        };
+        sql::drain(rows).await?;
+        Ok(found)
+    }
+
+    /// Refuses a write whose session does not exist.
+    ///
+    /// The alternative is to let the foreign key refuse it and hand the caller the engine's
+    /// message: `docs/design/storage.md` §1 maps "no such session" to a caller error and "the
+    /// engine refused" to a storage failure, and those reach a frontend as different error codes.
+    /// Asking first costs one indexed read on a path that is about to write anyway.
+    async fn session_exists(&self, session: SessionId) -> Result<(), StoreError> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT id FROM sessions WHERE id = ?1",
+                [session.to_string()],
+            )
+            .await
+            .map_err(StoreError::database)?;
+        let found = rows.next().await.map_err(StoreError::database)?.is_some();
+        sql::drain(rows).await?;
+        if found {
+            Ok(())
+        } else {
+            Err(StoreError::SessionNotFound(session))
+        }
+    }
+
+    async fn count(&self, session: SessionId, table: &str) -> Result<i64, StoreError> {
+        let sql = format!("SELECT count(*) FROM {table} WHERE session_id = ?1");
+        let mut rows = self
+            .conn
+            .query(sql, [session.to_string()])
+            .await
+            .map_err(StoreError::database)?;
+        let value = match rows.next().await.map_err(StoreError::database)? {
+            Some(row) => row.get_value(0).map_err(StoreError::database)?,
+            None => {
+                return Err(StoreError::Database("count(*) returned no row".to_owned()));
+            }
+        };
+        sql::drain(rows).await?;
+        as_int(&value).ok_or_else(|| StoreError::Database("count(*) is not an integer".to_owned()))
+    }
+
+    /// A tree-walk failure, which means the stored data is corrupt.
+    fn tree_error(&self, error: tree::TreeError) -> StoreError {
+        StoreError::Database(format!("item tree is corrupt: {error}"))
+    }
+}
+
+/// Parses a `session/list` cursor: `updated_at_millis:id`.
+fn parse_cursor(cursor: &str) -> Result<(i64, SessionId), StoreError> {
+    let (millis, id) = cursor
+        .split_once(':')
+        .ok_or_else(|| StoreError::Invalid(format!("malformed cursor {cursor:?}")))?;
+    let millis = millis
+        .parse()
+        .map_err(|_| StoreError::Invalid(format!("malformed cursor {cursor:?}")))?;
+    let id = id
+        .parse()
+        .map_err(|_| StoreError::Invalid(format!("malformed cursor {cursor:?}")))?;
+    Ok((millis, id))
+}
+
+/// Sends a reply, ignoring a caller that has gone away.
+fn reply_send<T>(reply: Reply<T>, value: Result<T, StoreError>) {
+    if reply.send(value).is_err() {
+        tracing::debug!("a store caller dropped its reply slot");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hatchery_protocol::{CheckpointKind, ItemKindTag};
+
+    #[test]
+    fn cursors_round_trip() {
+        let id = SessionId::new();
+        let cursor = format!("1780000000000:{id}");
+        let (millis, parsed) = parse_cursor(&cursor).expect("a cursor we wrote");
+        assert_eq!(millis, 1_780_000_000_000);
+        assert_eq!(parsed, id);
+    }
+
+    #[test]
+    fn a_malformed_cursor_is_a_bad_request() {
+        for cursor in ["nonsense", "12:", ":id", ""] {
+            let error = parse_cursor(cursor).expect_err("must not parse");
+            assert_eq!(
+                error.to_event_error().code,
+                hatchery_protocol::ErrorCode::InvalidRequest
+            );
+        }
+    }
+
+    #[test]
+    fn the_spellings_written_into_sql_are_pinned() {
+        // `items.kind`, `sessions.status` and `checkpoints.kind` are matched against literals in
+        // SQL, so a rename in the protocol would surface as an empty result set rather than as a
+        // compile error.
+        assert_eq!(ItemKindTag::UserMessage.as_str(), "user_message");
+        assert_eq!(
+            status_text(sql::parse_status("idle").expect("known")),
+            "idle"
+        );
+        assert_eq!(checkpoint_kind_text(CheckpointKind::PreWrite), "pre_write");
+        assert_eq!(checkpoint_kind_text(CheckpointKind::PreShell), "pre_shell");
+        assert_eq!(checkpoint_kind_text(CheckpointKind::Manual), "manual");
+    }
+}
