@@ -944,6 +944,24 @@ async fn a_write_outside_the_workspace_is_refused_by_the_local_backend() {
     );
 }
 
+/// Whether the symlink a case needs is now on the disk. Windows mints a symbolic link only with
+/// `SeCreateSymbolicLinkPrivilege` (or developer mode) and answers error 1314 without it — measured
+/// on `x86_64-pc-windows-gnu`, where the account running the tests is not an administrator. The
+/// escape these cases guard is a property of the resolver, not of the runner, so a machine that
+/// cannot build the fixture says which case it skips instead of failing a case that never existed.
+/// Recorded as skipped-on-platform in `docs/worklog/capabilities.md`.
+fn symlink_was_minted(made: std::io::Result<()>) -> bool {
+    match made {
+        Ok(()) => true,
+        #[cfg(windows)]
+        Err(error) if error.raw_os_error() == Some(1314) => {
+            eprintln!("skipped: this machine cannot create symlinks (os error 1314)");
+            false
+        }
+        Err(error) => panic!("the symlink fixture failed: {error}"),
+    }
+}
+
 #[tokio::test]
 async fn a_symlinked_ancestor_cannot_carry_a_write_out_of_the_workspace() {
     // The escape the write path has to close that the lexical check cannot see: `link/` points
@@ -951,8 +969,14 @@ async fn a_symlinked_ancestor_cannot_carry_a_write_out_of_the_workspace() {
     // had run, if resolution anchored on the file instead of on the deepest existing ancestor.
     let sandbox = Sandbox::new();
     let outside = tempfile::tempdir().expect("outside");
-    std::os::unix::fs::symlink(outside.path(), sandbox.workspace.root().join("link"))
-        .expect("symlink");
+    #[cfg(unix)]
+    let minted = std::os::unix::fs::symlink(outside.path(), sandbox.workspace.root().join("link"));
+    #[cfg(windows)]
+    let minted =
+        std::os::windows::fs::symlink_dir(outside.path(), sandbox.workspace.root().join("link"));
+    if !symlink_was_minted(minted) {
+        return;
+    }
 
     let store = sandbox.store();
     let inner = LocalFs::new(sandbox.workspace.root()).expect("backend");
@@ -980,11 +1004,19 @@ async fn a_symlinked_ancestor_cannot_carry_a_write_out_of_the_workspace() {
 
     // A dangling symlink is refused for the same reason: writing "through" it would create the
     // file at its destination, outside every checkpoint.
-    std::os::unix::fs::symlink(
+    #[cfg(unix)]
+    let minted = std::os::unix::fs::symlink(
         outside.path().join("absent"),
         sandbox.workspace.root().join("dangling"),
-    )
-    .expect("symlink");
+    );
+    #[cfg(windows)]
+    let minted = std::os::windows::fs::symlink_file(
+        outside.path().join("absent"),
+        sandbox.workspace.root().join("dangling"),
+    );
+    if !symlink_was_minted(minted) {
+        return;
+    }
     let error = fs
         .write_text_file("dangling", "nope")
         .await

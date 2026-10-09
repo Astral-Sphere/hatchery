@@ -102,6 +102,14 @@ capabilities 的**代码**在 M0b 没有动（trait 与工具实现是 M1/M2 的
 
 ## 变更日志
 
+### 2026-10-09 · 符号链接类用例改成「造不出 fixture 就明说跳过」
+
+ADR-0013 让 windows-gnu 第一次编译到这些测试，`std::os::unix::fs::symlink` 是硬编译错误；改成两侧都有臂之后，**本机实测 `symlink_dir` 与 `symlink_file` 都返回 os error 1314**（这台机器的测试账户不是管理员，也没开 developer mode，即没有 `SeCreateSymbolicLinkPrivilege`）。`local_fs.rs` 原有的那条 Windows 臂（`symlink_dir("C:\\ProgramData", …).expect("symlink")`）因此从来没跑过：它不是「Windows 上的对等用例」，是一句会 panic 的假臂。
+
+现在 5 处符号链接 fixture（`local_fs.rs`、`checkpoint.rs` 两条、`checkpoints.rs` 一条、tools 的 `assembly.rs` 两条）统一走各文件内的 `symlink_was_minted`：创建成功 → 用例照跑；错误是 1314 → 打印 `skipped: this machine cannot create symlinks (os error 1314)` 并让用例过去；其他错误 → 照旧 panic。**GitHub runner 是否握有该特权未测**（管理员令牌通常有，未验证），所以这条判定两台都成立，而不是把用例钉死在某一边。
+
+代价要说清：跳过是用例「过去」而不是「没跑」，而 nextest 的捕获让那行说明在绿灯时看不见——本机这几条今天确实是跳过的。`the_disk_backend_serves_the_tools_and_refuses_a_symlink_escape` 保留了非符号链接那一半（磁盘后端服务三个只读工具），只把 escape 那半包起来；纯符号链接的两条（`a_symlink_loop_is_skipped_not_fatal_for_the_walk`、`a_symlinked_ancestor_cannot_carry_a_write_out_of_the_workspace`）跳过时整条不跑。escape 的真实覆盖今天仍只由 linux/macos 两个 job 供给；要补回来，得在 runner 上开 developer mode，或找到一个不需要特权的替换夹具——junction 要走 `DeviceIoControl` 写 reparse data，`hard_link` 又不能指向目录，都与符号链接不等价。
+
 ### 2026-10-08 · M2 Phase 1：CheckpointStore 转正 + 写路径 + D9/D13
 
 **新增**：`src/checkpoint.rs`（`CheckpointStore` / `CheckpointPool` / `CheckpointOptions` / `SnapshotReport` / `RestoreOptions` / `RestoreReport` / `CheckpointError`）、`src/checkpointed_fs.rs`（`Checkpointer` trait / `PreWrite` / `CheckpointedFs` 装饰器）、`tests/checkpoint.rs`（22 条）。`FsBackend` 加 `write_text_file`，`FsError` 加 `Checkpoint` 变体，`Backends` 加 `checkpointer`。capabilities 51 条测试全绿，覆盖率 88.2%（地板 85%）。

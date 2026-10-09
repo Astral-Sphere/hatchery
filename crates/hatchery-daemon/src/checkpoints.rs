@@ -665,6 +665,23 @@ mod tests {
         assert_eq!(checkpoints.sweep_orphans().await, 0, "nothing left to do");
     }
 
+    /// Whether the symlink a case needs is now on the disk. Windows mints a symbolic link only with
+    /// `SeCreateSymbolicLinkPrivilege` (or developer mode) and answers error 1314 without it —
+    /// measured on `x86_64-pc-windows-gnu`, where the account running the tests is not an
+    /// administrator. A machine that cannot build the fixture names the skip instead of failing a
+    /// case that never existed. Recorded in `docs/worklog/capabilities.md`.
+    fn symlink_was_minted(made: std::io::Result<()>) -> bool {
+        match made {
+            Ok(()) => true,
+            #[cfg(windows)]
+            Err(error) if error.raw_os_error() == Some(1314) => {
+                eprintln!("skipped: this machine cannot create symlinks (os error 1314)");
+                false
+            }
+            Err(error) => panic!("the symlink fixture failed: {error}"),
+        }
+    }
+
     /// Both writers of a checkpoint row spell the workspace the way the shadow repository records
     /// it, so the sweep can find them. If they ever diverge the sweep asks about a path nobody has a
     /// row for and reclaims a *live* repository — user data, gone, with nothing in the log to say
@@ -681,7 +698,13 @@ mod tests {
         // canonicalises to the same workspace. (`join(".")` would not do — `Path` equality compares
         // components, and a `.` component is not one.)
         let spelled = fixture.dir.path().join("link");
-        std::os::unix::fs::symlink(&fixture.workspace, &spelled).expect("symlink");
+        #[cfg(unix)]
+        let minted = std::os::unix::fs::symlink(&fixture.workspace, &spelled);
+        #[cfg(windows)]
+        let minted = std::os::windows::fs::symlink_dir(&fixture.workspace, &spelled);
+        if !symlink_was_minted(minted) {
+            return;
+        }
         assert_ne!(spelled, fixture.workspace);
         let store = checkpoints.store_for(&spelled).await.expect("store");
         let checkpointer = checkpoints

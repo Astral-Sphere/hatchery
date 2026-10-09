@@ -347,14 +347,34 @@ mod tests {
         }
     }
 
+    /// Whether the symlink a case needs is now on the disk. Windows mints a symbolic link only
+    /// with `SeCreateSymbolicLinkPrivilege` (or developer mode) and answers error 1314 without it —
+    /// measured on `x86_64-pc-windows-gnu`. Escaping through a symlink is a property of the
+    /// resolver, not of the runner, so a machine that cannot build the fixture says so out loud
+    /// instead of failing a case that never existed.
+    fn symlink_was_minted(made: std::io::Result<()>) -> bool {
+        match made {
+            Ok(()) => true,
+            #[cfg(windows)]
+            Err(error) if error.raw_os_error() == Some(1314) => {
+                eprintln!("skipped: this machine cannot create symlinks (os error 1314)");
+                false
+            }
+            Err(error) => panic!("the symlink fixture failed: {error}"),
+        }
+    }
+
     #[tokio::test]
     async fn a_symlink_escaping_the_workspace_is_caught_on_disk() {
         let (_dir, fs) = workspace();
         #[cfg(unix)]
-        std::os::unix::fs::symlink("/etc", _dir.path().join("escape")).expect("symlink");
+        let minted = std::os::unix::fs::symlink("/etc", _dir.path().join("escape"));
         #[cfg(windows)]
-        std::os::windows::fs::symlink_dir("C:\\ProgramData", _dir.path().join("escape"))
-            .expect("symlink");
+        let minted =
+            std::os::windows::fs::symlink_dir("C:\\ProgramData", _dir.path().join("escape"));
+        if !symlink_was_minted(minted) {
+            return;
+        }
 
         let error = fs
             .read_dir("escape")

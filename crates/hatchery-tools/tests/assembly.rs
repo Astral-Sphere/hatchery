@@ -177,12 +177,37 @@ fn summaries_come_back_human_readable_for_every_chat_tool() {
     }
 }
 
+/// Whether the symlink a case needs is now on the disk. Windows mints a symbolic link only with
+/// `SeCreateSymbolicLinkPrivilege` (or developer mode) and answers error 1314 without it — measured
+/// on `x86_64-pc-windows-gnu`, where the account running the tests is not an administrator. The
+/// escape these cases guard is a property of the resolver, not of the runner, so a machine that
+/// cannot build the fixture says which case it is skipping instead of failing a case that never
+/// existed. Recorded as skipped-on-platform in `docs/worklog/capabilities.md`.
+fn symlink_was_minted(made: std::io::Result<()>) -> bool {
+    match made {
+        Ok(()) => true,
+        #[cfg(windows)]
+        Err(error) if error.raw_os_error() == Some(1314) => {
+            eprintln!("skipped: this machine cannot create symlinks (os error 1314)");
+            false
+        }
+        Err(error) => panic!("the symlink fixture failed: {error}"),
+    }
+}
+
 #[tokio::test]
 async fn the_disk_backend_serves_the_tools_and_refuses_a_symlink_escape() {
     let ws = hatchery_testkit::TempWorkspace::new();
     ws.write("src/lib.rs", "pub fn real() {}\n");
-    // A symlink pointing outside the workspace: classic escape attempt.
-    std::os::unix::fs::symlink("/etc/hostname", ws.root().join("outside")).expect("symlink");
+    // A symlink pointing outside the workspace: classic escape attempt. Any outside target proves
+    // the same thing — the resolver refuses before it opens anything — so each platform points at
+    // a file it certainly has.
+    #[cfg(unix)]
+    let minted = std::os::unix::fs::symlink("/etc/hostname", ws.root().join("outside"));
+    #[cfg(windows)]
+    let minted =
+        std::os::windows::fs::symlink_file(r"C:\Windows\win.ini", ws.root().join("outside"));
+    let escaped_link = symlink_was_minted(minted);
 
     let registry = registry_on_disk(ws.root());
     let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
@@ -200,21 +225,23 @@ async fn the_disk_backend_serves_the_tools_and_refuses_a_symlink_escape() {
     assert!(!inside.is_error);
     assert!(inside.output.text.contains("pub fn real()"));
 
-    let escaped = registry
-        .invoke(
-            "read_file",
-            serde_json::json!({"path": "outside"}),
-            CancellationToken::new(),
-            tx,
-            CheckpointCollector::new(),
-        )
-        .await
-        .expect("dispatched");
-    assert!(
-        escaped.is_error,
-        "a symlink out of the workspace must be refused, got: {}",
-        escaped.output.text
-    );
+    if escaped_link {
+        let escaped = registry
+            .invoke(
+                "read_file",
+                serde_json::json!({"path": "outside"}),
+                CancellationToken::new(),
+                tx,
+                CheckpointCollector::new(),
+            )
+            .await
+            .expect("dispatched");
+        assert!(
+            escaped.is_error,
+            "a symlink out of the workspace must be refused, got: {}",
+            escaped.output.text
+        );
+    }
 }
 
 #[tokio::test]
@@ -265,8 +292,14 @@ async fn glob_and_grep_walk_the_real_disk() {
 async fn a_symlink_loop_is_skipped_not_fatal_for_the_walk() {
     let ws = hatchery_testkit::TempWorkspace::new();
     ws.write("plain.txt", "content\n");
-    std::os::unix::fs::symlink(ws.root().join("loop"), ws.root().join("loop"))
-        .expect("self-symlink");
+    #[cfg(unix)]
+    let minted = std::os::unix::fs::symlink(ws.root().join("loop"), ws.root().join("loop"));
+    #[cfg(windows)]
+    let minted = std::os::windows::fs::symlink_dir(ws.root().join("loop"), ws.root().join("loop"));
+    if !symlink_was_minted(minted) {
+        // The loop *is* the case; without it the walk proves nothing about cycles.
+        return;
+    }
 
     let registry = registry_on_disk(ws.root());
     let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
