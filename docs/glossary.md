@@ -30,7 +30,7 @@
 - **disposer**：逆序执行的 teardown 步骤栈（ADR-0009）；一步 panic 不阻断其余步骤。
 - **fail-loud 审计**：启动时把所有缺件（provider 缺 key、目录不可写……）一次列全再退出，拒绝半可用的 daemon。
 - **LiveHub**：per-session broadcast 扇出（容量 4096）。无 coalescing、无 replay window——重连靠 `session/load` 重建，这是文档化的形状而非缺口；两者顺延 M3（2026-10-07 裁决）：`is_coalescable` 只含 text/reasoning delta，而 Code 模式新增的事件量主要来自**不可合并**的 `ToolCallProgress`，coalescing 治不了它。
-- **stdio 监听**：与 UDS 同一条 `serve_connection` 循环的 stdin/stdout 实例，嵌入方用。
+- **stdio 监听**：与本地套接字同一条 `serve_connection` 循环的 stdin/stdout 实例，嵌入方用。
 
 ## llm 与能力
 
@@ -54,7 +54,7 @@
 - **e2e 形态（D7 定案）**：默认**进程内过真 socket**（TestDaemon），子进程形态保留一条常驻对比；entry 生命周期由 daemon 的 entry 测试专供。
 - **fixture**：`tests/fixtures/<name>.sse` + `.meta.json` 成对出现——字节级录制 + 来源元数据；脱敏扫描命中即拒写。
 - **invariants 分组**：`invariant_` 前缀的测试集合，nextest profile 按前缀选取，默认组也跑、永不 skip（testing.md §5 有不变量 → 测试映射表）。
-- **`TestDaemon` / `ClientProbe`**：testkit 的 e2e 主驱动——真 turso + 真配置 + 真 UDS 的进程内 daemon，与协议客户端探针。
+- **`TestDaemon` / `ClientProbe`**：testkit 的 e2e 主驱动——真 turso + 真配置 + 真本地套接字的进程内 daemon，与协议客户端探针。
 
 ## 配置与 prompt
 

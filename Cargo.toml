@@ -34,6 +34,14 @@ globset = "0.4.20"
 regex = "1.13.1"
 async-trait = "0.1.92"
 futures = "0.3.34"
+# ADR-0013: the daemon's local socket on the platform tokio cannot give one to. tokio gates
+# `net::unix` behind `cfg(unix)`, and `x86_64-pc-windows-gnu` is not `cfg(unix)` — MSYS2 UCRT64
+# builds native Windows binaries, so there is no AF_UNIX there. interprocess is UDS on unix and
+# named pipes on Windows behind one API; stable Rust (no `--cfg tokio_unstable`, which the
+# "portable by default" rule in .cargo/config.toml keeps out of CI) and no C toolchain (the same
+# reason ADR-0010 picked turso). It is referenced from exactly one module,
+# crates/hatchery-protocol/src/transport.rs, so no other crate names a platform socket type.
+interprocess = { version = "2.4.4", features = ["tokio"] }
 # The sole wire layer for hatchery-llm (ADR-0007): no hand-written HTTP/SSE this side. Feature
 # flags pick the provider families we probe in M1; `reasoning` rides along with each of them.
 # `ferritls` adds the pure-Rust TLS backend plus its installer, so no other crate has to pick one.

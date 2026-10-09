@@ -8,7 +8,7 @@
 
 它同时是全 workspace 的**共享词汇表**：id 新类型、`Content`、`ToolOutput`、`ApprovalRequest`、`Usage` 这些既要进 wire、又被 kernel 与 capabilities 使用的值类型只定义一次，住在这里。因此它位于所有 crate 之下（M0b 分层裁决，见 architecture.md §3）。
 
-选型：JSON-RPC 2.0。传输：UDS（daemon 常驻）与 stdio（embedded/ACP 桥接、测试）同一套消息帧（newline-delimited JSON）。不用 gRPC/protobuf 的理由：调试可用肉眼、与 ACP/MCP 生态一致、serde 即可。
+选型：JSON-RPC 2.0。传输：本地套接字（unix = UDS，Windows = 命名管道，ADR-0013；daemon 常驻）与 stdio（embedded/ACP 桥接、测试），同一套消息帧（newline-delimited JSON）。不用 gRPC/protobuf 的理由：调试可用肉眼、与 ACP/MCP 生态一致、serde 即可。
 
 帧的编解码在 `rpc.rs`：`encode_frame`（带换行符）与 `decode_frame` / `classify`（请求 / 通知 / 响应三类判别，`jsonrpc` 字段类型化，写错版本会被拒），外加 `FrameDecoder`——增量解码器，按**行**而不是按 chunk 解码，所以被两个 chunk 劈开的 UTF-8 字符不是错误；未结束的帧超过 4 MiB 报 `TooLong` 而不是无限缓冲。
 
@@ -203,7 +203,7 @@ pub enum DaemonEvent { DaemonShuttingDown { reason: String } }   // 非会话级
 
 规则：
 
-- 事件顺序保证：同一 session 内严格有序（UDS 单连接 FIFO + daemon 内 per-session 广播队列）。
+- 事件顺序保证：同一 session 内严格有序（单连接 FIFO + daemon 内 per-session 广播队列）。
 - 只有 `TextDelta`/`ReasoningDelta` 允许 daemon 侧合并（`ServerEvent::is_coalescable`）；控制事件不合并、不乱序。合并**策略**本身排 M3：M2 新增的事件量主要来自 `ToolCallProgress`，而它不可合并，所以调这个窗口治不了 M2 的病。
 - 迟加入的前端：`session/load` 返回 active 分支 items（或 `replay_from` 之后的增量），随后接实时流。
 - **历史移动不加新事件**（M2 Phase 3 的约定）：`session/rewind`、`branch/switch`、`edit_item` 都会让前端已投影的链失效，但新增事件 `type` 属 major bump（§6），所以不为它开变体。`SessionUpdated.state.active_branch_head` **已经在广播里**：前端发现新 head 不是自己已投影 head 的后继，就发 `session/load` 重建；发起方本来就能在自己的回复里拿到新 Session，不需要事件。

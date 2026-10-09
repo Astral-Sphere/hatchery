@@ -14,11 +14,12 @@ use std::time::Duration;
 
 use serde::{Serialize, de::DeserializeOwned};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::UnixStream;
 use tokio::sync::{Mutex as AsyncMutex, mpsc, oneshot};
+use tokio_util::sync::CancellationToken;
 
 use crate::method::HelloParams;
 use crate::rpc::{self, Id, Incoming, Request, Response};
+use crate::transport::{self, ReadHalf, WriteHalf};
 use crate::{PROTOCOL_VERSION, SessionEvent};
 
 /// The one-slot reply mailbox of an event connection: the subscribing call's response.
@@ -62,39 +63,51 @@ pub enum ClientError {
     OrphanReply(i64),
 }
 
-/// A live connection to the daemon over UDS.
+/// A live connection to the daemon over its local socket (ADR-0013).
 #[derive(Clone)]
 pub struct DaemonClient {
     inner: Arc<Inner>,
 }
 
 struct Inner {
-    write: AsyncMutex<tokio::io::BufWriter<tokio::net::unix::OwnedWriteHalf>>,
+    write: AsyncMutex<tokio::io::BufWriter<WriteHalf>>,
     pending: Mutex<HashMap<i64, oneshot::Sender<Result<serde_json::Value, ClientError>>>>,
     next_id: AtomicI64,
+    /// Signals the reply router that the last client is gone. It cannot learn that from the
+    /// socket: on Windows dropping the write half leaves the connection standing, so a router
+    /// parked on a quiet read would hold the read half — and the pipe — alive forever (ADR-0013).
+    death: CancellationToken,
+}
+
+impl Drop for Inner {
+    fn drop(&mut self) {
+        self.death.cancel();
+    }
 }
 
 impl DaemonClient {
-    /// Connects to the daemon's UDS and starts the reply router.
+    /// Connects to the daemon's socket and starts the reply router.
     ///
     /// # Errors
     ///
     /// [`ClientError::Connect`] when the socket is not there.
     pub async fn connect(path: impl AsRef<Path>) -> Result<Self, ClientError> {
         let path = path.as_ref();
-        let stream = UnixStream::connect(path)
-            .await
-            .map_err(|source| ClientError::Connect {
-                path: path.display().to_string(),
-                source,
-            })?;
-        let (read, write) = stream.into_split();
+        let (read, write) =
+            transport::connect(path)
+                .await
+                .map_err(|source| ClientError::Connect {
+                    path: path.display().to_string(),
+                    source,
+                })?;
+        let death = CancellationToken::new();
         let inner = Arc::new(Inner {
             write: AsyncMutex::new(tokio::io::BufWriter::new(write)),
             pending: Mutex::new(HashMap::new()),
             next_id: AtomicI64::new(1),
+            death: death.clone(),
         });
-        spawn_reply_router(Arc::downgrade(&inner), read);
+        spawn_reply_router(Arc::downgrade(&inner), death, read);
         Ok(Self { inner })
     }
 
@@ -207,7 +220,7 @@ impl DaemonClient {
 /// The router holds the inner state only *weakly*: the connection must die with the last
 /// [`DaemonClient`] clone, and a strong hold here would keep the write half — and therefore the
 /// whole connection — alive forever after every caller was gone.
-fn spawn_reply_router(inner: Weak<Inner>, read: tokio::net::unix::OwnedReadHalf) {
+fn spawn_reply_router(inner: Weak<Inner>, death: CancellationToken, read: ReadHalf) {
     tokio::spawn(async move {
         let mut lines = BufReader::new(read).lines();
         loop {
@@ -215,21 +228,28 @@ fn spawn_reply_router(inner: Weak<Inner>, read: tokio::net::unix::OwnedReadHalf)
             // write half alive through the router itself, and the daemon could never observe the
             // last client hanging up. A line can only arrive while a client lives, so the
             // upgrade after the await is the honest check.
-            let line = match lines.next_line().await {
-                Ok(Some(line)) => line,
-                Ok(None) | Err(_) => {
-                    // The daemon is gone: every waiter learns at once.
-                    if let Some(inner) = inner.upgrade() {
-                        let mut pending =
-                            inner.pending.lock().expect("pending map is not poisoned");
-                        for (_id, waiter) in pending.drain() {
-                            let _ = waiter.send(Err(ClientError::Connection(
-                                "the daemon connection closed".to_owned(),
-                            )));
+            //
+            // `death` is the other half of that: on Windows a dropped write half leaves the
+            // connection standing (measured), so parking on the read alone would keep this socket
+            // alive for as long as the daemon says nothing (ADR-0013).
+            let line = tokio::select! {
+                _ = death.cancelled() => return,
+                received = lines.next_line() => match received {
+                    Ok(Some(line)) => line,
+                    Ok(None) | Err(_) => {
+                        // The daemon is gone: every waiter learns at once.
+                        if let Some(inner) = inner.upgrade() {
+                            let mut pending =
+                                inner.pending.lock().expect("pending map is not poisoned");
+                            for (_id, waiter) in pending.drain() {
+                                let _ = waiter.send(Err(ClientError::Connection(
+                                    "the daemon connection closed".to_owned(),
+                                )));
+                            }
                         }
+                        return;
                     }
-                    return;
-                }
+                },
             };
             let Some(inner) = inner.upgrade() else {
                 // Every client is gone; dropping the read half here is what ends the connection
@@ -286,10 +306,13 @@ fn route(inner: &Inner, response: Response) {
 /// it, then [`next`](Self::next) forever. The subscribing call's reply comes back through
 /// `subscribe`'s result even as later events are already flowing to `next`.
 pub struct EventStream {
-    writer: AsyncMutex<tokio::io::BufWriter<tokio::net::unix::OwnedWriteHalf>>,
+    writer: AsyncMutex<tokio::io::BufWriter<WriteHalf>>,
     pending: Arc<Mutex<Option<PendingReply>>>,
     next_id: AtomicI64,
     events: mpsc::Receiver<SessionEvent>,
+    /// Cancels the event router when this stream dies, which is the only way the connection ends
+    /// on Windows: dropping the writer alone leaves the pipe standing (ADR-0013).
+    death: CancellationToken,
 }
 
 impl EventStream {
@@ -300,21 +323,23 @@ impl EventStream {
     /// [`ClientError::Connect`] when the socket is not there.
     pub async fn connect(path: impl AsRef<Path>) -> Result<Self, ClientError> {
         let path = path.as_ref();
-        let stream = UnixStream::connect(path)
-            .await
-            .map_err(|source| ClientError::Connect {
-                path: path.display().to_string(),
-                source,
-            })?;
-        let (read, write) = stream.into_split();
+        let (read, write) =
+            transport::connect(path)
+                .await
+                .map_err(|source| ClientError::Connect {
+                    path: path.display().to_string(),
+                    source,
+                })?;
         let (tx, rx) = mpsc::channel(1024);
         let pending: Arc<Mutex<Option<PendingReply>>> = Arc::new(Mutex::new(None));
-        spawn_event_router(Arc::clone(&pending), read, tx);
+        let death = CancellationToken::new();
+        spawn_event_router(Arc::clone(&pending), death.clone(), read, tx);
         Ok(Self {
             writer: AsyncMutex::new(tokio::io::BufWriter::new(write)),
             pending,
             next_id: AtomicI64::new(10_000),
             events: rx,
+            death,
         })
     }
 
@@ -370,7 +395,10 @@ impl EventStream {
 
 impl Drop for EventStream {
     fn drop(&mut self) {
-        // Closing the writer ends the connection; the router task notices and exits.
+        // The writer field drops with the rest of the struct; cancelling here is what releases the
+        // read half the router is parked on. On unix either one would end the connection, on
+        // Windows it takes both (ADR-0013).
+        self.death.cancel();
         self.events.close();
     }
 }
@@ -384,65 +412,70 @@ impl Drop for EventStream {
 /// state with stale deltas.
 fn spawn_event_router(
     pending: Arc<Mutex<Option<PendingReply>>>,
-    read: tokio::net::unix::OwnedReadHalf,
+    death: CancellationToken,
+    read: ReadHalf,
     events: mpsc::Sender<SessionEvent>,
 ) {
     tokio::spawn(async move {
         let mut lines = BufReader::new(read).lines();
         let mut highest_generation = 0_u64;
         loop {
-            match lines.next_line().await {
-                Ok(Some(line)) => match rpc::decode_frame(&line) {
-                    Ok(Incoming::Response(response)) => {
-                        let waiter = pending.lock().expect("pending is not poisoned").take();
-                        if let Some(waiter) = waiter {
-                            let payload = if response.is_ok() {
-                                response
-                                    .result_as::<serde_json::Value>()
-                                    .map_err(ClientError::Frame)
-                            } else {
-                                Err(ClientError::Daemon {
-                                    message: response.error.map_or_else(
-                                        || "unspecified error".to_owned(),
-                                        |error| error.message,
-                                    ),
-                                })
-                            };
-                            let _ = waiter.send(payload);
-                        }
-                    }
-                    Ok(Incoming::Notification(notification))
-                        if notification.method == EVENT_NOTIFICATION =>
-                    {
-                        let value = notification.params.unwrap_or(serde_json::Value::Null);
-                        match serde_json::from_value::<SessionEvent>(value) {
-                            Ok(event) => {
-                                if event.generation < highest_generation {
-                                    tracing::debug!(
-                                        event_generation = event.generation,
-                                        seen = highest_generation,
-                                        "dropped an event from a superseded runtime"
-                                    );
-                                    continue;
-                                }
-                                highest_generation = event.generation;
-                                if events.send(event).await.is_err() {
-                                    return;
-                                }
-                            }
-                            Err(error) => {
-                                tracing::warn!("an event payload did not parse: {error}");
-                            }
-                        }
-                    }
-                    Ok(frame) => {
-                        tracing::debug!(
-                            "a non-event frame arrived on the events connection: {frame:?}"
-                        );
-                    }
-                    Err(error) => tracing::warn!("an unparseable event frame arrived: {error}"),
+            let line = tokio::select! {
+                _ = death.cancelled() => return,
+                received = lines.next_line() => match received {
+                    Ok(Some(line)) => line,
+                    Ok(None) | Err(_) => return,
                 },
-                Ok(None) | Err(_) => return,
+            };
+            match rpc::decode_frame(&line) {
+                Ok(Incoming::Response(response)) => {
+                    let waiter = pending.lock().expect("pending is not poisoned").take();
+                    if let Some(waiter) = waiter {
+                        let payload = if response.is_ok() {
+                            response
+                                .result_as::<serde_json::Value>()
+                                .map_err(ClientError::Frame)
+                        } else {
+                            Err(ClientError::Daemon {
+                                message: response.error.map_or_else(
+                                    || "unspecified error".to_owned(),
+                                    |error| error.message,
+                                ),
+                            })
+                        };
+                        let _ = waiter.send(payload);
+                    }
+                }
+                Ok(Incoming::Notification(notification))
+                    if notification.method == EVENT_NOTIFICATION =>
+                {
+                    let value = notification.params.unwrap_or(serde_json::Value::Null);
+                    match serde_json::from_value::<SessionEvent>(value) {
+                        Ok(event) => {
+                            if event.generation < highest_generation {
+                                tracing::debug!(
+                                    event_generation = event.generation,
+                                    seen = highest_generation,
+                                    "dropped an event from a superseded runtime"
+                                );
+                                continue;
+                            }
+                            highest_generation = event.generation;
+                            if events.send(event).await.is_err() {
+                                return;
+                            }
+                        }
+                        Err(error) => {
+                            tracing::warn!("an event payload did not parse: {error}");
+                        }
+                    }
+                }
+                Ok(frame) => {
+                    tracing::debug!(
+                        "a non-event frame arrived on the events connection: {frame:?}"
+                    );
+                }
+                Err(error) => tracing::warn!("an unparseable event frame arrived: {error}"),
             }
         }
     });
@@ -451,25 +484,64 @@ fn spawn_event_router(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::io::AsyncReadExt;
-    use tokio::net::{UnixListener, UnixStream as TokioUnixStream};
+    use std::io;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
+
+    /// The fake daemon's side of one connection: both halves carried together, because a test
+    /// reads requests and writes replies on the same socket. [`transport`] hands out the two
+    /// halves separately — that is how a real client drops them separately (ADR-0013), and the
+    /// `Peer` exists for these tests only.
+    struct Peer {
+        read: ReadHalf,
+        write: WriteHalf,
+    }
+
+    impl AsyncRead for Peer {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.read).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for Peer {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            bytes: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Pin::new(&mut self.write).poll_write(cx, bytes)
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.write).poll_flush(cx)
+        }
+
+        fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.write).poll_shutdown(cx)
+        }
+    }
 
     /// A fake daemon: binds a tempdir socket and hands the test each accepted connection.
     struct FakeDaemon {
         _dir: tempfile::TempDir,
         path: std::path::PathBuf,
-        accept: tokio::sync::mpsc::Receiver<TokioUnixStream>,
+        accept: tokio::sync::mpsc::Receiver<Peer>,
     }
 
     impl FakeDaemon {
         async fn new() -> Self {
             let dir = tempfile::tempdir().expect("tempdir");
             let path = dir.path().join("fake.sock");
-            let listener = UnixListener::bind(&path).expect("bind");
+            let listener = transport::bind(&path).expect("bind");
             let (accepted_tx, accepted_rx) = tokio::sync::mpsc::channel(4);
             tokio::spawn(async move {
-                while let Ok((stream, _)) = listener.accept().await {
-                    if accepted_tx.send(stream).await.is_err() {
+                while let Ok((read, write)) = listener.accept().await {
+                    if accepted_tx.send(Peer { read, write }).await.is_err() {
                         return;
                     }
                 }
@@ -481,12 +553,12 @@ mod tests {
             }
         }
 
-        async fn connection(&mut self) -> TokioUnixStream {
+        async fn connection(&mut self) -> Peer {
             self.accept.recv().await.expect("a connection arrived")
         }
     }
 
-    async fn read_line(stream: &mut TokioUnixStream) -> String {
+    async fn read_line(stream: &mut Peer) -> String {
         let mut line = Vec::new();
         loop {
             let mut byte = [0_u8; 1];

@@ -77,7 +77,7 @@ async fn the_daemon_serves_over_uds_and_teardown_clears_the_state() {
     };
 
     let info = wait_published(&state, &mut runner).await;
-    let client = DaemonClient::connect(&info.uds_path)
+    let client = DaemonClient::connect(&info.endpoint)
         .await
         .expect("connect");
     let hello = client
@@ -182,10 +182,14 @@ async fn a_listener_bind_failure_still_clears_daemon_json() {
     // later `attach` would trust it.
     let dir = tempfile::tempdir().expect("tempdir");
     let state = state_dir(dir.path());
-    // Occupy the socket path with a directory: bind cannot succeed, and `serve_uds`'s own
-    // pre-bind remove cannot clear it either.
     let socket_path = state.socket_path();
+    // Occupy the endpoint so the bind must fail. The two refusals are different, and both are
+    // measured (ADR-0013): unix unlinks a corpse socket file before binding, so only something
+    // that is not a file at all can stop it; Windows refuses a name a live listener already holds.
+    #[cfg(unix)]
     std::fs::create_dir_all(&socket_path).expect("occupy the socket path");
+    #[cfg(windows)]
+    let _held = hatchery_protocol::transport::bind(&socket_path).expect("occupy the endpoint");
 
     let error = run_until(
         options(&state, &dir.path().join("data")),

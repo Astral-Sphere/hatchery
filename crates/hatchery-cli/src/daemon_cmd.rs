@@ -87,7 +87,7 @@ async fn start(state: &StateDir) -> i32 {
             println!(
                 "the daemon is up: pid {}, socket {}, log {}",
                 info.pid,
-                info.uds_path,
+                info.endpoint,
                 state.logs_dir().display()
             );
             return 0;
@@ -144,7 +144,7 @@ fn status(state: &StateDir) -> i32 {
     }
     println!(
         "the daemon is running: pid {}, socket {}, protocol {}, since unix {}",
-        info.pid, info.uds_path, info.protocol_version, info.started_at
+        info.pid, info.endpoint, info.protocol_version, info.started_at
     );
     0
 }

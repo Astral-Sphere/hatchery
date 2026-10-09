@@ -22,7 +22,7 @@
 
 **范围**
 - `hatchery-llm`：ChatCompletions adapter（deepseek/qwen 两家真实探测录制 fixture）、effort 映射表 v1、reasoning 采集/回放。
-- `hatchery-daemon`：UDS/stdio 监听、attach-or-spawn、单会话 runtime、live hub（无 coalescing 优化）、generation。
+- `hatchery-daemon`：本地套接字（unix UDS / Windows 命名管道）与 stdio 监听、attach-or-spawn、单会话 runtime、live hub（无 coalescing 优化）、generation。
 - `hatchery-cli`：TUI 最小版（消息流 + 输入 + reasoning 折叠 + `/effort` `/model` `/prompt`）+ headless exec。
 - Chat 模式：只读工具 `read_file`/`glob`/`grep`（LocalFs 直读）。
 - 配置分层（platform.md §1）+ prompt 管线 v1（identity + mode_variant + environment + safety_gate）。**交付范围更正（2026-10-07 勘察）**：这一项实际只交付了**透明性**——四节装配、`{{var}}` 插值、per-section 来源标注与 `prompt/render`／CLI `/prompt`；`render_chat` 的唯一非测试调用方是 `core.rs:227` 的 `prompt/render`，**装配结果从未进过任何一次模型请求**（`ChatOptions` 无 system 字段、`StoreHistory::view()` 不产 `Role::System`，且 `runtime.rs:618` 有一条测试主动断言消息里没有 system 角色）。注入模型随 **M2 Phase 0**——**已于 2026-10-07 落地**（`StoreHistory::view()` 前置 `Role::System`，kernel 与 llm 一行未改；D15 定稿，细节见 design/platform.md §2.1）。

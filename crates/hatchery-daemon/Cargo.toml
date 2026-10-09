@@ -27,7 +27,7 @@ hatchery-tools.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["io-std", "io-util", "net", "signal"] }
+tokio = { workspace = true, features = ["io-std", "io-util", "signal"] }
 tokio-util.workspace = true
 toml.workspace = true
 tracing.workspace = true

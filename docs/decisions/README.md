@@ -11,7 +11,7 @@
 
 | 编号 | 标题 | 状态 |
 |---|---|---|
-| [0001](0001-runtime-daemon.md) | 全协议化 runtime daemon，前端皆瘦客户端 | accepted |
+| [0001](0001-runtime-daemon.md) | 全协议化 runtime daemon，前端皆瘦客户端 | accepted（传输层的 Windows 半边由 0013 补） |
 | [0002](0002-libsql-single-writer.md) | 存储：daemon 内嵌 libSQL + 单写者 actor | accepted（引擎选型部分被 0010 取代） |
 | [0003](0003-edit-as-fork.md) | 历史编辑 = 编辑即分叉，允许删除分支 | accepted |
 | [0004](0004-capability-seam-acp.md) | capability seam 支撑完整 ACP（含 fs/terminal 委派） | accepted |
@@ -23,3 +23,4 @@
 | [0010](0010-storage-engine-turso.md) | 存储引擎用 turso 0.7.2（纯 Rust），递归 CTE 改内存走树 | accepted |
 | [0011](0011-i18n-fluent.md) | i18n 用 fluent（纯 Rust），不用 gettext | accepted |
 | [0012](0012-shadow-git-git2-vendored.md) | 影子 Git 后端用 git2（vendored libgit2），不依赖用户的 git 二进制 | accepted |
+| [0013](0013-windows-named-pipe-transport.md) | Windows 的本地套接字用命名管道（interprocess），unix 保持 tokio UDS | accepted |

@@ -104,7 +104,7 @@ pub async fn run_attached(
         out.note(&format!(
             "session {} on {} ({})",
             session,
-            attached.info.uds_path,
+            attached.info.endpoint,
             if attached.spawned {
                 "spawned"
             } else {
@@ -176,7 +176,7 @@ pub(crate) async fn open_subscribed(
     model: Option<&str>,
     workspace: Option<&std::path::Path>,
 ) -> Result<(EventStream, SessionId, serde_json::Value), String> {
-    let mut stream = EventStream::connect(&attached.info.uds_path)
+    let mut stream = EventStream::connect(&attached.info.endpoint)
         .await
         .map_err(|error| error.to_string())?;
     let reply = if let Some(session) = session {

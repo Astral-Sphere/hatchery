@@ -1,9 +1,9 @@
 # hatchery-daemon
 
 The runtime host and the only writer of the database (ADR-0001, ADR-0002): single-instance
-discovery, UDS/stdio listeners, the session manager with leases and generation numbers, the live
-hub that fans events out to every attached frontend, and profile-based assembly with a fail-loud
-startup audit (ADR-0009).
+discovery, listeners on the local socket (UDS on unix, named pipes on Windows — ADR-0013) and
+stdio, the session manager with leases and generation numbers, the live hub that fans events out
+to every attached frontend, and profile-based assembly with a fail-loud startup audit (ADR-0009).
 
 Sessions outlive frontends — closing a terminal does not stop a running turn.
 

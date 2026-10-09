@@ -5,9 +5,10 @@
 //!
 //! * `daemon.lock` — an advisory file lock (`fs2`). Whoever holds it is the active daemon; a
 //!   second daemon's grab of the lock is the whole startup race, resolved by the OS.
-//! * `daemon.json` — `{pid, uds_path, protocol_version, boot_token, started_at}`. Clients read
-//!   it, connect to the UDS, and present the boot token on `daemon/hello`.
-//! * `hatchery.sock` — the UDS itself, permissions 0700.
+//! * `daemon.json` — `{pid, endpoint, protocol_version, boot_token, started_at}`. Clients read
+//!   it, connect to the endpoint, and present the boot token on `daemon/hello`.
+//! * `hatchery.sock` — the socket's locator: the UDS itself on unix (permissions 0700), and on
+//!   Windows the path a named-pipe name is derived from (ADR-0013), which is never a file.
 //!
 //! Two decisions this pins (both daemon.md open questions):
 //!
@@ -58,8 +59,11 @@ pub enum DiscoverError {
 pub struct DaemonInfo {
     /// The daemon's process id, for `daemon status` and stale-file checks.
     pub pid: u32,
-    /// The UDS path, absolute.
-    pub uds_path: String,
+    /// The socket's locator, absolute: a filesystem path on unix, and on Windows the path the
+    /// named-pipe name is derived from. A client hands it back to
+    /// [`transport::connect`](hatchery_protocol::transport::connect) unchanged — which platform
+    /// meaning it carries is the transport's business, not the client's (ADR-0013).
+    pub endpoint: String,
     /// The protocol version this daemon speaks.
     pub protocol_version: String,
     /// The boot token: presented on `daemon/hello`, regenerated every start (D4).
@@ -129,7 +133,9 @@ impl StateDir {
         self.root.join("daemon.json")
     }
 
-    /// `hatchery.sock`.
+    /// `hatchery.sock` — the endpoint's locator. On unix this is the socket file; on Windows no
+    /// file is ever created here, and the transport derives a named-pipe name from this path
+    /// (ADR-0013).
     #[must_use]
     pub fn socket_path(&self) -> PathBuf {
         self.root.join("hatchery.sock")
@@ -326,7 +332,7 @@ mod tests {
 
         let info = DaemonInfo {
             pid: std::process::id(),
-            uds_path: dir.socket_path().display().to_string(),
+            endpoint: dir.socket_path().display().to_string(),
             protocol_version: hatchery_protocol::PROTOCOL_VERSION.to_owned(),
             boot_token: "token-1".to_owned(),
             started_at: unix_now(),
@@ -346,7 +352,7 @@ mod tests {
         let dir = StateDir::at(tempfile::tempdir().expect("tempdir").path());
         let mut info = DaemonInfo {
             pid: std::process::id(),
-            uds_path: String::new(),
+            endpoint: String::new(),
             protocol_version: hatchery_protocol::PROTOCOL_VERSION.to_owned(),
             boot_token: String::new(),
             started_at: 0,
@@ -367,7 +373,7 @@ mod tests {
         let dir = StateDir::at(tempfile::tempdir().expect("tempdir").path());
         let info = DaemonInfo {
             pid: 1,
-            uds_path: String::new(),
+            endpoint: String::new(),
             protocol_version: hatchery_protocol::PROTOCOL_VERSION.to_owned(),
             boot_token: "t".to_owned(),
             started_at: 0,

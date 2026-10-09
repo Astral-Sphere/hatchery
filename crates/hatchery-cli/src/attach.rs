@@ -139,7 +139,7 @@ pub async fn attach_or_spawn(
 ///
 /// [`AttachError::Client`] when the connect or the handshake fails.
 pub async fn attach_to(info: &DaemonInfo) -> Result<Attached, AttachError> {
-    let client = hatchery_protocol::DaemonClient::connect(&info.uds_path).await?;
+    let client = hatchery_protocol::DaemonClient::connect(&info.endpoint).await?;
     client.hello(Some(info.boot_token.clone())).await?;
     Ok(Attached {
         client,

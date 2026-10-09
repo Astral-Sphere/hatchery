@@ -193,14 +193,79 @@ async fn attach_reuses_a_published_daemon_and_calls_work() {
     daemon.stop().await;
 }
 
+/// A stand-in for a daemon process that starts, publishes nothing and exits successfully:
+/// `/bin/true` on unix, a batch file on Windows — `Command::new` runs a `.cmd` through `cmd.exe`,
+/// and the `daemon run --state-dir …` arguments `attach_or_spawn` appends are simply ignored by it
+/// (both measured on `x86_64-pc-windows-gnu`).
+fn no_op_daemon(dir: &std::path::Path) -> std::path::PathBuf {
+    #[cfg(unix)]
+    {
+        let _ = dir;
+        std::path::PathBuf::from("/bin/true")
+    }
+    #[cfg(windows)]
+    {
+        let script = dir.join("no-op-daemon.cmd");
+        std::fs::write(&script, "@echo off\r\nexit /b 0\r\n").expect("the stand-in is written");
+        script
+    }
+}
+
+/// A stand-in for a daemon that dies of a locked database, complaining on stderr exactly the way
+/// the foreground `daemon run` does — the words the live acceptance run could only read by giving
+/// up on the detached path. Windows gets the same words from a batch file, so the assertion below
+/// is the same on both platforms.
+fn doomed_daemon(dir: &std::path::Path) -> std::path::PathBuf {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let script = dir.join("doomed-daemon.sh");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\necho 'store: database: Locking error: Failed locking file' >&2\nexit 1\n",
+        )
+        .expect("the stand-in is written");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        script
+    }
+    #[cfg(windows)]
+    {
+        let script = dir.join("doomed-daemon.cmd");
+        std::fs::write(
+            &script,
+            "@echo off\r\necho store: database: Locking error: Failed locking file 1>&2\r\nexit /b 1\r\n",
+        )
+        .expect("the stand-in is written");
+        script
+    }
+}
+
+/// A child that stays alive for a while, standing in for a daemon process whose pid somebody
+/// else owns. `ping` with a count is the portable sleep: `cmd /C ping -n 31` holds a live pid the
+/// same way `/bin/sleep 30` does (measured on `x86_64-pc-windows-gnu`).
+fn spawn_a_sleeper() -> std::process::Child {
+    #[cfg(unix)]
+    let sleeper = std::process::Command::new("/bin/sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn sleep");
+    #[cfg(windows)]
+    let sleeper = std::process::Command::new("cmd")
+        .args(["/C", "ping -n 31 127.0.0.1 >nul"])
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn a sleeper");
+    sleeper
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_spawned_child_that_dies_is_reported_not_polled_out() {
     let dir = tempfile::tempdir().expect("tempdir");
     let state = hatchery_daemon::discover::StateDir::at(dir.path().join("state"));
     let error = match hatchery_cli::attach::attach_or_spawn(
         state,
-        // `/bin/true` starts, publishes nothing, exits: the attach loop must notice.
-        Some(std::path::PathBuf::from("/bin/true")),
+        // Starts, publishes nothing, exits: the attach loop must notice.
+        Some(no_op_daemon(dir.path())),
         None,
     )
     .await
@@ -216,19 +281,8 @@ async fn a_spawned_child_that_dies_is_reported_not_polled_out() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_detached_childs_fatal_words_reach_the_log_it_is_pointed_at() {
-    use std::os::unix::fs::PermissionsExt;
-
     let dir = tempfile::tempdir().expect("tempdir");
-    // Stands in for a daemon that dies of a locked database, complaining on stderr exactly the
-    // way the foreground `daemon run` does — the words the live acceptance run could only read
-    // by giving up on the detached path.
-    let doomed = dir.path().join("doomed-daemon.sh");
-    std::fs::write(
-        &doomed,
-        "#!/bin/sh\necho 'store: database: Locking error: Failed locking file' >&2\nexit 1\n",
-    )
-    .expect("the stand-in is written");
-    std::fs::set_permissions(&doomed, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    let doomed = doomed_daemon(dir.path());
 
     let state_root = dir.path().join("state");
     let state = hatchery_daemon::discover::StateDir::at(state_root.clone());
@@ -304,13 +358,10 @@ async fn daemon_status_and_stop_report_the_published_truth() {
     // A live publication needs a live pid that is not this process — `discover_alive`
     // deliberately reads a publication naming *our own* pid as stale (a leftover from a crashed
     // same-pid run is exactly the trap it guards against). A sleeping child is the stand-in.
-    let mut sleeper = std::process::Command::new("/bin/sleep")
-        .arg("30")
-        .spawn()
-        .expect("spawn sleep");
+    let mut sleeper = spawn_a_sleeper();
     let info = hatchery_daemon::discover::DaemonInfo {
         pid: sleeper.id(),
-        uds_path: state_dir.join("absent.sock").display().to_string(),
+        endpoint: state_dir.join("absent.sock").display().to_string(),
         protocol_version: hatchery_protocol::PROTOCOL_VERSION.to_owned(),
         boot_token: "boot-test".to_owned(),
         started_at: 0,
@@ -335,14 +386,24 @@ async fn daemon_status_and_stop_report_the_published_truth() {
         "start on a running daemon is a no-op success"
     );
 
-    // A stale publication (the pid is gone): status says so and exits 1.
-    let mut died = std::process::Command::new("/bin/true")
-        .spawn()
-        .expect("spawn /bin/true");
-    let dead_pid = died.id();
-    assert!(died.wait().expect("waited").success());
+    // A stale publication (the pid is gone): status says so and exits 1. Which pid reads as gone is
+    // platform-dependent because the probe is: `discover_alive` asks `/proc` on Linux and
+    // conservatively answers "alive" everywhere else (D4's decision — the hello handshake is the
+    // real check). So Linux gets a pid that really exited, and every other platform the one shape
+    // the probe refuses everywhere: pid 0.
+    #[cfg(target_os = "linux")]
+    let stale_pid = {
+        let mut died = std::process::Command::new("/bin/true")
+            .spawn()
+            .expect("spawn /bin/true");
+        let pid = died.id();
+        assert!(died.wait().expect("waited").success());
+        pid
+    };
+    #[cfg(not(target_os = "linux"))]
+    let stale_pid = 0;
     let stale = hatchery_daemon::discover::DaemonInfo {
-        pid: dead_pid,
+        pid: stale_pid,
         ..info.clone()
     };
     state.publish(&stale).expect("publish stale");
@@ -358,20 +419,33 @@ async fn daemon_status_and_stop_report_the_published_truth() {
     // `stop` sends SIGTERM to the published pid and waits for it to disappear. The reaper runs
     // concurrently: until the test reaps its own child, the killed pid lingers as a zombie and
     // liveness checks would keep answering "alive".
-    state.publish(&info).expect("publish the sleeper again");
-    let reaper = tokio::task::spawn_blocking(move || {
+    //
+    // SIGTERM is a unix facility. Windows has no `kill` binary, and `taskkill /F` is
+    // TerminateProcess — no signal the daemon can catch, so no disposer run and a `daemon.json`
+    // left published — which is a gap in `daemon stop` on that platform, not in this test. It runs
+    // where the feature does; the gap is recorded in docs/worklog/daemon.md.
+    #[cfg(unix)]
+    {
+        state.publish(&info).expect("publish the sleeper again");
+        let reaper = tokio::task::spawn_blocking(move || {
+            let _ = sleeper.wait();
+        });
+        assert_eq!(
+            hatchery_cli::daemon_cmd::run(&DaemonAction::Stop { state_dir: sd }).await,
+            0,
+            "the published process was asked to stop and is gone"
+        );
+        reaper.await.expect("reaped");
+        assert!(
+            state.discover_alive().is_none(),
+            "after stop, nothing answers as alive"
+        );
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = sleeper.kill();
         let _ = sleeper.wait();
-    });
-    assert_eq!(
-        hatchery_cli::daemon_cmd::run(&DaemonAction::Stop { state_dir: sd }).await,
-        0,
-        "the published process was asked to stop and is gone"
-    );
-    reaper.await.expect("reaped");
-    assert!(
-        state.discover_alive().is_none(),
-        "after stop, nothing answers as alive"
-    );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]

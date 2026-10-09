@@ -24,13 +24,12 @@ use hatchery_tests::support;
 async fn invariant_stale_runtime_events_are_dropped() {
     let dir = tempfile::tempdir().expect("tempdir");
     let socket = dir.path().join("events.sock");
-    let listener = tokio::net::UnixListener::bind(&socket).expect("bind");
+    let listener = hatchery_protocol::transport::bind(&socket).expect("bind");
 
     let session = hatchery_protocol::SessionId::new().to_string();
     let push_session = session.clone();
     tokio::spawn(async move {
-        let (connection, _) = listener.accept().await.expect("a client");
-        let (read, mut write) = connection.into_split();
+        let (read, mut write) = listener.accept().await.expect("a client");
         let mut lines = BufReader::new(read).lines();
 
         // The subscribing call's reply — the client resolves `subscribe` on it. The id is

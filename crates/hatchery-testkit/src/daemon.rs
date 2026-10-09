@@ -1,7 +1,7 @@
 //! A real daemon on a real (temp) socket, plus the probe that talks to it.
 //!
-//! The point of spawning the full stack in tests: the e2e assertions then cover UDS, framing,
-//! routing and event fan-out — the layers a pure `DaemonCore` test cannot see. This also
+//! The point of spawning the full stack in tests: the e2e assertions then cover the transport,
+//! framing, routing and event fan-out — the layers a pure `DaemonCore` test cannot see. This also
 //! answers testing.md's open question 4 for M1: in-process-but-through-sockets is the default
 //! e2e shape, because it costs one temp dir and covers every byte the wire sees.
 
@@ -80,25 +80,32 @@ impl TestDaemon {
             let socket = socket.clone();
             let shutdown = shutdown.clone();
             tokio::spawn(async move {
-                let server = hatchery_daemon::server::serve_uds(core, manager, hub, socket);
+                let server = hatchery_daemon::server::serve_local(core, manager, hub, socket);
                 tokio::select! {
                     _ = server => {},
                     _ = shutdown.cancelled() => {},
                 }
             });
         }
-        // Wait for the socket to appear, so a test never races the bind.
-        for _ in 0..100 {
-            if socket.exists() {
+        // Wait until the listener answers a connection, so a test never races the bind. Polling
+        // for the file would not travel: on Windows the endpoint is a named pipe and there is no
+        // file to watch, while "does a connect succeed?" is answered the same way on every
+        // platform — and it is the stronger question anyway, since a bound-but-unwilling listener
+        // passes the first and fails this one (ADR-0013). Each probe is a real connection the
+        // daemon accepts, sees hang up, and moves on from.
+        let mut answered = false;
+        for _ in 0..200 {
+            if DaemonClient::connect(&socket).await.is_ok() {
+                answered = true;
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        assert!(socket.exists(), "the daemon socket never appeared");
+        assert!(answered, "the daemon never answered a connection");
 
         let info = DaemonInfo {
             pid: std::process::id(),
-            uds_path: socket.display().to_string(),
+            endpoint: socket.display().to_string(),
             protocol_version: hatchery_protocol::PROTOCOL_VERSION.to_owned(),
             boot_token: boot_token.clone(),
             started_at: hatchery_daemon::discover::unix_now(),
@@ -115,7 +122,7 @@ impl TestDaemon {
         }
     }
 
-    /// Stops the daemon and waits for the socket to disappear.
+    /// Stops the daemon and clears its publication.
     pub async fn stop(self) {
         self.shutdown.cancel();
         tokio::time::sleep(Duration::from_millis(50)).await;

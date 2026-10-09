@@ -16,9 +16,19 @@ authors.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["io-util", "net", "sync", "time"] }
+tokio = { workspace = true, features = ["io-util", "sync", "time"] }
+tokio-util.workspace = true
 tracing.workspace = true
 uuid.workspace = true
+
+# ADR-0013: `transport` is the only module that names a socket type, and it names a different one
+# per platform — tokio's `net::unix` is gated behind `cfg(unix)`, so `net` is useless (and
+# interprocess is dead weight) on the other half of the pair.
+[target.'cfg(unix)'.dependencies]
+tokio = { workspace = true, features = ["net"] }
+
+[target.'cfg(windows)'.dependencies]
+interprocess = { workspace = true }
 
 [dev-dependencies]
 tempfile.workspace = true

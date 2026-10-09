@@ -1,47 +1,51 @@
-//! The transport: newline-delimited JSON-RPC over UDS (and stdio), one task per connection.
+//! The transport: newline-delimited JSON-RPC over the daemon's local socket (and stdio), one
+//! task per connection.
 //!
 //! The connection loop is deliberately thin: read a frame, hand it to [`DaemonCore::dispatch`],
 //! write the reply. Everything with policy in it lives behind the core, which is why the tests
 //! can drive the whole protocol without a socket.
+//!
+//! Which socket that is — a UDS or a Windows named pipe — is `hatchery_protocol::transport`'s
+//! business (ADR-0013); nothing here names a platform socket type.
 
 use std::sync::Arc;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufWriter};
-use tokio::net::UnixListener;
 use tokio_util::sync::CancellationToken;
 
 use hatchery_protocol::SessionEvent;
+use hatchery_protocol::transport;
 use hatchery_protocol::{FrameDecoder, Incoming, Response, method as m};
 
 use crate::core::DaemonCore;
 use crate::hub::LiveHub;
 use crate::manager::SessionManager;
 
-/// Serves one UDS path forever. Returns when the listener dies.
+/// Serves one endpoint forever. Returns when the listener dies.
 ///
 /// # Errors
 ///
 /// Propagates the bind failure — an unbound listener is the startup audit's business, surfaced
 /// before this is called; a listener that dies mid-flight is logged by the caller.
-pub async fn serve_uds(
+pub async fn serve_local(
     core: Arc<DaemonCore>,
     manager: Arc<SessionManager>,
     hub: Arc<LiveHub>,
-    path: std::path::PathBuf,
+    endpoint: std::path::PathBuf,
 ) -> std::io::Result<()> {
-    let _ = std::fs::remove_file(&path);
-    let listener = UnixListener::bind(&path)?;
-    crate::discover::restrict_to_owner(&path);
-    tracing::info!(socket = %path.display(), "the daemon is listening");
+    let listener = transport::bind(&endpoint)?;
+    // On unix this is the socket's 0700; on Windows the endpoint got its owner-only DACL at
+    // creation, inside `transport::bind`, and `restrict_to_owner` has no file to chmod.
+    crate::discover::restrict_to_owner(&endpoint);
+    tracing::info!(socket = %endpoint.display(), "the daemon is listening");
 
     loop {
         match listener.accept().await {
-            Ok((stream, _addr)) => {
+            Ok((read, write)) => {
                 let core = Arc::clone(&core);
                 let manager = Arc::clone(&manager);
                 let hub = Arc::clone(&hub);
                 tokio::spawn(async move {
-                    let (read, write) = stream.into_split();
                     serve_connection(core, manager, hub, read, write).await;
                 });
             }

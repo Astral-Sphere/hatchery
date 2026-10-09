@@ -136,7 +136,7 @@ pub async fn run_until(options: RunOptions, external: CancellationToken) -> Resu
     let socket_path = state.socket_path();
     state.publish(&DaemonInfo {
         pid: std::process::id(),
-        uds_path: socket_path.display().to_string(),
+        endpoint: socket_path.display().to_string(),
         protocol_version: PROTOCOL_VERSION.to_owned(),
         boot_token,
         started_at: unix_now(),
@@ -154,9 +154,9 @@ pub async fn run_until(options: RunOptions, external: CancellationToken) -> Resu
     }
     {
         let socket_path = socket_path.clone();
-        disposers.push("uds socket", move || {
-            if let Err(error) = std::fs::remove_file(&socket_path) {
-                tracing::warn!("the socket file could not be removed: {error}");
+        disposers.push("the daemon's socket", move || {
+            if let Err(error) = hatchery_protocol::transport::discard(&socket_path) {
+                tracing::warn!("the socket could not be removed: {error}");
             }
         });
     }
@@ -192,14 +192,14 @@ pub async fn run_until(options: RunOptions, external: CancellationToken) -> Resu
     let listener_outcome = tokio::select! {
         _ = external.cancelled() => Ok(()),
         _ = shutdown.cancelled() => Ok(()),
-        result = crate::server::serve_uds(Arc::clone(&core), Arc::clone(&manager), Arc::clone(&hub), socket_path.clone()) => {
-            // `serve_uds` only returns when the listener dies; that is a teardown-worthy event
+        result = crate::server::serve_local(Arc::clone(&core), Arc::clone(&manager), Arc::clone(&hub), socket_path.clone()) => {
+            // `serve_local` only returns when the listener dies; that is a teardown-worthy event
             // either way — and `daemon.json` is already published at this point, so a bind
             // failure must fall through to the teardown below, not return past it and leave a
             // publication pointing at a socket that never served.
             match result {
                 Ok(()) => {
-                    tracing::warn!("the UDS listener ended without an error");
+                    tracing::warn!("the listener ended without an error");
                     Ok(())
                 }
                 Err(error) => Err(error),

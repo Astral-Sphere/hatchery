@@ -215,7 +215,7 @@ async fn spawn(dir: &Path, wire_url: &str) -> Spawned {
     );
     Spawned {
         _guard: guard,
-        socket: PathBuf::from(&info.uds_path),
+        socket: PathBuf::from(&info.endpoint),
         boot_token: info.boot_token,
     }
 }

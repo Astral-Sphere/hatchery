@@ -19,7 +19,7 @@ hatchery-store.workspace = true
 hatchery-testkit.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
-tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio = { workspace = true, features = ["io-util", "macros", "rt-multi-thread", "sync", "time"] }
 toml.workspace = true
 
 [[bin]]

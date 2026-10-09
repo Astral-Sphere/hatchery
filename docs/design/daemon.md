@@ -6,7 +6,7 @@
 
 daemon 是系统唯一的 runtime 所有者与数据写者：
 
-- 监听 UDS + stdio，说 `hatchery-protocol`。
+- 监听本地套接字（unix = UDS，Windows = 命名管道，ADR-0013）+ stdio，说 `hatchery-protocol`。
 - 会话管理：创建/加载 runtime、租约、代际号。
 - Live hub：事件扇出到多前端，迟加入 replay。
 - 装配：按模式组装工具注册表、按会话来源绑定能力后端（ADR-0004 的表）。
@@ -17,12 +17,12 @@ daemon 是系统唯一的 runtime 所有者与数据写者：
 ```
 ~/.local/state/hatchery/daemon/
 ├── daemon.lock        # advisory 文件锁（fs2），持锁者即活跃 daemon
-├── daemon.json        # { pid, uds_path, protocol_version, started_at }
-└── hatchery.sock      # UDS
+├── daemon.json        # { pid, endpoint, protocol_version, started_at }
+└── hatchery.sock      # 套接字 locator：unix 是 UDS 本体，Windows 只是管道名的来源、不落文件
 ```
 
 - **attach-or-spawn**：客户端先读 daemon.json + 尝试连接；失败则抢锁 spawn（fork/daemonize 或 systemd socket activation，二选一 M1 定）再 attach。竞态由锁保证。
-- UDS 权限 0700（用户级隔离）；`daemon.json` 里带随机 boot token，客户端连接时出示（防同机其他用户进程伪装前端——UDS 权限已挡，token 是纵深防御）。
+- 套接字权限 = 用户级隔离：unix 是 UDS 的 0700，Windows 是管道创建时的 DACL `D:P(A;;GA;;;OW)`（只有 owner 能连）。`daemon.json` 里带随机 boot token，客户端连接时出示（防同机其他用户进程伪装前端——套接字权限已挡，token 是纵深防御）。两侧的选择与实测见 ADR-0013：Windows 上「别人连不上」这半只证明了 owner 连得上，未用第二个账号实测。
 - CLI `--embedded`：同进程内起 DaemonCore，走内存 transport（协议不变）。
 
 ## 3. 内部结构
@@ -66,7 +66,7 @@ daemon 启动按命名 **profile** 装配组件捆绑，装配表是显式数据
 
 | profile | 监听器 | 能力后端 | 工具集 | 场景 |
 |---|---|---|---|---|
-| `local` | UDS | Local 三件套 | 按模式 | 常驻 daemon（CLI/GTK attach） |
+| `local` | 本地套接字 | Local 三件套 | 按模式 | 常驻 daemon（CLI/GTK attach） |
 | `headless` | stdio | Local 三件套 | 按模式 | `hatchery exec` embedded |
 | `acp-stdio` | stdio(ACP) | 按宿主能力协商（ADR-0004 矩阵） | Code 全量 | `hatchery acp` attach 常驻 daemon |
 | `acp-standalone` | stdio(ACP) | 同上 | 同上 | 宿主 spawn 的自包含进程 |
@@ -109,7 +109,7 @@ daemon 启动按命名 **profile** 装配组件捆绑，装配表是显式数据
 1. ~~daemonize 方式：双 fork vs `sd_notify` socket activation vs 前台进程 + CLI spawn 等待握手~~ → **已定（2026-10-01，D1）**：**CLI spawn 分离进程**（unix `setsid` / Windows `DETACHED_PROCESS`，`process_group(0)` 脱离前台进程组），握手靠 CLI 轮询 `daemon.json` 与 socket 出现；**不做双 fork、不依赖 `sd_notify`**——双 fork 的复杂度与 sd_notify 的依赖都不值得，而握手代码本来就在 CLI 里。systemd 用户直接跑前台的 `hatchery daemon run`。实现在 `entry.rs` 与 CLI 的 `attach_or_spawn`；证据与取舍见 worklog/daemon.md。
 2. ~~daemon 空闲退出策略与「进行中 turn 但无订阅者」的取舍（跑完 vs 暂停）~~ → **已定（2026-10-01，D2）**：**跑完为止**，结果无论如何落库。杀掉一个没人看着的 turn 等于烧掉已经付费的推理。空闲卸载因此有双守卫（busy 不扫、被看的不扫，且卸载前在槽位锁内复核）；`invariant_an_unwatched_turn_runs_to_completion_and_persists` 钉住这条（Phase 0 补前缀，见 design/testing.md §5）。
 3. 多工作区并发会话共享 CheckpointStore 的锁粒度（per-workspace mutex 已定，跨 workspace 的全局磁盘预算核算频率）——**M2（Phase 1），决策点 D9**。锁粒度那半已经有答案：**daemon 内 per-workspace 互斥**（ADR-0006），不是跨进程文件锁——`SessionLease` 一条 2026-10-07 已顺延到「多 daemon 形态出现时」（`--embedded` 无实现、单实例 `daemon.lock` 已挡双 daemon，理由见 worklog/daemon.md）。留给 D9 的是预算本身：超预算时 **GC 最旧** vs **拒绝写入**，以及核算频率（每次快照后同步核 vs 后台定期核）；`checkpoints` 表就是这项核算的数据来源（§5）。spike 数据已备，D9 在 Phase 1 内定稿并写回本条。
-4. ~~boot token 的轮换时机（daemon 重启即换 vs 定期）~~ → **已定（2026-10-01，D4）**：**每次 daemon 启动换新 token**，写进 0600 的 `daemon.json`（write-then-rename），客户端 attach 时现读；不做定期轮换——token 是 UDS 权限之外的纵深防御，而 UDS 权限已经挡住同机其他用户，定期轮换只增加「轮换窗口内前端连不上」这一种失败形态。死 pid 判定 best-effort 且无 unsafe（Linux 走 `/proc`，其余平台保守视为活、由 hello 握手兜底）。
+4. ~~boot token 的轮换时机（daemon 重启即换 vs 定期）~~ → **已定（2026-10-01，D4）**：**每次 daemon 启动换新 token**，写进 0600 的 `daemon.json`（write-then-rename），客户端 attach 时现读；不做定期轮换——token 是 UDS 权限之外的纵深防御，而 UDS 权限已经挡住同机其他用户，定期轮换只增加「轮换窗口内前端连不上」这一种失败形态。死 pid 判定 best-effort 且无 unsafe（Linux 走 `/proc`，其余平台保守视为活、由 hello 握手兜底）。（2026-10-09 补：Windows 没有 UDS 权限这一层，对等物是管道创建时的 owner-only DACL，见 ADR-0013——那句「UDS 权限已经挡住」在 Windows 上靠的是 DACL，不是同一件事的默认行为。）
 5. ~~配置变更要不要重组装活着的 runtime？~~ → **已定（2026-10-07，D19）** 今天不重组装：全仓库唯一的卸载路径是空闲清扫（`sweep_after` → `unload`），`session/set_config`（CLI 的 `/model` `/effort` 走的就是它）只改库里的行并发 `SessionUpdated`，`config/set` 只改 `LayeredConfig` 本身。而 provider adapter、`ChatOptions` 与 prompt 都是在 `assemble` 里绑死的，所以 `/model` 的变更**下次装配才生效**——用户敲完 `/model x`，下一轮请求仍然发给旧模型，且没有任何提示。prompt 冻结（D15）与之一致，不是它引入的问题。
 
 **`/effort` 比这更糟：它永远不生效（2026-10-07 live 实测）。** `session/set_config` 把 effort 写进 `session.config_patch`（manager.rs:391），而 `config_patch` 在 daemon 侧**没有任何读者**——读它的只有 CLI，用来画状态栏（chat.rs:91、tui/mod.rs:506）。provider 配置里的 `reasoning.reasoning_effort`（builtin 给 deepseek 与 qwen 都是 High）同样不进 turn：`runtime.rs:415` 用 `ChatOptions::new(model)`，`reasoning_effort` 恒为 `None`（message.rs:287），而 `translate.rs:75` 的 `apply_effort` 遇 `None` 直接 return。全仓库唯一喂 effort 的生产代码是 `doctor.rs:272`（探测的两轮）。实测：TUI 里 `/effort off` 之后状态栏确实变成 `effort off`，下一轮推理照旧流式出现。后果是 llm 侧 `ReasoningWire` 的三种拼法（`Effort` / `QwenThinking` / `ThinkingSwitch`，都已实现且有单测）在正常 turn 上从未被触发过——这是与 system prompt 同一类的第四处「机制建好了没接线」，Phase 0 的勘察没扫到它，因为勘察沿着 prompt 走而不是沿着 effort 走。三个约束决定了解法不能是「`set_config` 里调 `unload`」：① `unload` 对被 watch 的会话直接拒绝，而改配置的恰恰是附着中的前端；② 重组装会 bump generation，前端因此收到 `GenerationBumped` 并要重建视图——为一个 model 字段付这个代价太大；③ 正在跑的 turn 绝不能被抽掉 runtime（D2）。倾向的方向是**把 per-turn 可变的部分从装配里拿出来**（provider 解析与 `ChatOptions` 在 turn 开始时读一次），而 prompt 仍按 D15 冻结、只在重组装时换。**D19 的分界（已实现）**：

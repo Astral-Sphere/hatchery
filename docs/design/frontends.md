@@ -7,7 +7,7 @@
 ```rust
 pub struct DaemonClient { /* 连接管理 */ }
 impl DaemonClient {
-    pub async fn attach_or_spawn() -> Result<Self>;   // UDS 发现 + spawn + boot token
+    pub async fn attach_or_spawn() -> Result<Self>;   // 本地套接字发现 + spawn + boot token
     pub async fn call<M: Method>(&self, params: M::Params) -> Result<M::Response>;
     pub fn events(&self) -> broadcast::Receiver<ServerEvent>; // 已做 generation 过滤与重连 replay
 }

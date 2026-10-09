@@ -30,7 +30,7 @@
 ┌────────────┐   ┌────────────┐   ┌────────────┐   ┌──────────────────┐
 │ CLI (TUI)  │   │ GTK 桌面端 │   │ headless   │   │ ACP 宿主 (Zed…)  │
 └─────┬──────┘   └─────┬──────┘   └─────┬──────┘   └───────┬──────────┘
-      │ JSON-RPC (UDS) │ JSON-RPC (UDS) │ JSON-RPC(stdio)  │ stdio (ACP)
+      │ JSON-RPC (IPC) │ JSON-RPC (IPC) │ JSON-RPC(stdio)  │ stdio (ACP)
       └────────────────┴───────┬────────┴──────────────────┘
                         ┌──────▼────────────────────────────┐
                         │        hatchery daemon            │
@@ -49,7 +49,7 @@
 
 - **单 daemon 单写者**：每个用户一个 daemon 实例（attach-or-spawn），全系统只有 daemon 一个进程写数据库，规避跨进程写竞争（ADR-0002；引擎选型见 ADR-0010）。
 - **前端是瘦客户端**：CLI TUI、GTK、headless exec 都通过 `hatchery-protocol` 定义的 JSON-RPC 协议与 daemon 通信，不内嵌 agent runtime（ADR-0001）。会话生命周期独立于任何前端：关掉终端，任务继续跑。
-- **CLI 的启动路径**：`hatchery` 命令先探测 UDS；daemon 不在则 spawn 一个（daemonize），再 attach。也支持 `--embedded` 在同进程内起 daemon（测试与单机简化场景）。
+- **CLI 的启动路径**：`hatchery` 命令先探测 daemon 的本地套接字（unix = UDS，Windows = 命名管道，ADR-0013）；daemon 不在则 spawn 一个（daemonize），再 attach。也支持 `--embedded` 在同进程内起 daemon（测试与单机简化场景）。
 - **ACP server** 是 daemon 内的一个适配层：每个 ACP 连接映射到一个 runtime 会话；stdio 传输。`hatchery acp` 子命令可独立以 stdio 方式起一个单连接进程（宿主直接 spawn 的场景）。
 
 ## 3. Crate 分层
@@ -67,7 +67,7 @@ L2  hatchery-llm           openai-interface 之上的 provider adapter（实现 
                            ApprovalGate、影子 Git 检查点、工具注册表框架（实现 kernel 的 ToolHost）
 L3  hatchery-tools         内置工具（read/write/edit/glob/grep/shell/web_fetch/MCP client）
     hatchery-acp           ACP server + client（实现 capabilities 的 trait，绑定宿主后端）
-L4  hatchery-daemon        runtime 宿主：会话管理、监听 UDS/stdio、事件扇出（live hub）
+L4  hatchery-daemon        runtime 宿主：会话管理、监听本地套接字/stdio、事件扇出（live hub）
                            配置加载与 prompt 装配也在这里（前端一律经协议访问，无第二个消费者）
 D   hatchery-cli           ratatui TUI + headless exec
     hatchery-gui           gtk4-rs + libadwaita 桌面端
@@ -154,7 +154,7 @@ dev hatchery-testkit       测试基建：fake 后端 / ScriptedProvider / TestD
 ~/.config/hatchery/prompts/           # 用户 prompt 覆盖
 ~/.local/share/hatchery/hatchery.db   # turso 主数据库（ADR-0010）
 ~/.local/share/hatchery/checkpoints/<workspace-hash>/  # 影子 Git 仓库
-~/.local/state/hatchery/daemon/       # UDS socket、daemon 锁与端口文件
+~/.local/state/hatchery/daemon/       # 套接字 locator、daemon 锁与 daemon.json（ADR-0013）
 <project>/.hatchery/config.toml       # 项目级配置
 <project>/AGENTS.md                   # 项目级 prompt 注入
 ```

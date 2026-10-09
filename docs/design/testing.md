@@ -58,7 +58,7 @@ pub struct MemoryApprovalGate; // fake ApprovalGate：脚本化 allow/deny/超�
 
 // 环境
 pub struct TempWorkspace;   // 真 tempdir + 真 LocalFs。**Phase 1 已补齐 M2 目标**：`new()` / `git()`（脏用户仓库：一次提交 + 已 stage + 未 stage + 未跟踪）/ `file(rel, bytes)` 与 `dir(rel)` 链式树 DSL / `stage(rel)` / `commit(msg)` / `repo()` / `repo_state()` / `path(rel)` / `write(rel, bytes)` / `fs()` / `root()`。`UserRepoState` 与 `user_repo_state(path)` 也住在这里——不变量 6 的测试与 spike 必须度量同一组字段，两边各写一套就会各自腐烂
-pub struct TestDaemon;      // 进程内 DaemonCore，走真 temp UDS + 真 TursoStore + 真 LayeredConfig，发布真 daemon.json；暴露 ClientProbe
+pub struct TestDaemon;      // 进程内 DaemonCore，走真 temp 本地套接字 + 真 TursoStore + 真 LayeredConfig，发布真 daemon.json；暴露 ClientProbe
 pub struct ClientProbe;     // 协议客户端：hello（带 boot token）+ 类型化 call + 事件订阅与序列断言（e2e 主驱动）
 
 // store 的独立参考实现（不是 fake）

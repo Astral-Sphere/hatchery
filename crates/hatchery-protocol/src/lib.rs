@@ -82,6 +82,7 @@ mod rpc;
 mod session;
 mod time;
 mod tool;
+pub mod transport;
 mod usage;
 mod version;
 
