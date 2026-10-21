@@ -42,10 +42,18 @@ use hatchery_store::SessionStore;
 use crate::config::ApprovalConfig;
 use crate::hub::LiveHub;
 
+/// One waiting request: who is parked on it, and how to answer.
+#[derive(Debug)]
+struct Pending {
+    session: SessionId,
+    request: ApprovalRequest,
+    sender: oneshot::Sender<ApprovalOption>,
+}
+
 /// Approval requests waiting for an answer, keyed by the kernel's request id.
 #[derive(Debug, Default)]
 pub struct PendingApprovals {
-    inner: Mutex<HashMap<ApprovalId, oneshot::Sender<ApprovalOption>>>,
+    inner: Mutex<HashMap<ApprovalId, Pending>>,
 }
 
 impl PendingApprovals {
@@ -59,9 +67,21 @@ impl PendingApprovals {
     ///
     /// A duplicate id would mean the kernel reused one; the old waiter is dropped, which resolves
     /// its receiver to `Err` and therefore to deny. That is the safe direction for a bug.
-    fn register(&self, id: ApprovalId) -> oneshot::Receiver<ApprovalOption> {
+    fn register(
+        &self,
+        id: ApprovalId,
+        session: SessionId,
+        request: ApprovalRequest,
+    ) -> oneshot::Receiver<ApprovalOption> {
         let (tx, rx) = oneshot::channel();
-        self.slots().insert(id, tx);
+        self.slots().insert(
+            id,
+            Pending {
+                session,
+                request,
+                sender: tx,
+            },
+        );
         rx
     }
 
@@ -70,7 +90,7 @@ impl PendingApprovals {
     pub fn respond(&self, id: ApprovalId, option: ApprovalOption) -> bool {
         let sender = self.slots().remove(&id);
         match sender {
-            Some(sender) => sender.send(option).is_ok(),
+            Some(pending) => pending.sender.send(option).is_ok(),
             None => false,
         }
     }
@@ -78,6 +98,35 @@ impl PendingApprovals {
     /// Drops a waiter without answering it (timeout, shutdown).
     fn cancel(&self, id: ApprovalId) {
         self.slots().remove(&id);
+    }
+
+    /// The requests one session is parked on, oldest request id first.
+    ///
+    /// `session/load` hands these to a reconnecting frontend so a prompt that arrived while it
+    /// was away is rendered rather than timing out unseen. Sorted by id because a `HashMap` has
+    /// no order and two identical requests must not answer differently on two loads.
+    #[must_use]
+    pub fn for_session(
+        &self,
+        session: SessionId,
+    ) -> Vec<hatchery_protocol::method::PendingApproval> {
+        let slots = self.slots();
+        let mut waiting: Vec<_> = slots
+            .iter()
+            .filter(|(_, pending)| pending.session == session)
+            .map(|(id, pending)| (id.to_string(), *id, pending))
+            .collect();
+        waiting.sort_by(|left, right| left.0.cmp(&right.0));
+        waiting
+            .into_iter()
+            .map(
+                |(_, request_id, pending)| hatchery_protocol::method::PendingApproval {
+                    request_id,
+                    session_id: pending.session,
+                    request: pending.request.clone(),
+                },
+            )
+            .collect()
     }
 
     /// How many requests are waiting, for tests and diagnostics.
@@ -92,9 +141,7 @@ impl PendingApprovals {
         self.slots().is_empty()
     }
 
-    fn slots(
-        &self,
-    ) -> std::sync::MutexGuard<'_, HashMap<ApprovalId, oneshot::Sender<ApprovalOption>>> {
+    fn slots(&self) -> std::sync::MutexGuard<'_, HashMap<ApprovalId, Pending>> {
         self.inner.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
@@ -135,7 +182,9 @@ impl ApprovalGate for DaemonApproval {
         // wire must find the waiter. The reverse order is a real race — a scripted client answers
         // in microseconds — and its symptom would be a prompt that waits for the full timeout
         // after the user already clicked.
-        let receiver = self.pending.register(request_id);
+        let receiver = self
+            .pending
+            .register(request_id, self.session, request.clone());
         self.hub.publish(SessionEvent::new(
             self.session,
             self.generation,
@@ -547,6 +596,34 @@ mod tests {
             request("write_file", ApprovalOption::ALL.to_vec()),
         );
         assert!(matches!(ask(&tools).await, ApprovalNeed::Ask(_)));
+    }
+
+    #[tokio::test]
+    async fn pending_requests_are_listed_per_session_and_disappear_once_answered() {
+        let pending = PendingApprovals::new();
+        let one = SessionId::new();
+        let two = SessionId::new();
+        let first = ApprovalId::new();
+        let second = ApprovalId::new();
+        let _first = pending.register(
+            first,
+            one,
+            request("write_file", ApprovalOption::ALL.to_vec()),
+        );
+        let _second = pending.register(second, two, request("edit", ApprovalOption::ALL.to_vec()));
+
+        let listed = pending.for_session(one);
+        assert_eq!(listed.len(), 1, "another session's prompt is not ours");
+        assert_eq!(listed[0].request_id, first);
+        assert_eq!(listed[0].session_id, one);
+        assert_eq!(listed[0].request.tool, "write_file");
+
+        assert!(pending.respond(first, ApprovalOption::AllowOnce));
+        assert!(
+            pending.for_session(one).is_empty(),
+            "an answered request must not come back on reconnect"
+        );
+        assert_eq!(pending.for_session(two).len(), 1);
     }
 
     #[tokio::test]

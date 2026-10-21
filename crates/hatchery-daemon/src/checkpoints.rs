@@ -34,8 +34,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use hatchery_capabilities::{
     CheckpointError, CheckpointOptions, CheckpointPool, CheckpointStore, Checkpointer, PreWrite,
+    RestoreOptions, RestoreReport,
 };
-use hatchery_protocol::CheckpointKind;
+use hatchery_protocol::{CheckpointId, CheckpointKind, SessionId, Timestamp};
 use hatchery_store::SessionStore;
 
 use crate::config::CheckpointsConfig;
@@ -136,6 +137,54 @@ impl Checkpoints {
             shadow,
             store: Arc::clone(&self.store),
         }))
+    }
+
+    /// Rolls a workspace back to one checkpoint, recording the undo-of-undo first.
+    ///
+    /// The shadow store takes the safety snapshot itself, *before* it destroys anything, and
+    /// returns it in the report; the row written here is what makes that snapshot findable after
+    /// the process dies. It carries no item on purpose: it is not conversation history, and no
+    /// frontend should render it ([`hatchery_store::CheckpointRecord::item`] is optional for
+    /// exactly this record).
+    ///
+    /// # Errors
+    ///
+    /// Whatever the shadow store reports — an unknown commit, a git failure, or an I/O failure.
+    /// A failed record write does **not** fail the restore: the restore already happened, and
+    /// the row only serves budget accounting and the sweep.
+    pub async fn restore(
+        &self,
+        session: SessionId,
+        workspace: &Path,
+        commit_id: &str,
+        options: RestoreOptions,
+    ) -> Result<RestoreReport, CheckpointError> {
+        let shadow = self.store_for(workspace).await?;
+        let report = shadow.restore(commit_id, options).await?;
+        if !report.safety.oversized.is_empty() {
+            tracing::warn!(
+                workspace = %workspace.display(),
+                paths = ?report.safety.oversized,
+                "the rewind safety snapshot left files out: larger than the size limit"
+            );
+        }
+        let record = hatchery_store::CheckpointRecord {
+            id: CheckpointId::new(),
+            session,
+            item: None,
+            workspace: recorded_workspace(workspace),
+            commit_id: report.safety.checkpoint.commit_id.clone(),
+            kind: report.safety.checkpoint.kind,
+            created_at: Timestamp::now(),
+        };
+        if let Err(error) = self.store.record_checkpoint(record).await {
+            tracing::error!(
+                %session,
+                workspace = %workspace.display(),
+                "failed to record the rewind safety snapshot: {error}"
+            );
+        }
+        Ok(report)
     }
 
     /// Deletes every shadow repository whose workspace has no records left.

@@ -18,12 +18,17 @@ use std::sync::{Arc, Mutex};
 use hatchery_kernel::{AgentCommand, ChatOptions};
 use hatchery_llm::{ProviderConfig, ProviderRegistry};
 use hatchery_protocol::method::{
-    SessionListParams, SessionListResult, SessionLoadParams, SessionLoadResult, SessionNewParams,
-    SessionNewResult, SessionPromptParams, SessionPromptResult, SetConfigParams, SetConfigResult,
+    BranchDeleteParams, BranchDeleteResult, BranchListParams, BranchListResult, BranchNode,
+    BranchSwitchParams, BranchSwitchResult, EditItemParams, EditItemResult, ExportJsonlParams,
+    ExportJsonlResult, RewindParams, RewindReport, RewindResult, SessionDeleteParams,
+    SessionDeleteResult, SessionListParams, SessionListResult, SessionLoadParams,
+    SessionLoadResult, SessionNewParams, SessionNewResult, SessionPromptParams,
+    SessionPromptResult, SessionRenameParams, SessionRenameResult, SetConfigParams,
+    SetConfigResult, SetModeParams, SetModeResult,
 };
 use hatchery_protocol::{
-    ErrorCode, EventError, Item, ItemId, ReasoningEffort, ServerEvent, Session, SessionEvent,
-    SessionId, SessionPatch, SessionStatus, TurnId,
+    ErrorCode, EventError, Item, ItemId, ItemKind, ReasoningEffort, RewindScope, ServerEvent,
+    Session, SessionEvent, SessionId, SessionModeId, SessionPatch, SessionStatus, TurnId,
 };
 use hatchery_store::SessionStore;
 
@@ -254,6 +259,7 @@ impl SessionManager {
             session,
             items,
             next_cursor: None,
+            pending_approvals: self.pending.for_session(params.session_id),
         })
     }
 
@@ -390,6 +396,457 @@ impl SessionManager {
     /// Propagates the store's failure.
     pub async fn list(&self, params: SessionListParams) -> Result<SessionListResult, ManagerError> {
         self.store.list_sessions(params).await.map_err(store_error)
+    }
+
+    /// `session/set_mode`: change the mode and rebuild the runtime around it.
+    ///
+    /// The three things a mode stands for — the tool catalogue, the approval policy and the
+    /// prompt variant — all live in the runtime (ADR-0005), so writing the row without swapping
+    /// the runtime would leave the model calling the old catalogue under the new label. The
+    /// switch therefore takes the turn gate, refuses while a turn is in flight, and reassembles
+    /// once the row is written. Frontends stay subscribed: the hub outlives the runtime, and
+    /// `GenerationBumped` is how they learn to reset their view.
+    ///
+    /// # Errors
+    ///
+    /// [`ErrorCode::TurnInProgress`] while a turn is running — ADR-0005's "in-flight tool calls
+    /// finish or are cancelled first" cannot be honoured by swapping tools mid-call;
+    /// [`ErrorCode::InvalidRequest`] for Code without a workspace.
+    pub async fn set_mode(&self, params: SetModeParams) -> Result<SetModeResult, ManagerError> {
+        let session = self
+            .store
+            .session(params.session_id)
+            .await
+            .map_err(store_error)?;
+        if session.mode == params.mode {
+            return Ok(SetModeResult {
+                session: self.session_for_wire(session),
+            });
+        }
+        if params.mode.as_str() == SessionModeId::CODE && session.workspace.is_none() {
+            return Err(ManagerError::new(
+                ErrorCode::InvalidRequest,
+                "code mode requires a workspace: there is nowhere to write",
+            ));
+        }
+        let _lease = self.gate_for(session.id).await;
+        // Re-read under the gate: a prompt may have accepted a turn while this call waited, and
+        // the check above is only as fresh as the read that produced it.
+        let session = self
+            .store
+            .session(params.session_id)
+            .await
+            .map_err(store_error)?;
+        self.ensure_idle(session.id)?;
+        let updated = self
+            .store
+            .update_session(
+                session.id,
+                SessionPatch {
+                    mode: Some(params.mode.clone()),
+                    ..SessionPatch::default()
+                },
+            )
+            .await
+            .map_err(store_error)?;
+        if let Some(runtime) = self.take_runtime(session.id) {
+            let live = !runtime.handle.is_closed();
+            runtime.shutdown();
+            if live {
+                self.assemble(&updated).await?;
+            }
+        }
+        let current = self.session_for_wire(updated);
+        self.hub.publish(SessionEvent::new(
+            current.id,
+            current.generation,
+            ServerEvent::ModeSwitched {
+                from: session.mode,
+                to: params.mode,
+            },
+        ));
+        self.publish_session_updated(&current);
+        Ok(SetModeResult { session: current })
+    }
+
+    /// `session/edit_item`: replace a message, forking the branch.
+    ///
+    /// The fork is the store's: the replacement takes the original's parent, so the old branch
+    /// stays reachable and a mistaken edit is undone by switching back (ADR-0003). When a rewind
+    /// scope is given, the code leg runs **before** the fork — the same ordering rule as
+    /// `session/rewind`, for the same reason: a failed restore must not leave the history moved.
+    ///
+    /// # Errors
+    ///
+    /// [`ErrorCode::TurnInProgress`] while a turn is running; the store's own errors for an item
+    /// that is not editable or belongs to another session.
+    pub async fn edit_item(&self, params: EditItemParams) -> Result<EditItemResult, ManagerError> {
+        let session_id = self
+            .store
+            .session_of_item(params.item_id)
+            .await
+            .map_err(store_error)?;
+        let _lease = self.gate_for(session_id).await;
+        self.ensure_idle(session_id)?;
+        let session = self.store.session(session_id).await.map_err(store_error)?;
+        if matches!(
+            params.rewind_scope,
+            Some(RewindScope::Code | RewindScope::Both)
+        ) {
+            self.rewind_code(&session, params.item_id, false).await?;
+        }
+        let forked = self
+            .store
+            .edit_fork(session_id, params.item_id, params.new_content)
+            .await
+            .map_err(store_error)?;
+        let session = self.store.session(session_id).await.map_err(store_error)?;
+        let session = self.session_for_wire(session);
+        self.publish_session_updated(&session);
+        Ok(EditItemResult {
+            branch_head: forked.id,
+            session,
+        })
+    }
+
+    /// `session/branch/list`: the whole item tree, with the active chain marked.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the store's failure.
+    pub async fn branch_list(
+        &self,
+        params: BranchListParams,
+    ) -> Result<BranchListResult, ManagerError> {
+        let tree = self
+            .store
+            .branch_tree(params.session_id)
+            .await
+            .map_err(store_error)?;
+        let nodes = tree
+            .nodes
+            .into_iter()
+            .map(|node| BranchNode {
+                id: node.row.id,
+                parent: node.row.parent,
+                turn: node.row.turn,
+                kind: node.row.kind,
+                created_at: node.created_at,
+                active: node.active,
+            })
+            .collect();
+        Ok(BranchListResult { nodes })
+    }
+
+    /// `session/branch/switch`: point the active branch at an existing item.
+    ///
+    /// # Errors
+    ///
+    /// [`ErrorCode::TurnInProgress`] while a turn is running; the store refuses an item from
+    /// another session.
+    pub async fn branch_switch(
+        &self,
+        params: BranchSwitchParams,
+    ) -> Result<BranchSwitchResult, ManagerError> {
+        let _lease = self.gate_for(params.session_id).await;
+        self.ensure_idle(params.session_id)?;
+        let session = self
+            .store
+            .switch_branch(params.session_id, params.head)
+            .await
+            .map_err(store_error)?;
+        let session = self.session_for_wire(session);
+        self.publish_session_updated(&session);
+        Ok(BranchSwitchResult { session })
+    }
+
+    /// `session/branch/delete`: remove a subtree.
+    ///
+    /// The store refuses a subtree that contains the active head, so an accidental delete cannot
+    /// leave the session pointing at nothing. `confirm` is the protocol's second confirmation:
+    /// this is the one session operation that cannot be undone, and a mistyped request should not
+    /// be enough.
+    ///
+    /// # Errors
+    ///
+    /// [`ErrorCode::InvalidRequest`] without `confirm`; [`ErrorCode::TurnInProgress`] while a turn
+    /// is running.
+    pub async fn branch_delete(
+        &self,
+        params: BranchDeleteParams,
+    ) -> Result<BranchDeleteResult, ManagerError> {
+        if !params.confirm {
+            return Err(ManagerError::new(
+                ErrorCode::InvalidRequest,
+                "deleting a branch is not recoverable; repeat the call with `confirm: true`",
+            ));
+        }
+        let _lease = self.gate_for(params.session_id).await;
+        self.ensure_idle(params.session_id)?;
+        let deleted_items = self
+            .store
+            .delete_branch(params.session_id, params.head)
+            .await
+            .map_err(store_error)?;
+        Ok(BranchDeleteResult { deleted_items })
+    }
+
+    /// `session/rewind`: move history, code, or both back to an item.
+    ///
+    /// The ordering is the load-bearing part: for [`RewindScope::Both`] the code is restored
+    /// **first**, and the head moves only after that succeeded. The other order would leave a
+    /// history that claims a state the working tree is not in, and the next turn would build on
+    /// a lie (storage.md §5).
+    ///
+    /// The code leg locates its checkpoint by walking the item chain, not the `checkpoints`
+    /// table: the first `Checkpoint` item *after* the target carries the state before the first
+    /// write that happened after it — which is exactly the state the target describes. No such
+    /// item means nothing was written after the target, which makes the code leg a no-op, not an
+    /// error.
+    ///
+    /// # Errors
+    ///
+    /// [`ErrorCode::InvalidRequest`] when the target is not on the active branch, or when a code
+    /// scope was asked for on a session without a workspace; [`ErrorCode::TurnInProgress`] while
+    /// a turn is running; a restore failure, which leaves the history untouched.
+    pub async fn rewind(&self, params: RewindParams) -> Result<RewindResult, ManagerError> {
+        if params.purge_untracked {
+            // capabilities.md §2 requires an approval plus the manifest `untracked()` lists
+            // before a purge may delete anything, and the protocol has no way to fetch that
+            // manifest yet. Deleting without the documented consent would be the one failure
+            // mode rewind must never have, so the honest answer is a refusal.
+            return Err(ManagerError::new(
+                ErrorCode::InvalidRequest,
+                "purging untracked files needs the approval and manifest flow; \
+                 this build refuses rather than deleting them unlisted",
+            ));
+        }
+        let _lease = self.gate_for(params.session_id).await;
+        self.ensure_idle(params.session_id)?;
+        let session = self
+            .store
+            .session(params.session_id)
+            .await
+            .map_err(store_error)?;
+        let chain = self
+            .store
+            .rebuild_chain(session.id, None)
+            .await
+            .map_err(store_error)?;
+        if !chain.iter().any(|item| item.id == params.target_item) {
+            return Err(ManagerError::new(
+                ErrorCode::InvalidRequest,
+                "the rewind target is not on this session's active branch",
+            ));
+        }
+        let mut report = RewindReport::default();
+        if matches!(params.scope, RewindScope::Code | RewindScope::Both)
+            && let Some(restored) = self
+                .rewind_code(&session, params.target_item, params.purge_untracked)
+                .await?
+        {
+            report.rolled_back = restored.rolled_back;
+            report.purged = restored.purged;
+        }
+        if matches!(params.scope, RewindScope::Conversation | RewindScope::Both) {
+            let moved = self
+                .store
+                .switch_branch(session.id, params.target_item)
+                .await
+                .map_err(store_error)?;
+            let moved = self.session_for_wire(moved);
+            self.publish_session_updated(&moved);
+            return Ok(RewindResult {
+                session: moved,
+                report,
+            });
+        }
+        Ok(RewindResult {
+            session: self.session_for_wire(session),
+            report,
+        })
+    }
+
+    /// The code half of a rewind, shared with `session/edit_item`.
+    ///
+    /// `None` means there is nothing to restore: no checkpoint follows the target, so nothing was
+    /// written after it and the working tree already is the state it describes. That is a no-op,
+    /// not an error — a broken checkpoint would report itself from the restore instead.
+    /// Callers hold the turn gate.
+    async fn rewind_code(
+        &self,
+        session: &Session,
+        target_item: ItemId,
+        purge_untracked: bool,
+    ) -> Result<Option<hatchery_capabilities::RestoreReport>, ManagerError> {
+        let workspace = session.workspace.as_deref().ok_or_else(|| {
+            ManagerError::new(
+                ErrorCode::InvalidRequest,
+                "a code rewind requires a workspace; this session has none",
+            )
+        })?;
+        let chain = self
+            .store
+            .rebuild_chain(session.id, None)
+            .await
+            .map_err(store_error)?;
+        let position = chain
+            .iter()
+            .position(|item| item.id == target_item)
+            .ok_or_else(|| {
+                ManagerError::new(
+                    ErrorCode::InvalidRequest,
+                    "the rewind target is not on this session's active branch",
+                )
+            })?;
+        let commit = chain[position + 1..]
+            .iter()
+            .find_map(|item| match &item.kind {
+                ItemKind::Checkpoint(checkpoint) => Some(checkpoint.commit_id.clone()),
+                _ => None,
+            });
+        let Some(commit) = commit else {
+            return Ok(None);
+        };
+        self.checkpoints
+            .restore(
+                session.id,
+                workspace,
+                &commit,
+                hatchery_capabilities::RestoreOptions { purge_untracked },
+            )
+            .await
+            .map(Some)
+            .map_err(|error| ManagerError::new(ErrorCode::InternalError, error.to_string()))
+    }
+
+    /// `session/delete`: remove the session, its items and its live runtime.
+    ///
+    /// The runtime is torn down first and without the idle sweep's watcher veto: deleting a
+    /// session somebody is watching is the point of the method, and leaving an agent running
+    /// against rows that no longer exist would only produce store errors.
+    ///
+    /// # Errors
+    ///
+    /// [`ErrorCode::TurnInProgress`] while a turn is running — a turn's items would be written
+    /// against a session row that is being deleted.
+    pub async fn delete_session(
+        &self,
+        params: SessionDeleteParams,
+    ) -> Result<SessionDeleteResult, ManagerError> {
+        let _lease = self.gate_for(params.session_id).await;
+        self.ensure_idle(params.session_id)?;
+        if let Some(runtime) = self.take_runtime(params.session_id) {
+            runtime.shutdown();
+        }
+        let deleted_items = self
+            .store
+            .delete_session(params.session_id)
+            .await
+            .map_err(store_error)?;
+        self.hub.remove(&params.session_id);
+        self.watchers
+            .lock()
+            .expect("watchers is not poisoned")
+            .remove(&params.session_id);
+        Ok(SessionDeleteResult { deleted_items })
+    }
+
+    /// `session/rename`: set or clear the title.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the store's failure.
+    pub async fn rename(
+        &self,
+        params: SessionRenameParams,
+    ) -> Result<SessionRenameResult, ManagerError> {
+        let session = self
+            .store
+            .update_session(
+                params.session_id,
+                SessionPatch {
+                    title: Some(params.title),
+                    ..SessionPatch::default()
+                },
+            )
+            .await
+            .map_err(store_error)?;
+        let session = self.session_for_wire(session);
+        self.publish_session_updated(&session);
+        Ok(SessionRenameResult { session })
+    }
+
+    /// `store/export_jsonl`: write a session out, refusing to overwrite.
+    ///
+    /// # Errors
+    ///
+    /// The store's failure for an existing file or an unwritable path.
+    pub async fn export(
+        &self,
+        params: ExportJsonlParams,
+    ) -> Result<ExportJsonlResult, ManagerError> {
+        let lines = self
+            .store
+            .export_jsonl(params.session_id, params.path.clone(), params.all_branches)
+            .await
+            .map_err(store_error)?;
+        Ok(ExportJsonlResult {
+            path: params.path,
+            lines,
+        })
+    }
+
+    /// The per-session turn gate, cloned out of the map.
+    async fn gate_for(&self, session_id: SessionId) -> tokio::sync::OwnedMutexGuard<()> {
+        let gate = Arc::clone(
+            self.turn_gates
+                .lock()
+                .expect("turn gates is not poisoned")
+                .entry(session_id)
+                .or_default(),
+        );
+        gate.lock_owned().await
+    }
+
+    /// Refuses a session operation while a turn is in flight.
+    ///
+    /// The answer is the protocol's `TurnInProgress` — the same refusal a second prompt gets —
+    /// rather than a queue: queueing would apply the operation at an unspecified later moment,
+    /// and the caller could not tell which state it landed on.
+    fn ensure_idle(&self, session_id: SessionId) -> Result<(), ManagerError> {
+        match self.runtime_for(session_id) {
+            Some(runtime) if runtime.is_busy() => {
+                Err(ManagerError(crate::core::turn_in_progress()))
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// Removes a runtime from its slot, if there is one.
+    fn take_runtime(&self, session_id: SessionId) -> Option<Arc<SessionRuntime>> {
+        self.slots
+            .lock()
+            .expect("slots is not poisoned")
+            .remove(&session_id)
+            .map(|slot| slot.runtime)
+    }
+
+    /// The session with the generation the wire should carry.
+    ///
+    /// Assembly bumps the store's generation after a caller has already read the row, so a reply
+    /// built from that read would advertise a generation the very next event contradicts.
+    fn session_for_wire(&self, session: Session) -> Session {
+        let generation = self
+            .slots
+            .lock()
+            .expect("slots is not poisoned")
+            .get(&session.id)
+            .map_or(session.generation, |slot| slot.runtime.generation);
+        Session {
+            generation,
+            ..session
+        }
     }
 
     /// `session/set_config`.
@@ -1363,5 +1820,484 @@ mod tests {
         manager.detach(session);
         manager.sweep_after(std::time::Duration::ZERO).await;
         assert_eq!(manager.live_runtimes(), 0, "unwatched again, it goes");
+    }
+
+    async fn session_in_workspace(
+        manager: &SessionManager,
+        workspace: std::path::PathBuf,
+    ) -> Session {
+        let mut params = new_params();
+        params.workspace = Some(workspace);
+        manager.new_session(params).await.expect("created").session
+    }
+
+    /// Appends a Checkpoint item carrying `commit_id`, which is how a rewind finds a restore
+    /// target (storage.md §5). The commit itself need not exist for the walk to find it.
+    async fn append_checkpoint(
+        manager: &SessionManager,
+        session: SessionId,
+        parent: ItemId,
+        commit_id: &str,
+    ) -> Item {
+        let mut item = Item::new(
+            session,
+            ItemKind::Checkpoint(hatchery_protocol::Checkpoint {
+                commit_id: commit_id.to_owned(),
+                kind: hatchery_protocol::CheckpointKind::PreWrite,
+            }),
+        );
+        item.parent = Some(parent);
+        manager
+            .store
+            .append_item(item.clone())
+            .await
+            .expect("append");
+        item
+    }
+
+    fn rewind_params(
+        session_id: SessionId,
+        target_item: ItemId,
+        scope: RewindScope,
+    ) -> RewindParams {
+        RewindParams {
+            session_id,
+            target_item,
+            scope,
+            purge_untracked: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn set_mode_persists_the_row_and_broadcasts_the_switch() {
+        let (dir, manager, hub) = manager().await;
+        let workspace = dir.path().join("ws");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let session = session_in_workspace(&manager, workspace).await;
+        let mut events = hub.subscribe(session.id);
+
+        let result = manager
+            .set_mode(SetModeParams {
+                session_id: session.id,
+                mode: SessionModeId::code(),
+            })
+            .await
+            .expect("switched");
+
+        assert_eq!(result.session.mode, SessionModeId::code());
+        let stored = manager.store.session(session.id).await.expect("stored");
+        assert_eq!(stored.mode, SessionModeId::code());
+        let event = events.recv().await.expect("an event");
+        assert!(matches!(
+            event.event,
+            ServerEvent::ModeSwitched { ref from, ref to }
+                if *from == SessionModeId::chat() && *to == SessionModeId::code()
+        ));
+        assert_eq!(
+            manager.live_runtimes(),
+            0,
+            "nothing was assembled for a session that had no runtime"
+        );
+    }
+
+    #[tokio::test]
+    async fn code_mode_without_a_workspace_is_refused_and_changes_nothing() {
+        let (_dir, manager, _hub) = manager().await;
+        let created = manager.new_session(new_params()).await.expect("created");
+        let error = manager
+            .set_mode(SetModeParams {
+                session_id: created.session.id,
+                mode: SessionModeId::code(),
+            })
+            .await
+            .expect_err("no workspace");
+        assert_eq!(error.into_event().code, ErrorCode::InvalidRequest);
+        let stored = manager
+            .store
+            .session(created.session.id)
+            .await
+            .expect("stored");
+        assert_eq!(stored.mode, SessionModeId::chat());
+    }
+
+    #[tokio::test]
+    async fn setting_the_mode_it_already_has_is_a_no_op() {
+        let (_dir, manager, hub) = manager().await;
+        let created = manager.new_session(new_params()).await.expect("created");
+        let mut events = hub.subscribe(created.session.id);
+
+        manager
+            .set_mode(SetModeParams {
+                session_id: created.session.id,
+                mode: SessionModeId::chat(),
+            })
+            .await
+            .expect("no-op");
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), events.recv())
+                .await
+                .is_err(),
+            "nothing changed, so nothing is broadcast"
+        );
+    }
+
+    #[tokio::test]
+    async fn branch_list_marks_the_active_chain_and_switch_moves_it() {
+        let (_dir, manager, _hub) = manager().await;
+        let created = manager.new_session(new_params()).await.expect("created");
+        let items = chain_of_three(&manager, created.session.id).await;
+
+        let listed = manager
+            .branch_list(BranchListParams {
+                session_id: created.session.id,
+            })
+            .await
+            .expect("listed");
+        assert_eq!(listed.nodes.len(), 3);
+        assert!(listed.nodes.iter().all(|node| node.active));
+
+        let switched = manager
+            .branch_switch(BranchSwitchParams {
+                session_id: created.session.id,
+                head: items[1].id,
+            })
+            .await
+            .expect("switched");
+        assert_eq!(switched.session.active_branch_head, Some(items[1].id));
+
+        let relisted = manager
+            .branch_list(BranchListParams {
+                session_id: created.session.id,
+            })
+            .await
+            .expect("relisted");
+        let active: Vec<ItemId> = relisted
+            .nodes
+            .iter()
+            .filter(|node| node.active)
+            .map(|node| node.id)
+            .collect();
+        assert_eq!(active, vec![items[0].id, items[1].id]);
+    }
+
+    #[tokio::test]
+    async fn branch_delete_needs_confirmation_and_refuses_the_active_head() {
+        let (_dir, manager, _hub) = manager().await;
+        let created = manager.new_session(new_params()).await.expect("created");
+        let items = chain_of_three(&manager, created.session.id).await;
+
+        let unconfirmed = manager
+            .branch_delete(BranchDeleteParams {
+                session_id: created.session.id,
+                head: items[2].id,
+                confirm: false,
+            })
+            .await
+            .expect_err("no confirmation");
+        assert_eq!(unconfirmed.into_event().code, ErrorCode::InvalidRequest);
+
+        let refused = manager
+            .branch_delete(BranchDeleteParams {
+                session_id: created.session.id,
+                head: items[0].id,
+                confirm: true,
+            })
+            .await
+            .expect_err("the active head is inside");
+        assert_eq!(refused.into_event().code, ErrorCode::InvalidRequest);
+
+        // Move the head off the tail, then that tail is deletable.
+        manager
+            .branch_switch(BranchSwitchParams {
+                session_id: created.session.id,
+                head: items[1].id,
+            })
+            .await
+            .expect("switched");
+        let deleted = manager
+            .branch_delete(BranchDeleteParams {
+                session_id: created.session.id,
+                head: items[2].id,
+                confirm: true,
+            })
+            .await
+            .expect("deleted");
+        assert_eq!(deleted.deleted_items, 1);
+    }
+
+    #[tokio::test]
+    async fn rename_sets_and_clears_the_title() {
+        let (_dir, manager, hub) = manager().await;
+        let created = manager.new_session(new_params()).await.expect("created");
+        let mut events = hub.subscribe(created.session.id);
+
+        let renamed = manager
+            .rename(SessionRenameParams {
+                session_id: created.session.id,
+                title: Some("a better name".to_owned()),
+            })
+            .await
+            .expect("renamed");
+        assert_eq!(renamed.session.title.as_deref(), Some("a better name"));
+        assert!(matches!(
+            events.recv().await.expect("event").event,
+            ServerEvent::SessionUpdated { .. }
+        ));
+
+        let cleared = manager
+            .rename(SessionRenameParams {
+                session_id: created.session.id,
+                title: None,
+            })
+            .await
+            .expect("cleared");
+        assert_eq!(cleared.session.title, None);
+    }
+
+    #[tokio::test]
+    async fn deleting_a_session_removes_its_items() {
+        let (_dir, manager, _hub) = manager().await;
+        let created = manager.new_session(new_params()).await.expect("created");
+        chain_of_three(&manager, created.session.id).await;
+
+        let deleted = manager
+            .delete_session(SessionDeleteParams {
+                session_id: created.session.id,
+            })
+            .await
+            .expect("deleted");
+        assert_eq!(deleted.deleted_items, 3);
+        assert_eq!(
+            manager
+                .store
+                .session(created.session.id)
+                .await
+                .expect_err("gone")
+                .to_event_error()
+                .code,
+            ErrorCode::SessionNotFound
+        );
+    }
+
+    #[tokio::test]
+    async fn export_writes_the_branch_and_refuses_to_overwrite() {
+        let (dir, manager, _hub) = manager().await;
+        let created = manager.new_session(new_params()).await.expect("created");
+        chain_of_three(&manager, created.session.id).await;
+        let path = dir.path().join("session.jsonl");
+
+        let exported = manager
+            .export(ExportJsonlParams {
+                session_id: created.session.id,
+                path: path.clone(),
+                all_branches: false,
+            })
+            .await
+            .expect("exported");
+        assert_eq!(exported.lines, 3);
+        assert!(path.is_file());
+
+        let again = manager
+            .export(ExportJsonlParams {
+                session_id: created.session.id,
+                path,
+                all_branches: false,
+            })
+            .await
+            .expect_err("refuses to overwrite");
+        assert_eq!(again.into_event().code, ErrorCode::InvalidRequest);
+    }
+
+    #[tokio::test]
+    async fn a_conversation_rewind_moves_the_head_and_leaves_the_disk_alone() {
+        let (dir, manager, _hub) = manager().await;
+        let workspace = dir.path().join("ws");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let session = session_in_workspace(&manager, workspace.clone()).await;
+        let items = chain_of_three(&manager, session.id).await;
+        let note = workspace.join("note.txt");
+        std::fs::write(&note, "untouched\n").expect("write");
+
+        let result = manager
+            .rewind(rewind_params(
+                session.id,
+                items[0].id,
+                RewindScope::Conversation,
+            ))
+            .await
+            .expect("rewound");
+        assert_eq!(result.session.active_branch_head, Some(items[0].id));
+        assert_eq!(
+            std::fs::read_to_string(&note).expect("still there"),
+            "untouched\n"
+        );
+        assert!(result.report.rolled_back.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_rewind_target_off_the_active_branch_is_refused() {
+        let (_dir, manager, _hub) = manager().await;
+        let created = manager.new_session(new_params()).await.expect("created");
+        chain_of_three(&manager, created.session.id).await;
+
+        let error = manager
+            .rewind(rewind_params(
+                created.session.id,
+                ItemId::new(),
+                RewindScope::Conversation,
+            ))
+            .await
+            .expect_err("not on the branch");
+        assert_eq!(error.into_event().code, ErrorCode::InvalidRequest);
+    }
+
+    #[tokio::test]
+    async fn a_code_rewind_requires_a_workspace() {
+        let (_dir, manager, _hub) = manager().await;
+        let created = manager.new_session(new_params()).await.expect("created");
+        let items = chain_of_three(&manager, created.session.id).await;
+
+        let error = manager
+            .rewind(rewind_params(
+                created.session.id,
+                items[0].id,
+                RewindScope::Code,
+            ))
+            .await
+            .expect_err("no workspace");
+        assert_eq!(error.into_event().code, ErrorCode::InvalidRequest);
+    }
+
+    #[tokio::test]
+    async fn a_purge_rewind_is_refused_until_the_manifest_flow_exists() {
+        let (dir, manager, _hub) = manager().await;
+        let workspace = dir.path().join("ws");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let session = session_in_workspace(&manager, workspace).await;
+        let items = chain_of_three(&manager, session.id).await;
+
+        let mut params = rewind_params(session.id, items[0].id, RewindScope::Both);
+        params.purge_untracked = true;
+        let error = manager.rewind(params).await.expect_err("refused");
+        assert_eq!(
+            error.into_event().code,
+            ErrorCode::InvalidRequest,
+            "a purge without the approval and its manifest must never delete a file"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_both_rewind_leaves_the_history_alone_when_the_restore_fails() {
+        let (dir, manager, _hub) = manager().await;
+        let workspace = dir.path().join("ws");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let session = session_in_workspace(&manager, workspace).await;
+        let items = chain_of_three(&manager, session.id).await;
+        let checkpoint = append_checkpoint(
+            &manager,
+            session.id,
+            items[2].id,
+            "0000000000000000000000000000000000000000",
+        )
+        .await;
+
+        let error = manager
+            .rewind(rewind_params(session.id, items[0].id, RewindScope::Both))
+            .await
+            .expect_err("the commit does not exist");
+        assert_eq!(error.into_event().code, ErrorCode::InternalError);
+        let after = manager.store.session(session.id).await.expect("session");
+        assert_eq!(
+            after.active_branch_head,
+            Some(checkpoint.id),
+            "a failed restore must never move the history first"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_code_rewind_with_nothing_written_after_the_target_is_a_no_op() {
+        let (dir, manager, _hub) = manager().await;
+        let workspace = dir.path().join("ws");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let session = session_in_workspace(&manager, workspace.clone()).await;
+        let items = chain_of_three(&manager, session.id).await;
+        let note = workspace.join("note.txt");
+        std::fs::write(&note, "as it was\n").expect("write");
+
+        let result = manager
+            .rewind(rewind_params(session.id, items[2].id, RewindScope::Code))
+            .await
+            .expect("no-op");
+        assert!(result.report.rolled_back.is_empty());
+        assert!(result.report.purged.is_empty());
+        assert_eq!(result.session.active_branch_head, Some(items[2].id));
+        assert_eq!(
+            std::fs::read_to_string(&note).expect("still there"),
+            "as it was\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_code_rewind_restores_the_checkpoint_and_records_the_safety_snapshot() {
+        let (dir, manager, _hub) = manager().await;
+        let workspace = dir.path().join("ws");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let note = workspace.join("note.txt");
+        std::fs::write(&note, "v1\n").expect("write");
+        let session = session_in_workspace(&manager, workspace.clone()).await;
+        let items = chain_of_three(&manager, session.id).await;
+
+        let shadow = manager
+            .checkpoints()
+            .store_for(&workspace)
+            .await
+            .expect("shadow");
+        let snapshot = shadow
+            .snapshot(hatchery_protocol::CheckpointKind::PreWrite)
+            .await
+            .expect("snapshot");
+        let checkpoint = append_checkpoint(
+            &manager,
+            session.id,
+            items[2].id,
+            &snapshot.checkpoint.commit_id,
+        )
+        .await;
+        std::fs::write(&note, "v2\n").expect("the write after the checkpoint");
+
+        let result = manager
+            .rewind(rewind_params(session.id, items[2].id, RewindScope::Code))
+            .await
+            .expect("rewound");
+        assert_eq!(
+            std::fs::read_to_string(&note).expect("restored"),
+            "v1\n",
+            "the checkpoint's content is back"
+        );
+        assert!(
+            result
+                .report
+                .rolled_back
+                .iter()
+                .any(|path| path.ends_with("note.txt")),
+            "{:?}",
+            result.report.rolled_back
+        );
+        assert_eq!(
+            result.session.active_branch_head,
+            Some(checkpoint.id),
+            "a code rewind does not move the head"
+        );
+
+        let rows = manager
+            .store
+            .checkpoints_for_workspace(&workspace)
+            .await
+            .expect("rows");
+        assert!(
+            rows.iter().any(|row| row.item.is_none()),
+            "the undo-of-undo is recorded without an item: {rows:?}"
+        );
     }
 }

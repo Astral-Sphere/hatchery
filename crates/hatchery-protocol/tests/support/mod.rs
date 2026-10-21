@@ -20,12 +20,12 @@ use hatchery_protocol::method::{
     BranchSwitchParams, BranchSwitchResult, ClientInfo, ConfigEntry, ConfigGetParams,
     ConfigGetResult, ConfigOrigin, ConfigPatch, ConfigSetParams, ConfigSetResult,
     DaemonCapabilities, EditItemParams, EditItemResult, ExportJsonlParams, ExportJsonlResult,
-    HelloParams, HelloResult, PromptRenderParams, PromptRenderResult, PromptSection, RewindParams,
-    RewindReport, RewindResult, SessionCancelParams, SessionCancelResult, SessionDeleteParams,
-    SessionDeleteResult, SessionListParams, SessionListResult, SessionLoadParams,
-    SessionLoadResult, SessionNewParams, SessionNewResult, SessionPromptParams,
-    SessionPromptResult, SessionRenameParams, SessionRenameResult, SetConfigParams,
-    SetConfigResult, SetModeParams, SetModeResult,
+    HelloParams, HelloResult, PendingApproval, PromptRenderParams, PromptRenderResult,
+    PromptSection, RewindParams, RewindReport, RewindResult, SessionCancelParams,
+    SessionCancelResult, SessionDeleteParams, SessionDeleteResult, SessionListParams,
+    SessionListResult, SessionLoadParams, SessionLoadResult, SessionNewParams, SessionNewResult,
+    SessionPromptParams, SessionPromptResult, SessionRenameParams, SessionRenameResult,
+    SetConfigParams, SetConfigResult, SetModeParams, SetModeResult,
 };
 use hatchery_protocol::{
     ApprovalId, ApprovalOption, ApprovalRequest, ApprovalRule, ApprovalRuleId, ApprovalScope,
@@ -612,6 +612,16 @@ pub fn method_results() -> Vec<(&'static str, Value)> {
                 session: session.clone(),
                 items: replay,
                 next_cursor: Some(item_id_2()),
+                pending_approvals: vec![PendingApproval {
+                    request_id: approval_id(),
+                    session_id: session.id,
+                    request: ApprovalRequest::new(
+                        "write_file",
+                        "write ~/.ssh/config (outside the workspace)",
+                        RiskLevel::WritesOutside,
+                    )
+                    .once_only(),
+                }],
             }),
         ),
         (

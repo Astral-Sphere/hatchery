@@ -105,6 +105,14 @@ pub trait SessionStore: Send + Sync {
     /// Reads one item, refusing an id from another session.
     async fn item(&self, session: SessionId, item: ItemId) -> Result<Item, StoreError>;
 
+    /// Which session owns an item, refusing an id that is not stored.
+    ///
+    /// `session/edit_item` names only the item: unlike every other session method it does not
+    /// carry a session id, and the protocol's compatibility promise forbids adding a required
+    /// field. The store already knows the owner — `edit_fork` verifies it — so the answer belongs
+    /// here rather than in a branch walk the daemon would have to guess at.
+    async fn session_of_item(&self, item: ItemId) -> Result<SessionId, StoreError>;
+
     /// The active branch, root first, payloads included.
     ///
     /// `head` of `None` means the session's active head. Payload filtering — reasoning
@@ -396,6 +404,11 @@ impl SessionStore for TursoStore {
             reply,
         })
         .await
+    }
+
+    async fn session_of_item(&self, item: ItemId) -> Result<SessionId, StoreError> {
+        self.ask(|reply| StoreCmd::SessionOfItem { item, reply })
+            .await
     }
 
     async fn rebuild_chain(

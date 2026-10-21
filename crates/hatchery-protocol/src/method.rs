@@ -197,6 +197,14 @@ pub struct SessionLoadResult {
     /// replay is complete and the live stream takes over.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<ItemId>,
+    /// Approval requests still waiting for an answer at snapshot time.
+    ///
+    /// A reconnecting frontend has missed the `ApprovalRequested` event, and the turn it belongs
+    /// to is still parked; without this list the prompt would sit unrendered until the timeout
+    /// denied it. Answered requests are absent because the registry forgets them the moment an
+    /// answer lands.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending_approvals: Vec<PendingApproval>,
 }
 
 // ---------------------------------------------------------------- session/list

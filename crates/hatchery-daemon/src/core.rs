@@ -21,8 +21,10 @@ use crate::manager::SessionManager;
 /// What this daemon serves, in the order the protocol lists them.
 ///
 /// M1 is the chat loop: sessions, config, prompt rendering. M2 Phase 2 adds the approval round
-/// trip and the rule list/delete pair. Branch surgery, rewind and export arrive with their
-/// milestones; a frontend reading this list degrades gracefully instead of calling into the void.
+/// trip and the rule list/delete pair; Phase 3 adds the whole session-surgery surface — mode
+/// switching, item editing, branches, rewind, rename/delete and export. Every method the protocol
+/// names is served, so a frontend reading this list can rely on the absence of a name meaning the
+/// build is older, not the feature missing.
 const SERVED_METHODS: &[&str] = &[
     m::DAEMON_HELLO,
     m::SESSION_NEW,
@@ -30,13 +32,22 @@ const SERVED_METHODS: &[&str] = &[
     m::SESSION_LIST,
     m::SESSION_PROMPT,
     m::SESSION_CANCEL,
+    m::SESSION_SET_MODE,
     m::SESSION_SET_CONFIG,
+    m::SESSION_EDIT_ITEM,
+    m::SESSION_BRANCH_LIST,
+    m::SESSION_BRANCH_SWITCH,
+    m::SESSION_BRANCH_DELETE,
+    m::SESSION_REWIND,
+    m::SESSION_DELETE,
+    m::SESSION_RENAME,
     m::APPROVAL_RESPOND,
     m::APPROVAL_RULES_LIST,
     m::APPROVAL_RULES_DELETE,
     m::CONFIG_GET,
     m::CONFIG_SET,
     m::PROMPT_RENDER,
+    m::STORE_EXPORT_JSONL,
 ];
 
 /// The method names this build serves, for the capability list and tests.
@@ -70,7 +81,10 @@ impl DaemonCore {
             supported_versions: vec![PROTOCOL_VERSION.to_owned()],
             capabilities: m::DaemonCapabilities {
                 methods: SERVED_METHODS.iter().map(|s| (*s).to_owned()).collect(),
-                modes: vec![hatchery_protocol::SessionModeId::chat()],
+                modes: vec![
+                    hatchery_protocol::SessionModeId::chat(),
+                    hatchery_protocol::SessionModeId::code(),
+                ],
             },
         };
         Self {
@@ -167,6 +181,59 @@ impl DaemonCore {
                 let params: m::SetConfigParams =
                     serde_json::from_value(params).map_err(bad_params)?;
                 serde_json::to_value(self.manager.set_config(params).await.map_err(manager)?)
+                    .map_err(internal)
+            }
+            m::SESSION_SET_MODE => {
+                let params: m::SetModeParams =
+                    serde_json::from_value(params).map_err(bad_params)?;
+                serde_json::to_value(self.manager.set_mode(params).await.map_err(manager)?)
+                    .map_err(internal)
+            }
+            m::SESSION_EDIT_ITEM => {
+                let params: m::EditItemParams =
+                    serde_json::from_value(params).map_err(bad_params)?;
+                serde_json::to_value(self.manager.edit_item(params).await.map_err(manager)?)
+                    .map_err(internal)
+            }
+            m::SESSION_BRANCH_LIST => {
+                let params: m::BranchListParams =
+                    serde_json::from_value(params).map_err(bad_params)?;
+                serde_json::to_value(self.manager.branch_list(params).await.map_err(manager)?)
+                    .map_err(internal)
+            }
+            m::SESSION_BRANCH_SWITCH => {
+                let params: m::BranchSwitchParams =
+                    serde_json::from_value(params).map_err(bad_params)?;
+                serde_json::to_value(self.manager.branch_switch(params).await.map_err(manager)?)
+                    .map_err(internal)
+            }
+            m::SESSION_BRANCH_DELETE => {
+                let params: m::BranchDeleteParams =
+                    serde_json::from_value(params).map_err(bad_params)?;
+                serde_json::to_value(self.manager.branch_delete(params).await.map_err(manager)?)
+                    .map_err(internal)
+            }
+            m::SESSION_REWIND => {
+                let params: m::RewindParams = serde_json::from_value(params).map_err(bad_params)?;
+                serde_json::to_value(self.manager.rewind(params).await.map_err(manager)?)
+                    .map_err(internal)
+            }
+            m::SESSION_DELETE => {
+                let params: m::SessionDeleteParams =
+                    serde_json::from_value(params).map_err(bad_params)?;
+                serde_json::to_value(self.manager.delete_session(params).await.map_err(manager)?)
+                    .map_err(internal)
+            }
+            m::SESSION_RENAME => {
+                let params: m::SessionRenameParams =
+                    serde_json::from_value(params).map_err(bad_params)?;
+                serde_json::to_value(self.manager.rename(params).await.map_err(manager)?)
+                    .map_err(internal)
+            }
+            m::STORE_EXPORT_JSONL => {
+                let params: m::ExportJsonlParams =
+                    serde_json::from_value(params).map_err(bad_params)?;
+                serde_json::to_value(self.manager.export(params).await.map_err(manager)?)
                     .map_err(internal)
             }
             m::APPROVAL_RESPOND => {
@@ -509,7 +576,7 @@ mod tests {
     async fn an_unknown_method_is_method_not_found() {
         let (_dir, core, _config) = core().await;
         let response = core
-            .dispatch(&request("session/rewind", serde_json::json!({})))
+            .dispatch(&request("session/no-such-operation", serde_json::json!({})))
             .await;
         let error = response.error.expect("refused");
         assert_eq!(error.code, ErrorCode::MethodNotFound.as_i64());
@@ -541,6 +608,115 @@ mod tests {
         let listed: m::SessionListResult =
             serde_json::from_value(listed.result.expect("ok")).expect("typed");
         assert_eq!(listed.sessions.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn the_session_surgery_methods_round_trip_through_dispatch() {
+        let (dir, core, _config) = core().await;
+        let workspace = dir.path().join("ws");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let created = core
+            .dispatch(&request(
+                m::SESSION_NEW,
+                serde_json::to_value(SessionNewParams {
+                    mode: SessionModeId::chat(),
+                    workspace: Some(workspace),
+                    model: Some(ModelRef::new("deepseek", "deepseek-flash")),
+                    title: None,
+                    config_patch: None,
+                })
+                .expect("params"),
+            ))
+            .await;
+        let created: m::SessionNewResult =
+            serde_json::from_value(created.result.expect("ok")).expect("typed");
+        let id = created.session.id;
+
+        let renamed = core
+            .dispatch(&request(
+                m::SESSION_RENAME,
+                serde_json::json!({"session_id": id, "title": "surgery"}),
+            ))
+            .await;
+        let renamed: m::SessionRenameResult =
+            serde_json::from_value(renamed.result.expect("ok")).expect("typed");
+        assert_eq!(renamed.session.title.as_deref(), Some("surgery"));
+
+        let switched = core
+            .dispatch(&request(
+                m::SESSION_SET_MODE,
+                serde_json::json!({"session_id": id, "mode": "code"}),
+            ))
+            .await;
+        let switched: m::SetModeResult =
+            serde_json::from_value(switched.result.expect("ok")).expect("typed");
+        assert_eq!(switched.session.mode, SessionModeId::code());
+
+        let item = core
+            .store
+            .append_item(hatchery_protocol::Item::new(
+                id,
+                hatchery_protocol::ItemKind::UserMessage(hatchery_protocol::Content::text("hello")),
+            ))
+            .await
+            .expect("append");
+
+        let listed = core
+            .dispatch(&request(
+                m::SESSION_BRANCH_LIST,
+                serde_json::json!({"session_id": id}),
+            ))
+            .await;
+        let listed: m::BranchListResult =
+            serde_json::from_value(listed.result.expect("ok")).expect("typed");
+        assert_eq!(listed.nodes.len(), 1);
+        assert!(listed.nodes[0].active);
+
+        let rewound = core
+            .dispatch(&request(
+                m::SESSION_REWIND,
+                serde_json::json!({
+                    "session_id": id,
+                    "target_item": item,
+                    "scope": "conversation",
+                }),
+            ))
+            .await;
+        let rewound: m::RewindResult =
+            serde_json::from_value(rewound.result.expect("ok")).expect("typed");
+        assert_eq!(rewound.session.active_branch_head, Some(item));
+
+        let unconfirmed = core
+            .dispatch(&request(
+                m::SESSION_BRANCH_DELETE,
+                serde_json::json!({"session_id": id, "head": item, "confirm": false}),
+            ))
+            .await;
+        assert_eq!(
+            unconfirmed.error.expect("refused").code,
+            ErrorCode::InvalidRequest.as_i64()
+        );
+
+        let path = dir.path().join("out.jsonl");
+        let exported = core
+            .dispatch(&request(
+                m::STORE_EXPORT_JSONL,
+                serde_json::json!({"session_id": id, "path": path, "all_branches": false}),
+            ))
+            .await;
+        let exported: m::ExportJsonlResult =
+            serde_json::from_value(exported.result.expect("ok")).expect("typed");
+        assert_eq!(exported.lines, 1);
+
+        let deleted = core
+            .dispatch(&request(
+                m::SESSION_DELETE,
+                serde_json::json!({"session_id": id}),
+            ))
+            .await;
+        let deleted: m::SessionDeleteResult =
+            serde_json::from_value(deleted.result.expect("ok")).expect("typed");
+        assert_eq!(deleted.deleted_items, 1);
     }
 
     #[tokio::test]
@@ -644,17 +820,11 @@ mod tests {
 
     #[test]
     fn server_constants_name_what_this_build_serves() {
-        assert!(SERVED_METHODS.contains(&m::SESSION_PROMPT));
-        assert!(
-            !SERVED_METHODS.contains(&m::SESSION_REWIND),
-            "rewind is M2 later"
-        );
-        assert!(
-            SERVED_METHODS.contains(&m::APPROVAL_RESPOND),
-            "the approval round trip is Phase 2"
-        );
-        assert!(SERVED_METHODS.contains(&m::APPROVAL_RULES_LIST));
-        assert!(SERVED_METHODS.contains(&m::APPROVAL_RULES_DELETE));
+        // Phase 3 closed the last gap: every method the protocol names is routed. A method that
+        // disappears from this list without disappearing from `ALL` would make a frontend's
+        // capability check lie, which is why the assertion is equality rather than containment.
+        assert_eq!(SERVED_METHODS, m::ALL);
+        assert_eq!(served_methods(), m::ALL);
         assert!(is_request(&Incoming::Request(request(
             "x",
             serde_json::json!({})

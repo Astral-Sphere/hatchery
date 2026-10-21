@@ -161,6 +161,7 @@ where
         session,
         mut items,
         next_cursor: mut cursor,
+        pending_approvals: _,
     } = first;
     let session_id = session.id;
     let mut generation = Some(session.generation);
@@ -942,6 +943,7 @@ mod tests {
                 })
                 .collect(),
             next_cursor,
+            pending_approvals: Vec::new(),
         }
     }
 

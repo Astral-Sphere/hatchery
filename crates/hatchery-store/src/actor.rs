@@ -142,6 +142,13 @@ pub enum StoreCmd {
         /// The item.
         reply: Reply<Item>,
     },
+    /// Which session owns an item.
+    SessionOfItem {
+        /// Which item.
+        item: ItemId,
+        /// Its session.
+        reply: Reply<SessionId>,
+    },
     /// The active branch, root first, payloads included.
     RebuildChain {
         /// Which session.
@@ -336,6 +343,9 @@ impl Writer {
                     reply,
                 } => {
                     reply_send(reply, self.item(session, item).await);
+                }
+                StoreCmd::SessionOfItem { item, reply } => {
+                    reply_send(reply, self.session_of_item(item).await);
                 }
                 StoreCmd::RebuildChain {
                     session,
@@ -1266,6 +1276,12 @@ impl Writer {
         let items = self.all_items(session).await?;
         let tips = self.tips(session).await?;
         Ok((items, tips))
+    }
+
+    async fn session_of_item(&self, item: ItemId) -> Result<SessionId, StoreError> {
+        self.item_session(item)
+            .await?
+            .ok_or(StoreError::ItemNotFound(item))
     }
 
     async fn item_session(&self, item: ItemId) -> Result<Option<SessionId>, StoreError> {
