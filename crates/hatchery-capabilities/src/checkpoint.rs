@@ -154,6 +154,11 @@ pub struct RestoreReport {
     /// which is exactly why that column is nullable (storage.md §2).
     pub safety: SnapshotReport,
     /// Tracked files whose content the restore changed.
+    ///
+    /// Both sides of the change are counted: paths that differ between the last snapshot and the
+    /// target, and paths that were edited after the last snapshot (a snapshot is taken *before* a
+    /// write, so the worktree can be ahead of HEAD). Reporting only the commit-level diff would
+    /// say "nothing was rolled back" while the file was already being rewritten.
     pub rolled_back: Vec<PathBuf>,
     /// Files the purge removed. Empty unless [`RestoreOptions::purge_untracked`].
     pub purged: Vec<PathBuf>,
@@ -617,6 +622,31 @@ impl Shadow {
         }
     }
 
+    /// Tracked paths whose working-tree content differs from `head`.
+    ///
+    /// Untracked files are excluded on purpose: a restore only deletes them when
+    /// [`RestoreOptions::purge_untracked`] is set, and those deletions are reported separately in
+    /// `purged`. Ignored paths are excluded by the shadow repository's own ignore rules, which is
+    /// what keeps `.git` and build output out of both lists.
+    fn worktree_drift(
+        &self,
+        repo: &Repository,
+        head: Option<&Tree<'_>>,
+    ) -> Result<Vec<PathBuf>, CheckpointError> {
+        let mut options = git2::DiffOptions::new();
+        options
+            .include_untracked(false)
+            .recurse_untracked_dirs(false);
+        let diff = repo.diff_tree_to_workdir_with_index(head, Some(&mut options))?;
+        let mut paths = Vec::new();
+        for delta in diff.deltas() {
+            if let Some(path) = delta.new_file().path().or_else(|| delta.old_file().path()) {
+                paths.push(PathBuf::from(path));
+            }
+        }
+        Ok(paths)
+    }
+
     fn diff_trees(
         &self,
         repo: &Repository,
@@ -722,11 +752,20 @@ impl Shadow {
                 .and_then(|oid| repo.find_commit(oid).ok())
                 .and_then(|commit| commit.tree().ok());
             let target_tree = repo.find_commit(target_oid)?.tree()?;
-            self.diff_trees(repo, head_tree.as_ref(), Some(&target_tree))?
+            // Two sources, because a snapshot is taken *before* a write: a file edited after the
+            // last snapshot is absent from the commit-level diff, yet the reset will still change
+            // it. Reporting only the commit diff would tell the user "nothing was rolled back"
+            // while their file went back, which a rewind report must never do.
+            let mut paths: Vec<PathBuf> = self
+                .diff_trees(repo, head_tree.as_ref(), Some(&target_tree))?
                 .files
                 .into_iter()
                 .map(|file| PathBuf::from(file.path))
-                .collect()
+                .collect();
+            paths.extend(self.worktree_drift(repo, head_tree.as_ref())?);
+            paths.sort();
+            paths.dedup();
+            paths
         };
 
         // The purge manifest is computed before the purge: `checkout_index` does not report what it
