@@ -9,8 +9,8 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio_util::sync::CancellationToken;
 
 use hatchery_kernel::{
-    AgentCommand, AgentHandle, CheckpointCollector, KernelError, KernelEvent, ToolDef, ToolHost,
-    ToolInvocation,
+    AgentCommand, AgentHandle, ApprovalNeed, CheckpointCollector, KernelError, KernelEvent,
+    ToolDef, ToolHost, ToolInvocation,
 };
 use hatchery_protocol::{
     ApprovalOption, ApprovalRequest, Checkpoint, CheckpointKind, RiskLevel, ToolCallSummary,
@@ -47,6 +47,7 @@ enum ScriptedResult {
 pub struct ScriptedToolHost {
     defs: Mutex<Vec<ToolDef>>,
     approvals: Mutex<HashMap<String, ApprovalRequest>>,
+    refusals: Mutex<HashMap<String, String>>,
     results: Mutex<HashMap<String, VecDeque<ScriptedResult>>>,
     calls: Mutex<Vec<RecordedCall>>,
     checkpoints: Mutex<HashMap<String, Vec<Checkpoint>>>,
@@ -60,6 +61,7 @@ impl ScriptedToolHost {
         Self {
             defs: Mutex::new(Vec::new()),
             approvals: Mutex::new(HashMap::new()),
+            refusals: Mutex::new(HashMap::new()),
             results: Mutex::new(HashMap::new()),
             calls: Mutex::new(Vec::new()),
             checkpoints: Mutex::new(HashMap::new()),
@@ -110,6 +112,20 @@ impl ScriptedToolHost {
             .lock()
             .expect("the mutex is never poisoned")
             .insert(request.tool.clone(), request);
+        self
+    }
+
+    /// Makes this tool refuse without asking, the way a persisted `DenyAlways` rule does.
+    ///
+    /// The kernel must produce a denied `ToolResult` **without** emitting `ApprovalNeeded`; a
+    /// test that only checks the result could not tell that apart from a prompt the user answered
+    /// "no", so pair this with an assertion that no approval event arrived.
+    #[must_use]
+    pub fn refusing(self, name: &str, reason: &str) -> Self {
+        self.refusals
+            .lock()
+            .expect("the mutex is never poisoned")
+            .insert(name.to_owned(), reason.to_owned());
         self
     }
 
@@ -210,12 +226,30 @@ impl ToolHost for ScriptedToolHost {
         ToolCallSummary::new(format!("call {name}"))
     }
 
-    fn approval_for(&self, name: &str, _args: &Value) -> Option<ApprovalRequest> {
-        self.approvals
+    async fn approval_for(
+        &self,
+        name: &str,
+        _args: &Value,
+        _cancel: CancellationToken,
+    ) -> ApprovalNeed {
+        if let Some(reason) = self
+            .refusals
+            .lock()
+            .expect("the mutex is never poisoned")
+            .get(name)
+        {
+            return ApprovalNeed::Refused(reason.clone());
+        }
+        match self
+            .approvals
             .lock()
             .expect("the mutex is never poisoned")
             .get(name)
             .cloned()
+        {
+            Some(request) => ApprovalNeed::Ask(request),
+            None => ApprovalNeed::NotNeeded,
+        }
     }
 
     async fn invoke(
@@ -335,7 +369,7 @@ pub enum ScriptedApproval {
 }
 
 impl ScriptedApproval {
-    fn next(&mut self) -> ApprovalOption {
+    pub(crate) fn next(&mut self) -> ApprovalOption {
         match self {
             Self::AllowOnce => ApprovalOption::AllowOnce,
             Self::AllowAlways => ApprovalOption::AllowAlways,

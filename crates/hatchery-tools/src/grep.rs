@@ -103,7 +103,7 @@ impl Tool for Grep {
         }
     }
 
-    fn needs_approval(&self, _args: &Value) -> Option<ApprovalRequest> {
+    async fn needs_approval(&self, _ctx: &ToolCtx<'_>, _args: &Value) -> Option<ApprovalRequest> {
         None
     }
 

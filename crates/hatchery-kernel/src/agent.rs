@@ -20,7 +20,7 @@ use crate::message::{
 };
 use crate::sink::KernelEvent;
 use crate::state::{Ports, TurnCompletion, TurnLimits, TurnState};
-use crate::tools::{CheckpointCollector, ToolInvocation};
+use crate::tools::{ApprovalNeed, CheckpointCollector, ToolInvocation};
 
 /// How many commands may queue before a submitter is made to wait.
 const COMMAND_CAPACITY: usize = 64;
@@ -277,6 +277,8 @@ enum ToolStep {
 enum Decision {
     Chosen(ApprovalOption),
     Interrupted,
+    /// A persisted rule refused the call before anybody was asked.
+    Refused(String),
 }
 
 /// What a guarded startup await woke up on.
@@ -598,12 +600,19 @@ impl Agent {
         })
         .await;
 
-        let decision = match self.ports.tools.approval_for(&request.name, &request.args) {
-            None => Some(ApprovalOption::AllowOnce),
-            Some(approval) => {
+        let decision = match self
+            .ports
+            .tools
+            .approval_for(&request.name, &request.args, self.cancel.clone())
+            .await
+        {
+            ApprovalNeed::NotNeeded => Decision::Chosen(ApprovalOption::AllowOnce),
+            ApprovalNeed::Refused(reason) => Decision::Refused(reason),
+            ApprovalNeed::Ask(approval) => {
                 let request_id = ApprovalId::new();
                 match self.await_approval(request_id, approval).await? {
-                    Decision::Interrupted => None,
+                    Decision::Interrupted => Decision::Interrupted,
+                    Decision::Refused(reason) => Decision::Refused(reason),
                     Decision::Chosen(option) => {
                         // The design's edge back (docs/design/kernel.md §3): the wait ended when
                         // the answer arrived. A frontend projects `SessionStatus` from
@@ -611,19 +620,26 @@ impl Agent {
                         // later call in the round — would report "waiting for approval" under a
                         // request id that is no longer pending.
                         self.transition(TurnState::Executing { round }).await;
-                        Some(option)
+                        Decision::Chosen(option)
                     }
                 }
             }
         };
 
         let (invocation, status) = match decision {
-            None => {
+            Decision::Interrupted => {
                 self.commit_call(id, parent, request, ToolStatus::Cancelled)
                     .await;
                 return Ok(None);
             }
-            Some(option) if !option.allows() => (
+            Decision::Refused(reason) => (
+                ToolInvocation {
+                    output: ToolOutput::text(reason),
+                    is_error: true,
+                },
+                ToolStatus::Denied,
+            ),
+            Decision::Chosen(option) if !option.allows() => (
                 ToolInvocation {
                     output: ToolOutput::text(format!(
                         "the user denied this call to `{}`; do not repeat it",
@@ -633,7 +649,7 @@ impl Agent {
                 },
                 ToolStatus::Denied,
             ),
-            Some(_) => match self
+            Decision::Chosen(_) => match self
                 .invoke_tool(&request.name, request.args.clone(), id, &collector)
                 .await?
             {

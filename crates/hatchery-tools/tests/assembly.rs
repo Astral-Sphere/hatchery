@@ -3,8 +3,9 @@
 
 use std::sync::Arc;
 
-use hatchery_capabilities::{Backends, ToolRegistry};
-use hatchery_kernel::{CheckpointCollector, ToolHost};
+use hatchery_capabilities::{Backends, Tool, ToolRegistry};
+use hatchery_kernel::{ApprovalNeed, CheckpointCollector, ToolHost};
+use hatchery_protocol::ApprovalOption;
 use hatchery_testkit::MemoryFs;
 use tokio_util::sync::CancellationToken;
 
@@ -27,13 +28,21 @@ fn registry_on_disk(root: &std::path::Path) -> ToolRegistry {
 }
 
 fn registry_on(fs: Arc<MemoryFs>) -> ToolRegistry {
+    registry_with(fs, hatchery_tools::chat_tools())
+}
+
+fn code_registry_on(fs: Arc<MemoryFs>) -> ToolRegistry {
+    registry_with(fs, hatchery_tools::code_tools())
+}
+
+fn registry_with(fs: Arc<MemoryFs>, tools: Vec<Arc<dyn Tool>>) -> ToolRegistry {
     let backends = Backends {
         fs,
         terminal: Arc::new(hatchery_capabilities::NoTerminal),
         checkpointer: None,
     };
     let mut registry = ToolRegistry::new(backends);
-    for tool in hatchery_tools::chat_tools() {
+    for tool in tools {
         registry.register(tool);
     }
     registry
@@ -60,6 +69,58 @@ fn the_chat_catalogue_is_sorted_and_matches_the_dispatch_table() {
         );
     }
     assert_eq!(snapshot.len(), 3);
+}
+
+#[test]
+fn the_code_catalogue_adds_the_write_pair_and_stays_sorted() {
+    let registry = code_registry_on(Arc::new(MemoryFs::new()));
+    let snapshot = registry.snapshot();
+    let names: Vec<&str> = snapshot.iter().map(|def| def.name.as_str()).collect();
+    assert_eq!(
+        names,
+        ["edit", "glob", "grep", "read_file", "write_file"],
+        "sorted for prompt-cache stability"
+    );
+    for def in &snapshot {
+        assert!(
+            registry.get(&def.name).is_some(),
+            "{} advertised but absent",
+            def.name
+        );
+    }
+}
+
+#[tokio::test]
+async fn code_mode_gates_a_sensitive_path_but_offers_everything_for_an_ordinary_one() {
+    let registry = code_registry_on(Arc::new(MemoryFs::new()));
+
+    let gated = registry
+        .approval_for(
+            "write_file",
+            &serde_json::json!({"path": ".env", "content": "X=1"}),
+            CancellationToken::new(),
+        )
+        .await;
+    let ApprovalNeed::Ask(request) = gated else {
+        panic!("writing .env must ask");
+    };
+    assert_eq!(
+        request.options,
+        [ApprovalOption::AllowOnce, ApprovalOption::Deny],
+        "a hard gate cannot be remembered"
+    );
+
+    let ordinary = registry
+        .approval_for(
+            "write_file",
+            &serde_json::json!({"path": "src/a.txt", "content": "X=1"}),
+            CancellationToken::new(),
+        )
+        .await;
+    let ApprovalNeed::Ask(request) = ordinary else {
+        panic!("a write must ask");
+    };
+    assert_eq!(request.options, ApprovalOption::ALL.to_vec());
 }
 
 #[tokio::test]
@@ -132,12 +193,15 @@ async fn glob_and_grep_see_the_same_workspace_through_the_same_backend() {
 async fn chat_mode_approves_nothing_and_refuses_unknown_tools() {
     let registry = registry_on(Arc::new(MemoryFs::new()));
 
-    // ADR-0005: Chat has no approvals — every registered tool answers None for any arguments.
+    // ADR-0005: Chat has no approvals — every registered tool answers "run it" for any arguments.
     for name in ["read_file", "glob", "grep"] {
         assert!(
-            registry
-                .approval_for(name, &serde_json::json!({}))
-                .is_none(),
+            matches!(
+                registry
+                    .approval_for(name, &serde_json::json!({}), CancellationToken::new())
+                    .await,
+                hatchery_kernel::ApprovalNeed::NotNeeded
+            ),
             "{name} must not demand approval in Chat mode"
         );
     }

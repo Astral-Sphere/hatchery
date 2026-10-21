@@ -65,7 +65,13 @@ pub trait Tool: Send + Sync {
     /// Whether this specific call needs the user's OK.
     ///
     /// `None` for everything a Chat session can ask for; write tools (M2) answer per arguments.
-    fn needs_approval(&self, args: &Value) -> Option<hatchery_protocol::ApprovalRequest>;
+    /// Async and given the same [`ToolCtx`] execution gets because an approval preview has to
+    /// read what the call would overwrite (D14) — through the seam, not around it.
+    async fn needs_approval(
+        &self,
+        ctx: &ToolCtx<'_>,
+        args: &Value,
+    ) -> Option<hatchery_protocol::ApprovalRequest>;
 
     /// A one-line summary of a specific call, for the timeline. The tool owns the meaning;
     /// a generic "name + first argument" fallback lives in [`crate::ToolRegistry`].

@@ -201,6 +201,49 @@ impl ClientProbe {
         );
         stream
     }
+
+    /// Answers this session's approval requests over its own connection, like a second frontend.
+    ///
+    /// The kernel-side `answer_approvals` helper bypasses the wire; this one exists so the
+    /// `approval/respond` path — pending registry, generation, fan-out, `handled` — is covered by
+    /// a test that goes through the daemon. The task ends when the event stream closes; callers
+    /// that need it to stop early can abort the handle.
+    pub async fn answer_approvals(
+        &self,
+        daemon: &TestDaemon,
+        session: SessionId,
+        mut policy: crate::tools::ScriptedApproval,
+    ) -> tokio::task::JoinHandle<()> {
+        let mut events = self.events(daemon, session).await;
+        let socket = daemon.socket.clone();
+        let boot_token = daemon.boot_token.clone();
+        tokio::spawn(async move {
+            let Ok(client) = DaemonClient::connect(&socket).await else {
+                return;
+            };
+            if client.hello(Some(boot_token)).await.is_err() {
+                return;
+            }
+            while let Some(event) = events.next().await {
+                if let hatchery_protocol::ServerEvent::ApprovalRequested { request_id, .. } =
+                    event.event
+                {
+                    let option = policy.next();
+                    // A refusal means the request is gone (cancelled or timed out); the loop
+                    // keeps the connection for the next one rather than ending the script.
+                    let _ = client
+                        .call_raw(
+                            hatchery_protocol::method::APPROVAL_RESPOND,
+                            serde_json::json!({
+                                "request_id": request_id,
+                                "option": option,
+                            }),
+                        )
+                        .await;
+                }
+            }
+        })
+    }
 }
 
 #[cfg(test)]

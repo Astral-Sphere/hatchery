@@ -105,6 +105,23 @@ impl CheckpointCollector {
     }
 }
 
+/// What the approval step decided for one call.
+///
+/// `Refused` exists because a persisted "always deny" rule must refuse **without** asking: making
+/// the kernel pause and emit an `ApprovalNeeded` event for a call the user already refused
+/// forever would flash a dialog on every attempt. `NotNeeded` and `Refused` are both final
+/// answers, so the kernel can distinguish "run it" from "say no" without a second round trip.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ApprovalNeed {
+    /// Run the call; nobody has to be asked.
+    NotNeeded,
+    /// Pause the turn and wait for a human.
+    Ask(ApprovalRequest),
+    /// Do not run the call, and do not ask: a rule already decided. The string is what the model
+    /// is told.
+    Refused(String),
+}
+
 /// The tools available to one turn.
 #[async_trait]
 pub trait ToolHost: Send + Sync {
@@ -122,10 +139,19 @@ pub trait ToolHost: Send + Sync {
 
     /// Whether a call needs the user's approval before it runs.
     ///
-    /// `None` means "run it". `Some(request)` makes the kernel pause the turn, emit an
+    /// `NotNeeded` means "run it". `Ask(request)` makes the kernel pause the turn, emit an
     /// `ApprovalNeeded` event and wait for a decision — the kernel does not know *how* the user is
-    /// asked, only that somebody will answer.
-    fn approval_for(&self, name: &str, args: &Value) -> Option<ApprovalRequest>;
+    /// asked, only that somebody will answer. `Refused` skips both.
+    ///
+    /// Async and given the cancel token because a write tool builds its preview by reading the
+    /// file it is about to replace (D14), and that read goes through the async filesystem seam.
+    /// A synchronous method would have to block a runtime worker or duplicate the seam.
+    async fn approval_for(
+        &self,
+        name: &str,
+        args: &Value,
+        cancel: CancellationToken,
+    ) -> ApprovalNeed;
 
     /// Runs a tool.
     ///

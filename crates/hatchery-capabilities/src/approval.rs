@@ -8,7 +8,7 @@
 
 use async_trait::async_trait;
 
-use hatchery_protocol::{ApprovalOption, ApprovalRequest};
+use hatchery_protocol::{ApprovalId, ApprovalOption, ApprovalRequest};
 
 /// Answers approval requests.
 ///
@@ -17,5 +17,9 @@ use hatchery_protocol::{ApprovalOption, ApprovalRequest};
 #[async_trait]
 pub trait ApprovalGate: Send + Sync {
     /// Asks, and blocks until a human, a rule or the timeout answers.
-    async fn request(&self, request: ApprovalRequest) -> ApprovalOption;
+    ///
+    /// `request_id` is the kernel's own, not one the gate minted: an implementation that routes
+    /// the question through a frontend registers its pending entry under this id, because that is
+    /// the id `approval/respond` will name when the answer comes back.
+    async fn request(&self, request_id: ApprovalId, request: ApprovalRequest) -> ApprovalOption;
 }

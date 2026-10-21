@@ -38,9 +38,9 @@
 //! ```
 //! # use async_trait::async_trait;
 //! # use hatchery_kernel::{
-//! #     AgentBuilder, AgentCommand, ChatOptions, CheckpointCollector, EventSink, HistorySource,
-//! #     HistoryView, KernelError, KernelEvent, LlmError, Message, Ports, StreamEvent, ToolDef,
-//! #     ToolHost, ToolInvocation,
+//! #     AgentBuilder, AgentCommand, ApprovalNeed, ChatOptions, CheckpointCollector, EventSink,
+//! #     HistorySource, HistoryView, KernelError, KernelEvent, LlmError, Message, Ports,
+//! #     StreamEvent, ToolDef, ToolHost, ToolInvocation,
 //! # };
 //! # use hatchery_protocol::{ApprovalRequest, SessionId, ToolCallSummary, ToolOutput, ToolProgress};
 //! # use serde_json::Value;
@@ -68,8 +68,13 @@
 //! #     fn summarize(&self, name: &str, _args: &Value) -> ToolCallSummary {
 //! #         ToolCallSummary::new(name)
 //! #     }
-//! #     fn approval_for(&self, _name: &str, _args: &Value) -> Option<ApprovalRequest> {
-//! #         None
+//! #     async fn approval_for(
+//! #         &self,
+//! #         _name: &str,
+//! #         _args: &Value,
+//! #         _cancel: CancellationToken,
+//! #     ) -> ApprovalNeed {
+//! #         ApprovalNeed::NotNeeded
 //! #     }
 //! #     async fn invoke(
 //! #         &self,
@@ -138,4 +143,4 @@ pub use message::{
 pub use provider::LlmProvider;
 pub use sink::{EventSink, KernelEvent};
 pub use state::{Ports, TurnCompletion, TurnLimits, TurnState};
-pub use tools::{CheckpointCollector, ToolHost, ToolInvocation};
+pub use tools::{ApprovalNeed, CheckpointCollector, ToolHost, ToolInvocation};

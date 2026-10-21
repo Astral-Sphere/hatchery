@@ -61,7 +61,7 @@ impl Tool for ReadFile {
         }
     }
 
-    fn needs_approval(&self, _args: &Value) -> Option<ApprovalRequest> {
+    async fn needs_approval(&self, _ctx: &ToolCtx<'_>, _args: &Value) -> Option<ApprovalRequest> {
         // Chat mode: workspace-relative reads need nobody's permission (ADR-0005). The M2 Code
         // mode adds the outside-workspace approval via its own registry wiring.
         None

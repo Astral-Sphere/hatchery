@@ -18,6 +18,7 @@
 //! `MemoryTerminal`, `TempWorkspace`, `TestDaemon` and `ClientProbe` land with their consumers in
 //! M1–M2; `MemoryFs` and the wire double ([`MockWire`]) arrived with the llm crate's SSE replay.
 
+pub mod approval;
 pub mod daemon;
 pub mod events;
 pub mod fs;

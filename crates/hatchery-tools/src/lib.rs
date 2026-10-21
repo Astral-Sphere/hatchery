@@ -11,9 +11,11 @@
 //! tests that inject only the in-memory backends from `hatchery-testkit`.
 //!
 //! The M1 set is Chat mode's read-only trio (ADR-0005): [`read_file`], [`glob`], [`grep`]. The
-//! pattern engines are ripgrep's `globset` and `regex` — matching only; the walking itself goes
-//! through the `FsBackend` seam (decision D6, docs/worklog/capabilities.md), which is what keeps
-//! these tools testable against `MemoryFs` and portable to ACP-delegated backends.
+//! M2 set adds the write pair — [`write_file`], [`edit`] — which runs in Code mode and asks
+//! before every write; shell tools land with the rest of M2. The pattern engines are ripgrep's
+//! `globset` and `regex` — matching only; the walking itself goes through the `FsBackend` seam
+//! (decision D6, docs/worklog/capabilities.md), which is what keeps these tools testable against
+//! `MemoryFs` and portable to ACP-delegated backends.
 //!
 //! # Example
 //!
@@ -46,14 +48,20 @@
 
 use hatchery_capabilities::Tool;
 
+mod edit;
 mod glob;
 mod grep;
+mod hard_gate;
+mod preview;
 mod read_file;
 mod walk;
+mod write_file;
 
+pub use edit::Edit;
 pub use glob::Glob;
 pub use grep::Grep;
 pub use read_file::{DEFAULT_MAX_BYTES, ReadFile};
+pub use write_file::WriteFile;
 
 /// The `read_file` tool, boxed for registry assembly.
 #[must_use]
@@ -73,6 +81,35 @@ pub fn grep() -> std::sync::Arc<dyn Tool> {
     std::sync::Arc::new(Grep)
 }
 
+/// The `write_file` tool, boxed for registry assembly.
+#[must_use]
+pub fn write_file() -> std::sync::Arc<dyn Tool> {
+    std::sync::Arc::new(WriteFile::new())
+}
+
+/// The `edit` tool, boxed for registry assembly.
+#[must_use]
+pub fn edit() -> std::sync::Arc<dyn Tool> {
+    std::sync::Arc::new(Edit::new())
+}
+
+/// A built-in tool by name, boxed for registry assembly.
+///
+/// There is no per-tool configuration parameter yet: nothing in the tree assembles tools from a
+/// spec (the daemon still calls [`chat_tools`]/[`code_tools`] directly), and an argument every
+/// caller ignores is a seam nobody has tested (ADR-0009).
+#[must_use]
+pub fn builtin(name: &str) -> Option<std::sync::Arc<dyn Tool>> {
+    match name {
+        "read_file" => Some(read_file()),
+        "glob" => Some(glob()),
+        "grep" => Some(grep()),
+        "write_file" => Some(write_file()),
+        "edit" => Some(edit()),
+        _ => None,
+    }
+}
+
 /// Chat mode's toolset, in registration order (the registry sorts for the snapshot).
 ///
 /// The daemon's assembly calls this; keeping the list beside the tools means a new tool cannot
@@ -80,4 +117,13 @@ pub fn grep() -> std::sync::Arc<dyn Tool> {
 #[must_use]
 pub fn chat_tools() -> Vec<std::sync::Arc<dyn Tool>> {
     vec![read_file(), glob(), grep()]
+}
+
+/// Code mode's toolset: Chat's trio plus the write pair.
+///
+/// Same contract as [`chat_tools`] — the list is the decision about what Code may be shown, and
+/// every tool that writes is here and nowhere in Chat.
+#[must_use]
+pub fn code_tools() -> Vec<std::sync::Arc<dyn Tool>> {
+    vec![read_file(), glob(), grep(), write_file(), edit()]
 }

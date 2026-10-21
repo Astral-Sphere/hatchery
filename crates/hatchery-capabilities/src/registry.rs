@@ -13,7 +13,7 @@ use serde_json::Value;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio_util::sync::CancellationToken;
 
-use hatchery_kernel::{CheckpointCollector, KernelError, ToolHost, ToolInvocation};
+use hatchery_kernel::{ApprovalNeed, CheckpointCollector, KernelError, ToolHost, ToolInvocation};
 use hatchery_protocol::{ToolCallSummary, ToolProgress};
 
 use crate::checkpointed_fs::{CheckpointedFs, Checkpointer};
@@ -92,8 +92,29 @@ impl ToolHost for ToolRegistry {
         }
     }
 
-    fn approval_for(&self, name: &str, args: &Value) -> Option<hatchery_protocol::ApprovalRequest> {
-        self.tools.get(name)?.needs_approval(args)
+    async fn approval_for(
+        &self,
+        name: &str,
+        args: &Value,
+        cancel: CancellationToken,
+    ) -> ApprovalNeed {
+        let Some(tool) = self.tools.get(name) else {
+            return ApprovalNeed::NotNeeded;
+        };
+        // The preview reads through the same seam execution uses. Progress is meaningless here
+        // (nothing is running yet), so it is a no-op rather than the turn's channel: a preview
+        // that emitted "progress" would describe work that has not begun.
+        let emit = |_: ToolProgress| {};
+        let ctx = ToolCtx {
+            fs: self.backends.fs.as_ref(),
+            terminal: self.backends.terminal.as_ref(),
+            cancel,
+            emit: &emit,
+        };
+        match tool.needs_approval(&ctx, args).await {
+            Some(request) => ApprovalNeed::Ask(request),
+            None => ApprovalNeed::NotNeeded,
+        }
     }
 
     async fn invoke(
@@ -202,7 +223,11 @@ mod tests {
                 parameters: json!({}),
             }
         }
-        fn needs_approval(&self, _args: &Value) -> Option<hatchery_protocol::ApprovalRequest> {
+        async fn needs_approval(
+            &self,
+            _ctx: &ToolCtx<'_>,
+            _args: &Value,
+        ) -> Option<hatchery_protocol::ApprovalRequest> {
             None
         }
         fn summarize(&self, args: &Value) -> ToolCallSummary {
@@ -280,7 +305,11 @@ mod tests {
                     parameters: json!({}),
                 }
             }
-            fn needs_approval(&self, _args: &Value) -> Option<hatchery_protocol::ApprovalRequest> {
+            async fn needs_approval(
+                &self,
+                _ctx: &ToolCtx<'_>,
+                _args: &Value,
+            ) -> Option<hatchery_protocol::ApprovalRequest> {
                 None
             }
             fn summarize(&self, _args: &Value) -> ToolCallSummary {
@@ -397,7 +426,11 @@ mod tests {
                     parameters: json!({}),
                 }
             }
-            fn needs_approval(&self, _args: &Value) -> Option<hatchery_protocol::ApprovalRequest> {
+            async fn needs_approval(
+                &self,
+                _ctx: &ToolCtx<'_>,
+                _args: &Value,
+            ) -> Option<hatchery_protocol::ApprovalRequest> {
                 None
             }
             fn summarize(&self, _args: &Value) -> ToolCallSummary {

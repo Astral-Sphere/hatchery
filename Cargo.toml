@@ -32,6 +32,9 @@ anyhow = "1.0.104"
 # itself goes through the FsBackend seam so tools stay fs-free and MemoryFs-testable.
 globset = "0.4.20"
 regex = "1.13.1"
+# Write-approval previews (D14): the same structured-diff producer the TUI uses for its own
+# diffs. `text` alone is enough — no inline/serde/git feature reaches the binary.
+similar = { version = "2.7", default-features = false, features = ["text"] }
 async-trait = "0.1.92"
 futures = "0.3.34"
 # ADR-0013: the daemon's local socket on the platform tokio cannot give one to. tokio gates

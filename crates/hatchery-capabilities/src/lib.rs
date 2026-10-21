@@ -51,6 +51,7 @@ mod checkpoint;
 mod checkpointed_fs;
 mod fs;
 mod local_fs;
+mod mode;
 mod registry;
 mod terminal;
 mod tool;
@@ -63,6 +64,7 @@ pub use checkpoint::{
 pub use checkpointed_fs::{CheckpointedFs, Checkpointer, PreWrite};
 pub use fs::{FsBackend, FsEntry, FsError, FsMetadata};
 pub use local_fs::LocalFs;
+pub use mode::ToolPolicy;
 pub use registry::{Backends, ToolRegistry};
 pub use terminal::{
     NoTerminal, TermError, TerminalBackend, TerminalHandle, TerminalOutcome, TerminalSpec,

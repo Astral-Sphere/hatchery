@@ -674,6 +674,56 @@ async fn a_denied_call_becomes_an_error_result_the_model_can_read() {
 }
 
 #[tokio::test]
+async fn a_persisted_deny_rule_refuses_without_asking() {
+    // D8's kernel-side half: a decision the user already made must not produce another prompt.
+    // The difference from `a_denied_call_became_an_error_result...` is exactly the missing
+    // `ApprovalNeeded` event — a test that only checks the result cannot tell the two apart.
+    let provider = ScriptedProvider::new(vec![
+        ScriptedProvider::tool_round("call-1", "write_file", json!({"path": "a.rs"})),
+        ScriptedProvider::text_round("understood"),
+    ]);
+    let tools = ScriptedToolHost::new()
+        .advertising(&["write_file"])
+        .refusing(
+            "write_file",
+            "denied by an approval rule for `write_file`; do not repeat it",
+        )
+        .answering("write_file", ToolOutput::text("must not run"));
+    let harness = Harness::new(
+        provider,
+        tools,
+        MemoryHistory::empty(),
+        TurnLimits::default(),
+    );
+    harness.prompt("write it").await;
+    let events = harness.finish().await;
+
+    assert!(
+        harness.tools.calls().is_empty(),
+        "a refused call must never run"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, KernelEvent::ApprovalNeeded { .. })),
+        "a persisted deny must refuse without asking: {events:?}"
+    );
+    let texts = tool_result_texts(&events);
+    assert!(
+        texts[0].contains("denied by an approval rule"),
+        "the model must be told which rule refused it: {texts:?}"
+    );
+    let call = finished_items(&events)
+        .into_iter()
+        .find(|item| item.kind_tag() == ItemKindTag::ToolCall)
+        .expect("a tool call item");
+    assert!(
+        matches!(call.kind, ItemKind::ToolCall(ref call) if call.status == ToolStatus::Denied),
+        "the item records the refusal"
+    );
+}
+
+#[tokio::test]
 async fn approving_always_still_only_runs_the_call_once() {
     let provider = ScriptedProvider::new(vec![
         ScriptedProvider::tool_round("call-1", "write_file", json!({"path": "a.rs"})),
