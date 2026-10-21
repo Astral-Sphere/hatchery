@@ -135,13 +135,13 @@ pub enum ApprovalPreview { Diff(Diff), Command { argv: Vec<String>, cwd: PathBuf
 
 **③ 审批规则的 list / delete 方法（Phase 2）**。今天一条已持久化的规则**既看不见也撤不掉**：一条误存的 `DenyAlways` 会永久废掉一个工具，除了直接改数据库没有补救。`approval_rules` 表没有排序列也没有 enabled 列（storage.md §2），所以 scope/matcher/decision 的文法与求值顺序由 **D8** 定义，协议只负责把它们列举出来、删掉。
 
-**④ `SessionLoadResult.pending_approvals`（Phase 3）**。`PendingApproval` 今天零 fixture、零消费者；重连的前端拿不到「有一个审批正等着我」，弹层就重画不出来。
+**④ `SessionLoadResult.pending_approvals`（Phase 3，已落地）**。`PendingApproval` 原先零消费者；重连的前端拿不到「有一个审批正等着我」，弹层就重画不出来。`PendingApprovals` 现在按下发时的 session 记录请求，`session/load` 把该会话仍在等待的那些按 id 排序列出；已答复（或超时）的请求在登记表里消失，因此不会在重连时复活。
 
 **硬门不靠新增 `RiskLevel` 变体表达。** `RiskLevel::is_hard_gate()` 只认 `WritesOutside`，而 design/capabilities.md §5 把**工作区内**的 `.env*` 与 `.git/hooks` 也列为硬门——两者对不上。补一个变体是错的方向：新增枚举值属 major bump，而「未知枚举值一律硬失败」是刻意设计（§6），加一个值就要所有前端同步升级。已有的机制够用：`ApprovalRequest::once_only()` 用「不提供 `AllowAlways`/`DenyAlways`」表达「不可记忆」，而 kernel 会拒绝一个没被提供过的答复（kernel/src/agent.rs 的 `await_approval`）。所以路径门要做的只是为工作区内的敏感路径**强制 `once_only`**，协议零改动。
 
 ## 3. 方法（client → daemon）
 
-命名沿用 ACP 风格（`session/*`），便于 ACP 适配层直译。方法名的**单一真相**是 `method.rs` 的 20 个常量（`method::SESSION_PROMPT` 等），单元测试把它与本文档的列表逐条对账——所以**下表只列已接通的**；M2 要加的审批规则 list/delete 方法见 §2.1 ③，加进来时表与常量表一起动。
+命名沿用 ACP 风格（`session/*`），便于 ACP 适配层直译。方法名的**单一真相**是 `method.rs` 的 `ALL` 常量表（`method::SESSION_PROMPT` 等），单元测试把它与本文档的列表逐条对账。M2 Phase 3 起 daemon 服务全部方法（`SERVED_METHODS == ALL` 由 daemon 的测试钉住）；下表即全表。
 
 | 方法 | 参数 / 结果类型 | 说明 |
 |---|---|---|

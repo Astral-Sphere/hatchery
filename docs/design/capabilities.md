@@ -129,6 +129,9 @@ pub struct RestoreOptions {
     pub purge_untracked: bool,
 }
 pub struct RestoreReport { pub safety: SnapshotReport, pub rolled_back: Vec<PathBuf>, pub purged: Vec<PathBuf> }
+// rolled_back 同时算两侧：最后快照与目标之间的差异，以及「快照之后、尚未入快照」的工作区漂移。
+// 快照总在写之前拍，所以后者正是 Code rewind 的常见路径；只报 commit 级差异会说「什么都没回滚」
+// 而文件其实已经被改写。
 
 impl CheckpointStore {
     pub fn open(workspace: &Path, git_dir: &Path, options: &CheckpointOptions) -> Result<Arc<Self>>;
@@ -152,7 +155,7 @@ impl CheckpointStore {
 
 `Diff` **已在 Phase 1 落地**（protocol 的 `Diff/DiffFile/DiffStatus/DiffHunk/DiffLine/DiffLineKind`），草图那个暂定名 `UnifiedDiff` 没有采用：载荷是**结构化 hunk**，不是 unified 文本。理由是 D11 已经裁决 TUI 用 `similar` 算 hunk、git2 侧也原生产出 hunk，两个生产者喂同一个类型，两个前端都不必写 unified-diff 解析器（codex 走文本那条路，为此有 2745 行 `tui/src/diff_render.rs`）。**D14 已落地**：`ApprovalRequest.preview: Option<ApprovalPreview>`（`Diff(Diff) | Command{argv,cwd} | Excerpt(String)`），缺省省略以保持旧 fixture 兼容；`args_digest` 仍是一行摘要。write/edit 的预览读旧文件后算真实 diff，超限退化成 `Excerpt`。
 
-**目前没有 golden fixture 钉 `Diff`，这是对的**：fixture 注册表只覆盖三类东西（`ItemKind` 载荷、方法结果、事件），`Diff` 一类都不是。第一个返回它的方法（Phase 3 的 rewind，或 `checkpoint_diff` 工具）落地时补上。serde 拼写由 protocol 内的单测钉住。
+**目前没有 golden fixture 钉 `Diff`，这是对的**：fixture 注册表只覆盖三类东西（`ItemKind` 载荷、方法结果、事件），`Diff` 一类都不是。`session/rewind` 落地后返回的仍是路径列表而不是 `Diff`，所以它依然没有协议层消费者；第一个会是 `checkpoint_diff` 工具。serde 拼写由 protocol 内的单测钉住。
 
 **另一处 diff 的来源已在 Phase 2 落地**：`write_file`/`edit` 的预览 diff 是「旧缓冲 vs 新内容」，由 tools crate 的 `preview.rs` 用 `similar 2.7`（`default-features = false, features = ["text"]`）算出同一个 `Diff`；它只进 tools，不进 capabilities。
 

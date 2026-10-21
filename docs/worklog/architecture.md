@@ -37,6 +37,18 @@
 
 ## 变更日志
 
+### 2026-10-22 · M2 Phase 3：会话级方法、rewind 三 scope 与重连审批
+
+**交付**：全部协议方法接通（`SERVED_METHODS == m::ALL`，测试钉住），`hello` 广告 chat + code。`session/set_mode` 是重组装路径：turn 闸门内写行、取走旧 runtime 并 `shutdown`、按新模式重新装配，hub 不删所以订阅者不断流，随后发 `ModeSwitched` + `SessionUpdated`；turn 进行中回 `TurnInProgress`；Code 无工作区在写库前拒绝。rewind：Code 腿沿 `rebuild_chain` 向后扫第一个 `ItemKind::Checkpoint` 取 commit（不查 `checkpoints` 表），没有则 no-op；`Both` 先 restore 成功再 `switch_branch`；restore 的安全快照由 capabilities 在破坏前拍，daemon 的 `Checkpoints::restore` 补写 `checkpoints` 行（`item_id = NULL`，写失败只记日志）。分支 list/switch/delete、`edit_item`、rename/delete、`store/export_jsonl` 全部接线；除 list/export 外都在 turn 闸门内并在 turn 进行中拒绝。`SessionLoadResult.pending_approvals` 落地：`PendingApprovals` 的值从 sender 变成 `{session, request, sender}`，`for_session` 按 id 排序返回，答复即移除。
+
+**`edit_item` 的归属查询**：给 `EditItemParams` 加必填 `session_id` 会让 `version_compat` 的「新增字段必须可选」检查红掉（实测），所以协议零改动，改为 store 新增 `session_of_item`——`edit_fork` 本来就要校验归属，答案一直在库里，缺的只是出口。
+
+**实测修正：`RestoreReport.rolled_back` 原来会漏报**。端到端测试里文件确实被恢复，报告却是空列表：`restore_from` 只 diff「最后一个快照 commit vs 目标 commit」，而快照总在写**之前**拍，所以「最后一次快照之后、尚未入快照的写」只存在于工作区。这正是 Code rewind 的常见路径，报告说「什么都没回滚」而文件已被改写。改成 commit 级差异 ∪ `diff_tree_to_workdir_with_index` 的 tracked 漂移（不含 untracked，purge 单列），排序去重。
+
+**`purge_untracked: true` 拒绝**：capabilities §2 要求审批 + 先列出待删清单，协议没有取清单的方法；静默删除用户未跟踪文件是 rewind 唯一不可接受的失败形态，所以 daemon 返回 `InvalidRequest`，而不是把 `false` 以外的值当成「用户已同意」。
+
+**验证**：`cargo nextest` 全绿（manager 侧的 rewind/分支/模式用例、`pending_requests_are_listed_per_session_and_disappear_once_answered`、`the_session_surgery_methods_round_trip_through_dispatch`）；clippy `-D warnings` 干净。未做：`purge_untracked` 的清单/审批流程、rewind 与 `set_mode` 的活 runtime e2e（Phase 7 场景 3/4）。
+
 ### 2026-10-21 · M2 Phase 2：写路径、审批管线与硬门
 
 **交付**：protocol 的 `ApprovalPreview::{Diff, Command, Excerpt}`（D14，结构化 hunk，`preview` 可选且缺省不序列化）、`ApprovalScope`/`ApprovalRule`/`ApprovalRuleId`、`approval/rules/{list,delete}` 及其 fixture；store 的 `record_approval_rule`/`approval_rules`/`delete_approval_rule`；tools 的 `write_file`、`edit`（精确单次替换）、`hard_gate`（`.env*`、`.git/hooks/**`）与 `preview`（`similar 2.7`，超限退 `Excerpt`）；capabilities 的异步 `Tool::needs_approval`、`ToolPolicy`、`ApprovalGate::request(request_id, …)`；kernel 的 `ApprovalNeed::{NotNeeded, Ask, Refused}` 与 `ToolHost::approval_for` 异步化；daemon 的 `approvals.rs`（pending 注册表、fail-closed gate、`GatedTools`、pump）、`[approval]` 配置与 `STRICT_KEYS`、按模式装配、prompt 的 `mode_code`/`tool_discipline`/`project_context`；testkit 的 `ScriptedGate`、`refusing()`、协议级 `answer_approvals`；`invariant_project_config_cannot_disable_hard_gates`。
