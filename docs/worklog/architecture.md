@@ -37,6 +37,22 @@
 
 ## 变更日志
 
+### 2026-10-21 · M2 Phase 2：写路径、审批管线与硬门
+
+**交付**：protocol 的 `ApprovalPreview::{Diff, Command, Excerpt}`（D14，结构化 hunk，`preview` 可选且缺省不序列化）、`ApprovalScope`/`ApprovalRule`/`ApprovalRuleId`、`approval/rules/{list,delete}` 及其 fixture；store 的 `record_approval_rule`/`approval_rules`/`delete_approval_rule`；tools 的 `write_file`、`edit`（精确单次替换）、`hard_gate`（`.env*`、`.git/hooks/**`）与 `preview`（`similar 2.7`，超限退 `Excerpt`）；capabilities 的异步 `Tool::needs_approval`、`ToolPolicy`、`ApprovalGate::request(request_id, …)`；kernel 的 `ApprovalNeed::{NotNeeded, Ask, Refused}` 与 `ToolHost::approval_for` 异步化；daemon 的 `approvals.rs`（pending 注册表、fail-closed gate、`GatedTools`、pump）、`[approval]` 配置与 `STRICT_KEYS`、按模式装配、prompt 的 `mode_code`/`tool_discipline`/`project_context`；testkit 的 `ScriptedGate`、`refusing()`、协议级 `answer_approvals`；`invariant_project_config_cannot_disable_hard_gates`。
+
+**四处偏离，各有机制级理由**：① `DaemonApproval` 住 daemon 而不是 capabilities——它要 hub/session/generation，capabilities 看不到这些；capabilities 只留 trait。② kernel 的 `approval_for` 从同步 `Option` 变成异步三态：预览要读被覆盖的文件（走异步 fs 接缝），而 `DenyAlways` 要能在**不弹窗**的情况下拒绝。③ `matcher` 只有工具名，没有 path glob：UI 的「总是允许」只表达工具级作用域，路径规则的消费者还没出现（atomcode 的 `Edit(src/**)` 是手写权限块的形态，不是审批面板的产物）。④ 硬门只列工作区内可达的 `.env*` 与 `.git/hooks/**`；`~/.ssh`、`~/.config/hatchery` 在工作区外，`LocalFs` 在工具运行前就拒绝，写成审批门是**不可达的声称**。`builtin(spec, &backends)` 也没有按草图加 `backends` 参数：没有 per-tool 配置的读者，按 ADR-0009 不预造。
+
+**请求形状的连带**：`ApprovalRequest` 新增可选 `preview`，旧 fixture 不变（缺省省略）；`ApprovalGate` 多了 `request_id`，因为 pending 必须登记在 kernel 将用来回答的那个 id 下。pending 在 publish **之前**登记，否则脚本化前端的微秒级回答会撞上「waiter 还没注册」并白等到超时。
+
+**验证**：`./scripts/ci.sh` 八步全绿（toolchain fmt clippy build tests invariants doctests determinism，i18n 仍明示未设门禁）；全量 nextest 全绿（含新 invariant；fixture 更新随协议提交）。未做：daemon 全链路审批 e2e（需脚本化 provider 走工具调用，Phase 7 场景 6）、`TerminalBackend` 契约腿（M3）、`session/set_mode` 与 `hello` 广告 code（Phase 3）。
+
+### 2026-10-21 · D10 的 Windows 栏顺延到 TUI 之后（用户裁决）
+
+用户裁决：Windows CI 确实有问题，但可以等 TUI 做完之后再到 Windows 开发机上修理，现在先推进 Phase 2。
+
+落档口径（roadmap 的 D10 行、Phase 4 行与风险 1 已同步）：**D10 仍未关闭**；顺延的是 Windows 那一栏的两件事——修 `spikes/pty` 里从未执行过的 PowerShell payload，以及在 Windows 开发机上取数。后果写明：Phase 4 的 `LocalPty` 只能按 Linux（+ 可跑的 macOS）结论实现，Windows 的 child 替换（codex 那条自带 ConPTY + Job Object 的路）**不在 Phase 4 范围内**；M2 的三平台 CI 里 windows-gnu 仍跑普通测试，只是不跑 PTY 探针。这不是砍范围而是排期，TUI 收口时这条要重新排期——顺延表刻意没有收它。
+
 ### 2026-10-08 · M2 Phase 1 顺带对账：七个 crate README 的层号还是 M0b 之前的
 
 §3 的层号在 M0b 那次「protocol 沉淀为唯一最底层、其余各层顺次 +1」之后变过，但 crate README 结尾那行 `Workspace layer **LN**` 没跟着改，于是 10 个里有 7 个是错的（kernel L0→**L1**、llm/store/capabilities L1→**L2**、tools/acp L2→**L3**、daemon L3→**L4**；protocol 的 L0 与 cli/gui 的 D 本来就对）。Phase 0 那轮 README 对账改的是**内容声称**（工具数量、检查点是否已存在），没核这一行——它看起来像元数据，其实同样是会被引用的事实：读者据此判断「这个 crate 能不能依赖那个 crate」。已全部改正，与 §3 的图逐项核对。

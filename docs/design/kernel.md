@@ -126,7 +126,12 @@ kernel 只认一个**窄接口**。`Tool`、`ToolCtx` 与 `FsBackend`/`TerminalB
 pub trait ToolHost: Send + Sync {
     fn snapshot(&self) -> Vec<ToolDef>;                        // turn 开始时冻结一次
     fn summarize(&self, name: &str, args: &Value) -> ToolCallSummary;
-    fn approval_for(&self, name: &str, args: &Value) -> Option<ApprovalRequest>;
+    fn approval_for(
+        &self,
+        name: &str,
+        args: &Value,
+        cancel: CancellationToken,
+    ) -> ApprovalNeed;                                  // M2 Phase 2：NotNeeded | Ask(request) | Refused(reason)
     async fn invoke(
         &self,
         name: &str,

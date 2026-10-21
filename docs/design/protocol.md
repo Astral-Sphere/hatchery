@@ -160,6 +160,8 @@ pub enum ApprovalPreview { Diff(Diff), Command { argv: Vec<String>, cwd: PathBuf
 | `session/rewind` | `RewindParams` → `RewindResult` | 对话/代码/两者回滚（`purge_untracked` 默认 false） |
 | `session/delete` \| `session/rename` | `…Params` → `…Result` | 会话管理 |
 | `approval/respond` | `ApprovalRespondParams` → `ApprovalRespondResult` | `request_id` + 选项；重复答复幂等（`handled: false`） |
+| `approval/rules/list` | `ApprovalRulesListParams` → `ApprovalRulesListResult` | 列出已持久化的 allow/deny 规则；可按会话收窄到「全局 + 该工作区」 |
+| `approval/rules/delete` | `ApprovalRulesDeleteParams` → `ApprovalRulesDeleteResult` | 删一条规则；误存的 `DenyAlways` 因此可撤销（删不存在返回 `deleted: false`） |
 | `config/get` \| `config/set` | `ConfigGetParams`/`ConfigSetParams` | 分层配置读写，返回 per-key `origin` |
 | `prompt/render` | `PromptRenderParams` → `PromptRenderResult` | 导出完整 system prompt + 每 section 来源 |
 | `store/export_jsonl` | `ExportJsonlParams` → `ExportJsonlResult` | 审计导出（ADR-0002） |

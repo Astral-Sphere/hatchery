@@ -102,11 +102,11 @@ M1 的 handle 只有 `wait()`（进程结束后一次性返回全部输出）与
 
 ### 本地实现（本 crate 提供）
 
-三者中只有 `LocalFs` 的**只读路径**已落地（M1）；`LocalFs` 的写路径、`LocalPty`、`DaemonApproval` 都是 M2（Phase 1 / 4 / 2），今天是设计而非代码。
+三者中 `LocalFs` 的只读与写路径、`DaemonApproval` 已落地（M2 Phase 1 / Phase 2）；`LocalPty` 仍是 Phase 4，今天是设计而非代码。
 
 - `LocalFs`：tokio::fs + 路径校验（工作区逃逸检查、危险路径硬门）+ **写前打影子 Git 检查点**。
 - `LocalPty`：实现 TerminalBackend；PTY 会话注册表（后台进程、复用、超时杀进程）；输出环形缓冲（截断保护，借鉴 codex unified_exec）。**库选型 = D10**（spike 提前到 M2 Phase 1 并行做，实现落 Phase 4）：候选 `portable-pty`（codex 用 `portable-pty = "0.9.0"`，references/codex/codex-rs/Cargo.toml:422），但它在 Windows 侧还要额外挂带 `jobapi`/`jobapi2` 的 `winapi`（references/codex/codex-rs/utils/pty/Cargo.toml）——即 Job Object，因为**杀 PTY 不留孤儿孙进程**要靠它，而那正是「cancel 后无孤儿进程（`kill -0` 断言）」这条测试在 windows-gnu CI 上的坑。spike 必须在三平台上实测孤儿进程、取消与输出流后再定。
-- `DaemonApproval`：把 ApprovalRequest 经 EventSink 发 `ApprovalRequested` 协议事件，等待前端 `approval/respond`；查询/写入 `approval_rules` 持久化规则；超时策略 = deny（fail-closed，借鉴 dsh）。
+- `DaemonApproval`：**实现住 daemon 的 `src/approvals.rs`，不在这里**——它要 hub、session 与 generation 来发 `ApprovalRequested`，capabilities 看不到这些；本 crate 只保留 `ApprovalGate` trait。落地形状：pending 注册表按 kernel 给的 `request_id` 登记 waiter（**先登记再 publish**，否则脚本化前端会撞上未注册的窗口）、超时答 deny（fail-closed）、`approval/respond` 路由到该 runtime 的 `AgentCommand::decide`。`AllowAlways/DenyAlways` 在决定之后写 `approval_rules`，下一次 `approval_for` 由 daemon 的 `GatedTools` 装饰器先读规则（拒绝优先、与行序无关；读取失败转成「问」）。
 
 ### 委派实现（hatchery-acp 提供，实现同样的 trait）
 
@@ -150,11 +150,11 @@ impl CheckpointStore {
 - **`snapshot` 的签名里没有 `item: ItemId`**：item 是 kernel 在工具返回**之后**才造的，打点那一刻没有 id 可给。关联由 `checkpoints` 行（`item_id`）与 Checkpoint item 自己的载荷（`commit_id`）承担，两者都比 commit message 里塞一个字符串强。
 - **commit id 是 `String` 不是新类型 `CommitId`**：protocol 的 `Checkpoint.commit_id` 已经是 `String`，再引入一个同值类型只会在边界上添一次可失败的转换。
 
-`Diff` **已在 Phase 1 落地**（protocol 的 `Diff/DiffFile/DiffStatus/DiffHunk/DiffLine/DiffLineKind`），草图那个暂定名 `UnifiedDiff` 没有采用：载荷是**结构化 hunk**，不是 unified 文本。理由是 D11 已经裁决 TUI 用 `similar` 算 hunk、git2 侧也原生产出 hunk，两个生产者喂同一个类型，两个前端都不必写 unified-diff 解析器（codex 走文本那条路，为此有 2745 行 `tui/src/diff_render.rs`）。注意 `ApprovalRequest` 仍装不下 diff：它只有 `args_digest: String`，其文档明写不是原始 JSON；审批要预览 diff 得走 D14 的结构化 preview 字段——那时 preview 的类型就直接是这个 `Diff`。
+`Diff` **已在 Phase 1 落地**（protocol 的 `Diff/DiffFile/DiffStatus/DiffHunk/DiffLine/DiffLineKind`），草图那个暂定名 `UnifiedDiff` 没有采用：载荷是**结构化 hunk**，不是 unified 文本。理由是 D11 已经裁决 TUI 用 `similar` 算 hunk、git2 侧也原生产出 hunk，两个生产者喂同一个类型，两个前端都不必写 unified-diff 解析器（codex 走文本那条路，为此有 2745 行 `tui/src/diff_render.rs`）。**D14 已落地**：`ApprovalRequest.preview: Option<ApprovalPreview>`（`Diff(Diff) | Command{argv,cwd} | Excerpt(String)`），缺省省略以保持旧 fixture 兼容；`args_digest` 仍是一行摘要。write/edit 的预览读旧文件后算真实 diff，超限退化成 `Excerpt`。
 
 **目前没有 golden fixture 钉 `Diff`，这是对的**：fixture 注册表只覆盖三类东西（`ItemKind` 载荷、方法结果、事件），`Diff` 一类都不是。第一个返回它的方法（Phase 3 的 rewind，或 `checkpoint_diff` 工具）落地时补上。serde 拼写由 protocol 内的单测钉住。
 
-另有一处 diff **仍没有来源**：`git2` 出的是检查点之间（commit → commit）的 diff，而 `write_file`/`edit` 的**预览** diff 是「旧缓冲 vs 新内容」、此时还没有 commit。这需要独立的 diff 能力（D11 的证据：atomcode 用 `similar = "2"`，references/atomcode/Cargo.toml:40），**目前仍不在任何依赖表里**——Phase 2 的 `edit` 预览或 Phase 6 的 diff 视图谁先到谁引入，产出同一个 `Diff` 类型。
+**另一处 diff 的来源已在 Phase 2 落地**：`write_file`/`edit` 的预览 diff 是「旧缓冲 vs 新内容」，由 tools crate 的 `preview.rs` 用 `similar 2.7`（`default-features = false, features = ["text"]`）算出同一个 `Diff`；它只进 tools，不进 capabilities。
 
 ### D9：预算熔断（用户裁决 2026-10-08）
 
@@ -289,6 +289,8 @@ fn assemble(mode: &SessionMode, backends: Backends) -> ToolRegistry {
 ### 「规则不可 allow-always」怎么表达（不动 `RiskLevel`）
 
 四条硬门路径里有两条（`.env*`、`.git/hooks`）在**工作区内**，所以风险级本身表达不了它们：`RiskLevel::is_hard_gate()`（crates/hatchery-protocol/src/approval.rs:34）只认 `WritesOutside`。**不新增枚举变体**——新增枚举值属协议 major bump。改用已有机制：`ApprovalRequest::once_only()` 已经用「不提供 always 选项」表达了「不可记忆」，路径门只需要能为工作区内的敏感路径**强制 `once_only`**。于是「规则表不可 allow-always」的准确含义是：这类请求**根本不提供 AllowAlways 这个选项**，而不是让人存了一条规则再在求值时拦下来。
+
+**D8 落地的形状（2026-10-21）**：`approval_rules.scope` 存 `global` 或 `workspace:<规范化路径>`；`matcher` 只存工具名（审批面板的「总是」只表达工具级作用域；手写路径 glob 的消费者还没出现），`decision` 只接受 `allow_always`/`deny_always`。求值**拒绝优先且与行序无关**——表没有排序列，按 `created_at` 排会把插入时刻变成隐藏语义；`DenyAlways` 命中时不弹窗（kernel 的 `approval_for` 返回 `Refused`），allow 规则永不作用于 `once_only` 请求。daemon 的 `GatedTools` 同时读 DB 规则与 `[approval]` 配置，任一来源的 deny 都先生效；规则读取失败转成「问」，因为此时既不能信 allow 也不能替用户 deny。项目层写 `approval.allow/deny` 被 `STRICT_KEYS` 丢弃并记 error 日志——仓库不能给自己预授权（invariant 5 的配置腿）。
 
 ### 凭据脱敏的位置：接缝，不是存储（更正）
 
