@@ -10,9 +10,10 @@
 //! * A key outside the schema — or a known key whose value has the wrong type — is **ignored
 //!   with a warning**, never a hard parse failure of the whole file: a typo in `[ui]` must not
 //!   take down `[providers]`, and one bad key must not reset a whole provider.
-//! * A security-relevant key that fails to parse must take its **strictest default** and log at
-//!   error level. M1 has no such keys yet (the write-path approval rules arrive in M2), so that
-//!   mechanism is not wired yet — [`STRICT_KEYS`] exists as its seam and must not grow first.
+//! * A security-relevant key is held to the strict path: a **project-layer** assignment is
+//!   dropped with an error log (a repository cannot grant itself approvals), and a value of the
+//!   wrong type is dropped rather than coerced, so the typed reader falls back to the strictest
+//!   default. [`STRICT_KEYS`] names the keys this applies to.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -96,6 +97,10 @@ fn builtin_document() -> toml::Table {
     document.insert(
         "checkpoints".to_owned(),
         toml_value_of(&BuiltinCheckpoints::default()),
+    );
+    document.insert(
+        "approval".to_owned(),
+        toml_value_of(&BuiltinApproval::default()),
     );
     document.insert("providers".to_owned(), toml::Value::Table(providers));
     document
@@ -184,13 +189,35 @@ impl Default for BuiltinCheckpoints {
     }
 }
 
+/// The `[approval]` keys M2 reads.
+///
+/// `allow` and `deny` are user-declared pre-authorizations — the same shape atomcode's
+/// `permission_rules` uses — and they are deliberately **not** settable from the project layer:
+/// a repository must not be able to pre-authorize its own writes (invariant 5). The timeout is
+/// the gate's fail-closed answer, which is why its floor is one second rather than zero (zero
+/// would deny before anyone could read the prompt).
+#[derive(Clone, Debug, Serialize)]
+pub struct BuiltinApproval {
+    /// Seconds the local gate waits before answering deny.
+    pub timeout_seconds: u64,
+}
+
+impl Default for BuiltinApproval {
+    fn default() -> Self {
+        Self {
+            timeout_seconds: 120,
+        }
+    }
+}
+
 /// Keys whose parse failure must not degrade (M2's approval rules and friends).
 ///
-/// The strict path — drop, log at error level, typed reader falls back to the strictest default —
-/// is an M2 mechanism: M1 has no security-relevant keys yet, so the list is empty and the only
-/// pinned behaviour is that it is empty. Nothing reads it yet; wiring it into `filter_keys` and
-/// the typed readers is the M2 task, so the list must not silently grow before that.
-const STRICT_KEYS: &[&str] = &[];
+/// The strict path has two halves, both wired now: a **project-layer** assignment to one of these
+/// keys is dropped with an error log (a repository cannot narrow or widen its own approval
+/// surface), and a value of the wrong type is dropped rather than coerced. The typed reader then
+/// falls back to the strictest default — empty lists — so a corrupt user file cannot silently
+/// grant anything.
+const STRICT_KEYS: &[&str] = &["approval.allow", "approval.deny"];
 
 /// True when the dotted key path is one this build reads.
 #[must_use]
@@ -205,6 +232,9 @@ pub fn is_known_key(path: &str) -> bool {
         "checkpoints.global_budget_mb",
         "checkpoints.max_file_mb",
         "checkpoints.ignore_rules",
+        "approval.timeout_seconds",
+        "approval.allow",
+        "approval.deny",
     ];
     if known_static.contains(&path) || STRICT_KEYS.contains(&path) {
         return true;
@@ -231,9 +261,12 @@ pub fn is_known_key(path: &str) -> bool {
         ),
         // Whole-table keys: an assignment like `providers = …` restructures the schema, so it
         // is treated as unknown rather than honoured.
-        (Some("ui") | Some("daemon") | Some("checkpoints") | Some("providers"), None, None) => {
-            false
-        }
+        (
+            Some("ui") | Some("daemon") | Some("checkpoints") | Some("providers")
+            | Some("approval"),
+            None,
+            None,
+        ) => false,
         _ => false,
     }
 }
@@ -480,6 +513,44 @@ impl LayeredConfig {
         }
     }
 
+    /// The `[approval]` view.
+    ///
+    /// A timeout below one second is clamped rather than honoured: zero would deny before a
+    /// frontend could render the question, which is indistinguishable from "never ask".
+    #[must_use]
+    pub fn approval(&self) -> ApprovalConfig {
+        let defaults = BuiltinApproval::default();
+        let inner = self.inner.read().expect("config is not poisoned");
+        let value = &inner.effective;
+        let seconds = value
+            .get_dotted("approval.timeout_seconds")
+            .and_then(toml::Value::as_integer)
+            .filter(|seconds| *seconds >= 0)
+            .map_or(defaults.timeout_seconds, |seconds| seconds as u64)
+            .max(1);
+        let list = |key: &str| -> Vec<String> {
+            value
+                .get_dotted(key)
+                .and_then(toml::Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(toml::Value::as_str)
+                        .map(str::trim)
+                        // An empty matcher would look like a rule while applying to nothing.
+                        .filter(|item| !item.is_empty())
+                        .map(str::to_owned)
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        ApprovalConfig {
+            timeout: std::time::Duration::from_secs(seconds),
+            allow: list("approval.allow"),
+            deny: list("approval.deny"),
+        }
+    }
+
     /// Every configured provider, built-ins deep-merged under the user's entries.
     #[must_use]
     pub fn providers(&self) -> BTreeMap<String, ProviderConfig> {
@@ -550,6 +621,21 @@ pub struct CheckpointsConfig {
     pub ignore_rules: Vec<String>,
 }
 
+/// The `[approval]` view, typed.
+///
+/// `allow`/`deny` hold tool names (D8: the UI's "always" options are tool-wide, so a rule is
+/// too). Deny wins over allow regardless of where each came from; the daemon's rule decorator
+/// merges these with the rows in `approval_rules`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ApprovalConfig {
+    /// How long the local gate waits before answering deny.
+    pub timeout: std::time::Duration,
+    /// Tools the user pre-authorized, by name.
+    pub allow: Vec<String>,
+    /// Tools the user pre-refused, by name.
+    pub deny: Vec<String>,
+}
+
 /// Per-key validation of a layer document: unknown dotted keys are dropped, loudly, and so are
 /// known keys whose value has the wrong type (the typed views then take their defaults, and the
 /// warning says which key and layer were dropped).
@@ -567,6 +653,14 @@ fn filter_keys(value: toml::Value, prefix: String, origin: ConfigOrigin) -> Opti
                 Some(child) => child,
                 None => continue,
             }
+        } else if STRICT_KEYS.contains(&path.as_str()) && origin == ConfigOrigin::Project {
+            // The strict half that is about *who* may set the key, not about parsing it: a
+            // repository does not get to pre-authorize its own writes (invariant 5).
+            tracing::error!(
+                key = %path,
+                "project configuration cannot set a security key; ignored"
+            );
+            continue;
         } else if is_known_key(&path) {
             if type_accepts(&path, &child) {
                 child
@@ -603,6 +697,13 @@ fn recurses_into(path: &str) -> bool {
     depth <= 2 && !path.ends_with(".http_headers")
 }
 
+/// Whether `value` is an array of strings (the shape of `approval.allow` / `approval.deny`).
+fn is_string_array(value: &toml::Value) -> bool {
+    value
+        .as_array()
+        .is_some_and(|items| items.iter().all(toml::Value::is_str))
+}
+
 /// Whether `value` has the type the schema gives `path`. Unknown leaves answer `true`: they are
 /// somebody else's rejection.
 fn type_accepts(path: &str, value: &toml::Value) -> bool {
@@ -616,6 +717,9 @@ fn type_accepts(path: &str, value: &toml::Value) -> bool {
         ("checkpoints.global_budget_mb", toml::Value::is_integer),
         ("checkpoints.max_file_mb", toml::Value::is_integer),
         ("checkpoints.ignore_rules", toml::Value::is_str),
+        ("approval.timeout_seconds", toml::Value::is_integer),
+        ("approval.allow", is_string_array),
+        ("approval.deny", is_string_array),
     ];
     if let Some((_, check)) = static_types.iter().find(|(key, _)| *key == path) {
         return check(value);
@@ -922,15 +1026,73 @@ mod tests {
     }
 
     #[test]
-    fn strict_keys_exist_as_a_mechanism() {
-        assert!(
-            STRICT_KEYS.is_empty(),
-            "M1 has no security keys yet; M2 adds them"
-        );
-        assert!(is_known_key("providers.deepseek.retry.backoff_ms"));
+    fn strict_keys_are_known_and_non_empty() {
+        assert_eq!(STRICT_KEYS, &["approval.allow", "approval.deny"]);
+        for key in STRICT_KEYS {
+            assert!(is_known_key(key), "{key} must be a schema key");
+        }
         assert!(
             !is_known_key("providers"),
             "whole-table assignments are not honoured"
+        );
+        assert!(
+            !is_known_key("approval"),
+            "whole-table assignments are not honoured"
+        );
+    }
+
+    /// Invariant 5's config-side leg: a repository may declare its own UI, but it must not be
+    /// able to pre-authorize the writes an agent makes inside it.
+    #[test]
+    fn a_project_config_cannot_grant_itself_approval() {
+        let config = LayeredConfig::from_layers(vec![(
+            ConfigOrigin::Project,
+            table("[approval]\nallow = [\"write_file\"]\ndeny = [\"read_file\"]\n"),
+        )]);
+        let approval = config.approval();
+        assert!(
+            approval.allow.is_empty(),
+            "a project must not pre-authorize writes"
+        );
+        assert!(
+            approval.deny.is_empty(),
+            "a project must not silently disable reads either"
+        );
+    }
+
+    #[test]
+    fn a_user_config_can_declare_rules_and_the_timeout() {
+        let config = LayeredConfig::from_layers(vec![(
+            ConfigOrigin::User,
+            table(
+                "[approval]\nallow = [\"write_file\", \" \"]\ndeny = [\"shell\"]\ntimeout_seconds = 5\n",
+            ),
+        )]);
+        let approval = config.approval();
+        assert_eq!(approval.allow, ["write_file"], "blank rules are dropped");
+        assert_eq!(approval.deny, ["shell"]);
+        assert_eq!(approval.timeout, std::time::Duration::from_secs(5));
+    }
+
+    #[test]
+    fn a_badly_typed_strict_key_is_dropped_rather_than_granting_anything() {
+        let config = LayeredConfig::from_layers(vec![(
+            ConfigOrigin::User,
+            table("[approval]\nallow = \"write_file\"\n"),
+        )]);
+        assert!(config.approval().allow.is_empty());
+    }
+
+    #[test]
+    fn the_approval_timeout_has_a_floor_of_one_second() {
+        let config = LayeredConfig::from_layers(vec![(
+            ConfigOrigin::User,
+            table("[approval]\ntimeout_seconds = 0\n"),
+        )]);
+        assert_eq!(
+            config.approval().timeout,
+            std::time::Duration::from_secs(1),
+            "zero would deny before a frontend could render the question"
         );
     }
 

@@ -20,9 +20,9 @@ use crate::manager::SessionManager;
 
 /// What this daemon serves, in the order the protocol lists them.
 ///
-/// M1 is the chat loop: sessions, config, prompt rendering. Branch surgery, rewind, approvals
-/// and export arrive with their milestones; a frontend reading this list degrades gracefully
-/// instead of calling into the void.
+/// M1 is the chat loop: sessions, config, prompt rendering. M2 Phase 2 adds the approval round
+/// trip and the rule list/delete pair. Branch surgery, rewind and export arrive with their
+/// milestones; a frontend reading this list degrades gracefully instead of calling into the void.
 const SERVED_METHODS: &[&str] = &[
     m::DAEMON_HELLO,
     m::SESSION_NEW,
@@ -31,6 +31,9 @@ const SERVED_METHODS: &[&str] = &[
     m::SESSION_PROMPT,
     m::SESSION_CANCEL,
     m::SESSION_SET_CONFIG,
+    m::APPROVAL_RESPOND,
+    m::APPROVAL_RULES_LIST,
+    m::APPROVAL_RULES_DELETE,
     m::CONFIG_GET,
     m::CONFIG_SET,
     m::PROMPT_RENDER,
@@ -166,6 +169,49 @@ impl DaemonCore {
                 serde_json::to_value(self.manager.set_config(params).await.map_err(manager)?)
                     .map_err(internal)
             }
+            m::APPROVAL_RESPOND => {
+                let params: m::ApprovalRespondParams =
+                    serde_json::from_value(params).map_err(bad_params)?;
+                let handled = self
+                    .manager
+                    .respond_approval(params.request_id, params.option);
+                serde_json::to_value(m::ApprovalRespondResult { handled }).map_err(internal)
+            }
+            m::APPROVAL_RULES_LIST => {
+                let params: m::ApprovalRulesListParams =
+                    serde_json::from_value(params).map_err(bad_params)?;
+                let all =
+                    self.store.approval_rules(None).await.map_err(|error| {
+                        EventError::new(ErrorCode::StoreError, error.to_string())
+                    })?;
+                let rules = match params.session_id {
+                    None => all,
+                    Some(session_id) => {
+                        let session = self.store.session(session_id).await.map_err(|error| {
+                            EventError::new(ErrorCode::StoreError, error.to_string())
+                        })?;
+                        all.into_iter()
+                            .filter(|rule| match &rule.scope {
+                                hatchery_protocol::ApprovalScope::Global => true,
+                                hatchery_protocol::ApprovalScope::Workspace(path) => {
+                                    session.workspace.as_deref() == Some(path.as_path())
+                                }
+                            })
+                            .collect()
+                    }
+                };
+                serde_json::to_value(m::ApprovalRulesListResult { rules }).map_err(internal)
+            }
+            m::APPROVAL_RULES_DELETE => {
+                let params: m::ApprovalRulesDeleteParams =
+                    serde_json::from_value(params).map_err(bad_params)?;
+                let deleted = self
+                    .store
+                    .delete_approval_rule(params.rule_id)
+                    .await
+                    .map_err(|error| EventError::new(ErrorCode::StoreError, error.to_string()))?;
+                serde_json::to_value(m::ApprovalRulesDeleteResult { deleted }).map_err(internal)
+            }
             m::CONFIG_GET => {
                 let params: m::ConfigGetParams =
                     serde_json::from_value(params).map_err(bad_params)?;
@@ -208,13 +254,21 @@ impl DaemonCore {
                     let session = self.store.session(session_id).await.map_err(|error| {
                         EventError::new(ErrorCode::StoreError, error.to_string())
                     })?;
-                    self.manager.render_prompt(Some(&session))
+                    let names = SessionManager::tool_names_for(&session.mode);
+                    self.manager
+                        .render_prompt(&session.mode, &names, session.workspace.as_deref())
                 }
             },
-            // A bare mode: nothing is running, so a fresh render is the only answer.
-            // `params.mode` is not read yet because Chat is the only mode with a prompt — the
-            // Code variant is M2 Phase 2.
-            None => self.manager.render_prompt(None),
+            // A bare mode: nothing is running, so a fresh render is the only answer. The tool
+            // list comes from the same policy assembly uses, so the prompt describes the
+            // catalogue this mode would actually advertise.
+            None => {
+                let mode = params
+                    .mode
+                    .unwrap_or_else(hatchery_protocol::SessionModeId::chat);
+                let names = SessionManager::tool_names_for(&mode);
+                self.manager.render_prompt(&mode, &names, None)
+            }
         };
         serde_json::to_value(crate::prompt::render_result(&sections)).map_err(internal)
     }
@@ -513,7 +567,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prompt_render_lists_four_sections() {
+    async fn prompt_render_lists_the_chat_pipeline() {
         let (_dir, core, _config) = core().await;
         let rendered = core
             .dispatch(&request(
@@ -524,7 +578,18 @@ mod tests {
         let result: m::PromptRenderResult =
             serde_json::from_value(rendered.result.expect("ok")).expect("typed");
         let ids: Vec<&str> = result.sections.iter().map(|s| s.id.as_str()).collect();
-        assert_eq!(ids, ["identity", "mode_chat", "environment", "safety_gate"]);
+        // Chat has three read-only tools, so the discipline section is present; a mode with no
+        // tools would omit it.
+        assert_eq!(
+            ids,
+            [
+                "identity",
+                "mode_chat",
+                "environment",
+                "tool_discipline",
+                "safety_gate"
+            ]
+        );
     }
 
     #[test]
@@ -578,13 +643,18 @@ mod tests {
     }
 
     #[test]
-    fn server_constants_name_what_m1_serves() {
+    fn server_constants_name_what_this_build_serves() {
         assert!(SERVED_METHODS.contains(&m::SESSION_PROMPT));
-        assert!(!SERVED_METHODS.contains(&m::SESSION_REWIND), "rewind is M2");
         assert!(
-            !SERVED_METHODS.contains(&m::APPROVAL_RESPOND),
-            "approvals are M2"
+            !SERVED_METHODS.contains(&m::SESSION_REWIND),
+            "rewind is M2 later"
         );
+        assert!(
+            SERVED_METHODS.contains(&m::APPROVAL_RESPOND),
+            "the approval round trip is Phase 2"
+        );
+        assert!(SERVED_METHODS.contains(&m::APPROVAL_RULES_LIST));
+        assert!(SERVED_METHODS.contains(&m::APPROVAL_RULES_DELETE));
         assert!(is_request(&Incoming::Request(request(
             "x",
             serde_json::json!({})

@@ -181,6 +181,13 @@ pub struct HubSink {
     /// submits, which is earlier than the kernel's own state machine can say so, and this is
     /// what hands the truth back.
     in_flight: Arc<AtomicBool>,
+    /// Approval questions for this runtime's pump. The sink does not publish them itself: the
+    /// gate registers its waiter before publishing, which is what closes the answer-before-
+    /// registration race.
+    approvals: tokio::sync::mpsc::UnboundedSender<(
+        hatchery_protocol::ApprovalId,
+        hatchery_protocol::ApprovalRequest,
+    )>,
 }
 
 impl HubSink {
@@ -193,6 +200,10 @@ impl HubSink {
         store: Arc<dyn SessionStore>,
         workspace: Option<std::path::PathBuf>,
         in_flight: Arc<AtomicBool>,
+        approvals: tokio::sync::mpsc::UnboundedSender<(
+            hatchery_protocol::ApprovalId,
+            hatchery_protocol::ApprovalRequest,
+        )>,
     ) -> Self {
         Self {
             session,
@@ -201,6 +212,7 @@ impl HubSink {
             store,
             workspace,
             in_flight,
+            approvals,
         }
     }
 
@@ -327,10 +339,9 @@ impl EventSink for HubSink {
                 request_id,
                 request,
             } => {
-                self.publish(ServerEvent::ApprovalRequested {
-                    request_id,
-                    request,
-                });
+                // The pump's gate registers the waiter and publishes the event. Sending is
+                // non-blocking, so a stalled human never stalls this session's item events.
+                let _ = self.approvals.send((request_id, request));
             }
             KernelEvent::TurnStarted { turn } => {
                 if let Err(error) = self
@@ -402,6 +413,10 @@ pub struct RuntimeParts {
     pub echo_reasoning: bool,
     /// The prompt rendered for this assembly, frozen into the runtime (D15).
     pub prompt: Vec<AssembledSection>,
+    /// Requests waiting for `approval/respond`, shared with the daemon's router.
+    pub approvals: Arc<crate::approvals::PendingApprovals>,
+    /// How long the local gate waits before answering deny (fail closed).
+    pub approval_timeout: std::time::Duration,
 }
 
 /// One assembled, running session.
@@ -451,8 +466,11 @@ impl SessionRuntime {
             tools,
             echo_reasoning,
             prompt,
+            approvals,
+            approval_timeout,
         } = parts;
         let in_flight = Arc::new(AtomicBool::new(false));
+        let (approval_tx, approval_rx) = tokio::sync::mpsc::unbounded_channel();
         // Spelled the one way the orphan sweep can find it — see `recorded_workspace`. A row the
         // sweep cannot see makes its workspace look abandoned, and the sweep deletes the repository.
         let workspace = session
@@ -471,15 +489,33 @@ impl SessionRuntime {
             Arc::new(HubSink::new(
                 session.id,
                 generation,
-                hub,
-                store,
-                workspace,
+                Arc::clone(&hub),
+                Arc::clone(&store),
+                workspace.clone(),
                 Arc::clone(&in_flight),
+                approval_tx,
             )),
         );
         let options = ChatOptions::new(session.model.model.clone());
         let (agent, handle) =
             hatchery_kernel::AgentBuilder::new(session.id, options, ports).build();
+        // The pump is the only place that turns a question into a decision. It is spawned after
+        // `build` because it needs the handle, and it starts with an empty channel: no turn can
+        // ask for approval before `spawn` returns.
+        let gate = Arc::new(crate::approvals::DaemonApproval::new(
+            session.id,
+            generation,
+            Arc::clone(&hub),
+            Arc::clone(&approvals),
+            approval_timeout,
+        ));
+        tokio::spawn(crate::approvals::pump_approvals(
+            approval_rx,
+            gate,
+            handle.clone(),
+            Arc::clone(&store),
+            workspace,
+        ));
         let task = tokio::spawn(agent.run());
         Ok(Self {
             session: session.id,
@@ -787,6 +823,7 @@ mod tests {
             Arc::clone(&store),
             Some(workspace.clone()),
             Arc::new(AtomicBool::new(false)),
+            tokio::sync::mpsc::unbounded_channel().0,
         );
         let item = Item::new(
             session.id,
@@ -869,6 +906,7 @@ mod tests {
             Arc::clone(&store),
             None,
             Arc::new(AtomicBool::new(false)),
+            tokio::sync::mpsc::unbounded_channel().0,
         );
         let item = Item::new(
             session.id,

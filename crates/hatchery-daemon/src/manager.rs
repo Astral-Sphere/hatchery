@@ -97,6 +97,8 @@ pub struct SessionManager {
     /// able to make per session, and a test isolates it the way it isolates everything else, by
     /// pointing `data_dir` at a temp dir.
     checkpoints: Arc<crate::checkpoints::Checkpoints>,
+    /// Requests waiting for `approval/respond`.
+    pending: Arc<crate::approvals::PendingApprovals>,
 }
 
 impl SessionManager {
@@ -125,6 +127,7 @@ impl SessionManager {
             providers: Mutex::new(ProviderRegistry::new()),
             prompts_dir,
             checkpoints,
+            pending: Arc::new(crate::approvals::PendingApprovals::new()),
         }
     }
 
@@ -629,7 +632,7 @@ impl SessionManager {
             provider_id,
             echo_reasoning,
         } = self.provider_for(&session.model.model)?;
-        let tools = self.chat_tools(session).await?;
+        let tools = self.tools_for(session).await?;
         // Rendered here and frozen for the runtime's life (D15): re-rendering per turn would move
         // the `environment` section's date and cwd under the provider's prefix cache, which is the
         // stability the rest of the request is built to preserve. Freezing is also what the model
@@ -638,7 +641,11 @@ impl SessionManager {
         // reports the frozen text rather than a fresh render, so "why did the model see this"
         // stays answerable; whether a config change *should* reassemble is daemon.md's open
         // question 5.
-        let prompt = self.render_prompt(Some(session));
+        let prompt = self.render_prompt(
+            &session.mode,
+            &Self::tool_names_for(&session.mode),
+            session.workspace.as_deref(),
+        );
 
         let updated = self
             .store
@@ -654,9 +661,11 @@ impl SessionManager {
                     hub: Arc::clone(&self.hub),
                     provider: Arc::new(provider),
                     provider_id,
-                    tools: Arc::new(tools),
+                    tools,
                     echo_reasoning,
                     prompt,
+                    approvals: Arc::clone(&self.pending),
+                    approval_timeout: self.config.approval().timeout,
                 },
             )
             .await
@@ -729,23 +738,63 @@ impl SessionManager {
         })
     }
 
-    /// The toolset over the session's workspace (or the daemon's cwd).
+    /// Which built-in tools a mode turns on (ADR-0005).
     ///
-    /// Still mode-blind (capabilities.md §4): nothing here reads `session.mode`, so a Code session
-    /// gets the same read-only tools as a Chat one, and the write tools that would use a checkpoint
-    /// arrive in Phase 2. What this does add is the seam they will need — a checkpointer bound to
-    /// this session's workspace — attached on `session.workspace` rather than on the mode, because a
-    /// Chat session has no workspace and so nothing it could write to.
+    /// An unknown mode falls back to Chat's read-only set rather than to everything: a mode the
+    /// daemon has never heard of must not quietly gain write tools. Custom modes need the mode
+    /// registry Phase 3 adds; until then this is the safe direction for a typo.
+    fn policy_for(mode: &hatchery_protocol::SessionModeId) -> hatchery_capabilities::ToolPolicy {
+        match mode.as_str() {
+            hatchery_protocol::SessionModeId::CODE => hatchery_capabilities::ToolPolicy::all(),
+            hatchery_protocol::SessionModeId::CHAT => {
+                hatchery_capabilities::ToolPolicy::including(["read_file", "glob", "grep"])
+            }
+            other => {
+                tracing::warn!(mode = other, "unknown mode; using the Chat tool set");
+                hatchery_capabilities::ToolPolicy::including(["read_file", "glob", "grep"])
+            }
+        }
+    }
+
+    /// The tool names a mode would advertise, without building a registry.
+    ///
+    /// `prompt/render` needs these for a bare mode, and the tool-discipline section needs them at
+    /// assembly; both must derive from the same policy as the registry, or the prompt would
+    /// describe a catalogue the model cannot call.
+    #[must_use]
+    pub fn tool_names_for(mode: &hatchery_protocol::SessionModeId) -> Vec<String> {
+        let policy = Self::policy_for(mode);
+        hatchery_tools::code_tools()
+            .into_iter()
+            .map(|tool| tool.def().name)
+            .filter(|name| policy.allows(name))
+            .collect()
+    }
+
+    /// The tool host over the session's workspace (or the daemon's cwd).
+    ///
+    /// One registry per session, wrapped in [`crate::approvals::GatedTools`] so persisted and
+    /// configured rules answer before the kernel asks. Code mode requires a workspace: the whole
+    /// point of a write tool is a place to write, and a Code session without one would silently
+    /// write into the daemon's cwd.
     ///
     /// # Errors
     ///
-    /// Propagates a backend or checkpoint failure. Failing the assembly rather than degrading to "no
-    /// checkpoints" is deliberate: a session whose writes cannot be undone must not look like one
-    /// that can, and the alternative discovers this on the user's first `write_file`.
-    async fn chat_tools(
+    /// Propagates a backend or checkpoint failure. Failing the assembly rather than degrading to
+    /// "no checkpoints" is deliberate: a session whose writes cannot be undone must not look like
+    /// one that can, and the alternative discovers this on the user's first `write_file`.
+    async fn tools_for(
         &self,
         session: &Session,
-    ) -> Result<hatchery_capabilities::ToolRegistry, ManagerError> {
+    ) -> Result<Arc<dyn hatchery_kernel::ToolHost>, ManagerError> {
+        if session.mode.as_str() == hatchery_protocol::SessionModeId::CODE
+            && session.workspace.is_none()
+        {
+            return Err(ManagerError::new(
+                ErrorCode::InvalidRequest,
+                "code mode requires a workspace: there is nowhere to write",
+            ));
+        }
         let root = session
             .workspace
             .clone()
@@ -768,11 +817,22 @@ impl SessionManager {
             terminal: Arc::new(hatchery_capabilities::NoTerminal),
             checkpointer,
         };
+        let policy = Self::policy_for(&session.mode);
         let mut registry = hatchery_capabilities::ToolRegistry::new(backends);
-        for tool in hatchery_tools::chat_tools() {
-            registry.register(tool);
+        for tool in hatchery_tools::code_tools() {
+            if policy.allows(&tool.def().name) {
+                registry.register(tool);
+            }
         }
-        Ok(registry)
+        let rules = Arc::new(crate::approvals::StoreRules::new(
+            Arc::clone(&self.store),
+            session.workspace.clone(),
+        ));
+        Ok(Arc::new(crate::approvals::GatedTools::new(
+            Arc::new(registry),
+            rules,
+            self.config.approval(),
+        )))
     }
 
     /// The checkpoint facilities: shadow repositories, budgets and the orphan sweep.
@@ -781,17 +841,33 @@ impl SessionManager {
         &self.checkpoints
     }
 
-    /// The prompt for a session, or for a bare mode when there is none.
+    /// Answers a pending approval request.
+    ///
+    /// `false` means no such request is waiting — already answered, timed out, or the turn was
+    /// cancelled. Idempotent by design: two frontends may race to answer the same prompt.
+    pub fn respond_approval(
+        &self,
+        request_id: hatchery_protocol::ApprovalId,
+        option: hatchery_protocol::ApprovalOption,
+    ) -> bool {
+        self.pending.respond(request_id, option)
+    }
+
+    /// The prompt for a mode, over a workspace, with the tool catalogue it will advertise.
     ///
     /// The manager is the assembler: it owns the config layer that supplies `response_language`,
-    /// the session row that supplies the workspace, and the override directory. `prompt/render`
-    /// calls this too, so the transparency answer and the text a request carries cannot drift.
+    /// the override directory and the workspace's project context. `prompt/render` calls this too,
+    /// so the transparency answer and the text a request carries cannot drift.
     #[must_use]
-    pub fn render_prompt(&self, session: Option<&Session>) -> Vec<AssembledSection> {
+    pub fn render_prompt(
+        &self,
+        mode: &hatchery_protocol::SessionModeId,
+        tool_names: &[String],
+        workspace: Option<&std::path::Path>,
+    ) -> Vec<AssembledSection> {
         let overrides = self.config.ui();
-        let workspace = session.and_then(|session| session.workspace.as_deref());
         let env = crate::prompt::environment(workspace, overrides.response_language.as_deref());
-        crate::prompt::render_chat(&env, self.prompts_dir.as_ref())
+        crate::prompt::render(mode, tool_names, &env, self.prompts_dir.as_ref())
     }
 
     /// The prompt a *live* runtime was assembled with, if this session has one.
