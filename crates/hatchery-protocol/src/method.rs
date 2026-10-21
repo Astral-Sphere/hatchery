@@ -10,9 +10,9 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::approval::{ApprovalOption, ApprovalRequest};
+use crate::approval::{ApprovalOption, ApprovalRequest, ApprovalRule};
 use crate::content::Content;
-use crate::id::{ApprovalId, ItemId, SessionId, TurnId};
+use crate::id::{ApprovalId, ApprovalRuleId, ItemId, SessionId, TurnId};
 use crate::item::{Item, ItemKindTag};
 use crate::session::{
     ModelRef, ReasoningEffort, RewindScope, Session, SessionListFilter, SessionModeId,
@@ -53,6 +53,13 @@ pub const SESSION_DELETE: &str = "session/delete";
 pub const SESSION_RENAME: &str = "session/rename";
 /// Answer a pending approval request.
 pub const APPROVAL_RESPOND: &str = "approval/respond";
+/// List the persisted approval rules ("always allow" / "always deny").
+pub const APPROVAL_RULES_LIST: &str = "approval/rules/list";
+/// Delete one persisted approval rule.
+///
+/// Without it a mis-clicked "always deny" would permanently disable a tool with no remedy short
+/// of editing the database (`docs/design/protocol.md` §2.1 ③).
+pub const APPROVAL_RULES_DELETE: &str = "approval/rules/delete";
 /// Read configuration with per-key origins.
 pub const CONFIG_GET: &str = "config/get";
 /// Write runtime configuration overrides.
@@ -80,6 +87,8 @@ pub const ALL: &[&str] = &[
     SESSION_DELETE,
     SESSION_RENAME,
     APPROVAL_RESPOND,
+    APPROVAL_RULES_LIST,
+    APPROVAL_RULES_DELETE,
     CONFIG_GET,
     CONFIG_SET,
     PROMPT_RENDER,
@@ -504,6 +513,39 @@ pub struct PendingApproval {
     pub request: ApprovalRequest,
 }
 
+// ------------------------------------------------- approval/rules/list,delete
+
+/// Parameters of [`APPROVAL_RULES_LIST`].
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApprovalRulesListParams {
+    /// Narrow the list to the rules that apply to this session — its workspace's rules plus the
+    /// global ones. Absent lists every rule this daemon stores.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<SessionId>,
+}
+
+/// Result of [`APPROVAL_RULES_LIST`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApprovalRulesListResult {
+    /// Oldest first, so a UI rendering them in insertion order does not need to sort.
+    pub rules: Vec<ApprovalRule>,
+}
+
+/// Parameters of [`APPROVAL_RULES_DELETE`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApprovalRulesDeleteParams {
+    /// Which rule to remove.
+    pub rule_id: ApprovalRuleId,
+}
+
+/// Result of [`APPROVAL_RULES_DELETE`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApprovalRulesDeleteResult {
+    /// False when the id named no rule. Idempotent for the same reason `approval/respond` is:
+    /// two frontends may race to remove the same rule.
+    pub deleted: bool,
+}
+
 // -------------------------------------------------------------- config/get,set
 
 /// Where a configuration value came from (`docs/design/platform.md` §1.1).
@@ -646,6 +688,8 @@ mod tests {
             "session/delete",
             "session/rename",
             "approval/respond",
+            "approval/rules/list",
+            "approval/rules/delete",
             "config/get",
             "config/set",
             "prompt/render",

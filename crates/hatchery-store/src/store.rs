@@ -10,8 +10,8 @@ use turso::Builder;
 
 use hatchery_protocol::method::{SessionListParams, SessionListResult};
 use hatchery_protocol::{
-    CheckpointId, CheckpointKind, Content, Item, ItemId, Session, SessionId, SessionPatch,
-    Timestamp, TurnCompletion, TurnId,
+    ApprovalOption, ApprovalRule, ApprovalRuleId, ApprovalScope, CheckpointId, CheckpointKind,
+    Content, Item, ItemId, Session, SessionId, SessionPatch, Timestamp, TurnCompletion, TurnId,
 };
 
 use crate::actor::{BranchTree, COMMAND_CAPACITY, Reply, StoreCmd, Writer};
@@ -196,6 +196,52 @@ pub trait SessionStore: Send + Sync {
     /// of it lands or none does, because a half-applied batch leaves the caller holding a number
     /// that describes neither its request nor the table.
     async fn delete_checkpoints(&self, ids: &[CheckpointId]) -> Result<u64, StoreError>;
+
+    /// Records an "always allow" / "always deny" rule and returns it as stored.
+    ///
+    /// Refuses an empty `matcher` and any `decision` that is not a remembered one
+    /// ([`ApprovalRule::is_valid_decision`]) with [`StoreError::Invalid`]: a once-decision is not
+    /// a rule, and an empty matcher would apply to nothing while looking healthy to every reader.
+    /// Both are caller mistakes, so they are reported as such rather than stored — the same
+    /// discipline `record_checkpoint` follows for an empty commit id.
+    ///
+    /// The id and `created_at` are minted here, not chosen by the caller: when a rule was recorded
+    /// is a property of the write, and a caller-supplied clock would let two rules claim the same
+    /// ordering.
+    ///
+    /// `scope` is stored in its [`ApprovalScope::as_storage`] spelling, so one path has one text
+    /// form in this database and a workspace lookup cannot miss a rule over a spelling difference.
+    /// `decision` is stored snake_case (`allow_always`/`deny_always`), the same spelling the wire
+    /// uses.
+    async fn record_approval_rule(
+        &self,
+        scope: ApprovalScope,
+        matcher: &str,
+        decision: ApprovalOption,
+    ) -> Result<ApprovalRule, StoreError>;
+
+    /// Every approval rule, or only those one workspace may apply, oldest first.
+    ///
+    /// `None` returns every rule. `Some(workspace)` returns the `global` rules plus the rules whose
+    /// scope is exactly that workspace: a rule recorded for one checkout must not leak into
+    /// another. Ordering is `created_at ASC, id ASC` — oldest first, with `id` breaking ties —
+    /// because "the first matching rule wins" is a policy only if the order is defined, and the
+    /// engine promises no row order of its own.
+    ///
+    /// A row whose `scope` or `decision` text this build does not understand is skipped with a
+    /// warning rather than failing the whole list: `approval_rules` has no CHECK constraints, so
+    /// one row written by a newer build (or by hand) must not make every rule unreadable. The
+    /// skipped rule is inert, which is the safe failure for a table whose rows grant permission.
+    async fn approval_rules(
+        &self,
+        workspace: Option<&Path>,
+    ) -> Result<Vec<ApprovalRule>, StoreError>;
+
+    /// Deletes one rule by id, reporting whether a row actually went away.
+    ///
+    /// Idempotent: an id that is not there is `Ok(false)`, not an error. A frontend retrying after
+    /// a dropped reply must not see a failure for an operation that already succeeded.
+    async fn delete_approval_rule(&self, id: ApprovalRuleId) -> Result<bool, StoreError>;
 
     /// Writes a session out as JSONL, refusing to overwrite an existing file.
     async fn export_jsonl(
@@ -454,6 +500,35 @@ impl SessionStore for TursoStore {
     async fn delete_checkpoints(&self, ids: &[CheckpointId]) -> Result<u64, StoreError> {
         let ids = ids.to_vec();
         self.ask(|reply| StoreCmd::DeleteCheckpoints { ids, reply })
+            .await
+    }
+
+    async fn record_approval_rule(
+        &self,
+        scope: ApprovalScope,
+        matcher: &str,
+        decision: ApprovalOption,
+    ) -> Result<ApprovalRule, StoreError> {
+        self.ask(|reply| StoreCmd::RecordApprovalRule {
+            scope,
+            matcher: matcher.to_owned(),
+            decision,
+            reply,
+        })
+        .await
+    }
+
+    async fn approval_rules(
+        &self,
+        workspace: Option<&Path>,
+    ) -> Result<Vec<ApprovalRule>, StoreError> {
+        let workspace = workspace.map(Path::to_path_buf);
+        self.ask(|reply| StoreCmd::ApprovalRules { workspace, reply })
+            .await
+    }
+
+    async fn delete_approval_rule(&self, id: ApprovalRuleId) -> Result<bool, StoreError> {
+        self.ask(|reply| StoreCmd::DeleteApprovalRule { id, reply })
             .await
     }
 

@@ -1,6 +1,10 @@
 //! Approval requests: what the agent asks for, and what the user answers.
 
+use std::path::PathBuf;
+
 use serde::{Deserialize, Serialize};
+
+use crate::diff::Diff;
 
 /// How dangerous an action is, which decides the wording and the defaults a UI shows.
 ///
@@ -77,6 +81,28 @@ impl ApprovalOption {
     }
 }
 
+/// What the user is shown so they can decide without reading megabytes of JSON.
+///
+/// `args_digest` is one line and deliberately lossy; this is the payload a frontend renders
+/// beside the options (D14). The variant names are wire spelling — adding one is a protocol
+/// change, which is why `Diff` travels as structured hunks instead of a text blob that every
+/// frontend would have to parse (`docs/design/protocol.md` §2.1 ②).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "body", rename_all = "snake_case")]
+pub enum ApprovalPreview {
+    /// The change a write would make, as the same structured diff checkpoints use.
+    Diff(Diff),
+    /// A command about to run, exactly as it will be spawned.
+    Command {
+        /// argv[0] is the program; the rest are its arguments.
+        argv: Vec<String>,
+        /// The directory it runs in.
+        cwd: PathBuf,
+    },
+    /// Text that fits neither shape (a URL, a snippet); already truncated by the tool.
+    Excerpt(String),
+}
+
 /// A tool call waiting for a decision.
 ///
 /// Built by the tool host (`ToolHost::approval_for`), forwarded by the kernel as an
@@ -93,6 +119,10 @@ pub struct ApprovalRequest {
     pub risk: RiskLevel,
     /// The options to offer. A hard gate omits the "always" choices (invariant 5).
     pub options: Vec<ApprovalOption>,
+    /// The payload to render beside the options. Optional because a tool may have nothing more
+    /// to say than its digest, and because old peers must keep parsing these requests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview: Option<ApprovalPreview>,
 }
 
 impl ApprovalRequest {
@@ -104,7 +134,15 @@ impl ApprovalRequest {
             args_digest: args_digest.into(),
             risk,
             options: ApprovalOption::ALL.to_vec(),
+            preview: None,
         }
+    }
+
+    /// Attaches the payload a frontend renders (D14).
+    #[must_use]
+    pub fn with_preview(mut self, preview: ApprovalPreview) -> Self {
+        self.preview = Some(preview);
+        self
     }
 
     /// A request that may only be allowed once (or denied): used by the hard gates.
@@ -118,6 +156,74 @@ impl ApprovalRequest {
     #[must_use]
     pub fn offers(&self, option: ApprovalOption) -> bool {
         self.options.contains(&option)
+    }
+}
+
+/// Where an approval rule applies.
+///
+/// The table has no workspace column, so the scope string is the only carrier: `global` for a
+/// rule every workspace shares, and the canonical workspace path for one that belongs to a
+/// single checkout (D8).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "path", rename_all = "snake_case")]
+pub enum ApprovalScope {
+    /// Applies to every session, whatever workspace it is bound to.
+    Global,
+    /// Applies only to sessions whose canonical workspace is this path.
+    Workspace(PathBuf),
+}
+
+impl ApprovalScope {
+    /// The spelling stored in `approval_rules.scope`.
+    #[must_use]
+    pub fn as_storage(&self) -> String {
+        match self {
+            Self::Global => "global".to_owned(),
+            Self::Workspace(path) => format!("workspace:{}", path.to_string_lossy()),
+        }
+    }
+
+    /// Parses the stored spelling. `None` for anything this build does not understand: an
+    /// unknown scope must make its rule inert, never apply it somewhere else.
+    #[must_use]
+    pub fn from_storage(raw: &str) -> Option<Self> {
+        if raw == "global" {
+            return Some(Self::Global);
+        }
+        raw.strip_prefix("workspace:")
+            .filter(|path| !path.is_empty())
+            .map(|path| Self::Workspace(PathBuf::from(path)))
+    }
+}
+
+/// One persisted "always allow" / "always deny" decision (D8).
+///
+/// Only [`ApprovalOption::AllowAlways`] and [`ApprovalOption::DenyAlways`] are meaningful here;
+/// a once-decision is not a rule. `matcher` is a tool name in v1 — the UI's "always" options
+/// offer a tool-wide scope, so persisting anything finer would record a decision the user was
+/// never shown (see `docs/design/capabilities.md` §5).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApprovalRule {
+    /// Primary key.
+    pub id: crate::id::ApprovalRuleId,
+    /// Where it applies.
+    pub scope: ApprovalScope,
+    /// Tool name this rule matches.
+    pub matcher: String,
+    /// Allow or deny; only the remembered variants are valid.
+    pub decision: ApprovalOption,
+    /// When it was recorded.
+    pub created_at: crate::time::Timestamp,
+}
+
+impl ApprovalRule {
+    /// True for the two variants a rule may carry.
+    #[must_use]
+    pub fn is_valid_decision(decision: ApprovalOption) -> bool {
+        matches!(
+            decision,
+            ApprovalOption::AllowAlways | ApprovalOption::DenyAlways
+        )
     }
 }
 
@@ -170,5 +276,66 @@ mod tests {
             serde_json::from_str::<ApprovalRequest>(&json).expect("deserialize"),
             request
         );
+    }
+
+    #[test]
+    fn a_request_without_a_preview_omits_the_field() {
+        let request = ApprovalRequest::new("read_file", "read a.txt", RiskLevel::ReadOnly);
+        let json = serde_json::to_string(&request).expect("serialize");
+        assert!(!json.contains("preview"), "{json}");
+    }
+
+    #[test]
+    fn every_preview_variant_roundtrips_and_keeps_its_tag() {
+        let previews = [
+            (
+                ApprovalPreview::Excerpt("https://example.test".to_owned()),
+                "excerpt",
+            ),
+            (
+                ApprovalPreview::Command {
+                    argv: vec!["ls".to_owned(), "-la".to_owned()],
+                    cwd: PathBuf::from("/tmp"),
+                },
+                "command",
+            ),
+            (
+                ApprovalPreview::Diff(crate::diff::Diff { files: Vec::new() }),
+                "diff",
+            ),
+        ];
+        for (preview, tag) in previews {
+            let json = serde_json::to_string(&preview).expect("serialize");
+            assert!(json.contains(&format!("\"kind\":\"{tag}\"")), "{json}");
+            assert_eq!(
+                serde_json::from_str::<ApprovalPreview>(&json).expect("deserialize"),
+                preview
+            );
+        }
+    }
+
+    #[test]
+    fn a_rule_scope_has_one_storage_spelling() {
+        assert_eq!(ApprovalScope::Global.as_storage(), "global");
+        let workspace = ApprovalScope::Workspace(PathBuf::from("/work/项目"));
+        assert_eq!(workspace.as_storage(), "workspace:/work/项目");
+        assert_eq!(
+            ApprovalScope::from_storage("global"),
+            Some(ApprovalScope::Global)
+        );
+        assert_eq!(
+            ApprovalScope::from_storage(&workspace.as_storage()),
+            Some(workspace)
+        );
+        assert_eq!(ApprovalScope::from_storage("workspace:"), None);
+        assert_eq!(ApprovalScope::from_storage("session:abc"), None);
+    }
+
+    #[test]
+    fn only_remembered_decisions_are_valid_rules() {
+        assert!(ApprovalRule::is_valid_decision(ApprovalOption::AllowAlways));
+        assert!(ApprovalRule::is_valid_decision(ApprovalOption::DenyAlways));
+        assert!(!ApprovalRule::is_valid_decision(ApprovalOption::AllowOnce));
+        assert!(!ApprovalRule::is_valid_decision(ApprovalOption::Deny));
     }
 }

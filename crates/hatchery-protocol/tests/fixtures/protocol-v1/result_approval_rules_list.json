@@ -1,0 +1,14 @@
+{
+  "rules": [
+    {
+      "created_at": 1780000000000,
+      "decision": "allow_always",
+      "id": "01890f47-0000-7000-8000-000000000006",
+      "matcher": "write_file",
+      "scope": {
+        "kind": "workspace",
+        "path": "/home/dev/project"
+      }
+    }
+  ]
+}

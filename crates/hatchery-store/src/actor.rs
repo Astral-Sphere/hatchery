@@ -14,14 +14,14 @@ use turso::{Connection, params_from_iter};
 
 use hatchery_protocol::method::{SessionListParams, SessionListResult};
 use hatchery_protocol::{
-    CheckpointId, Content, Item, ItemId, ItemKind, Session, SessionId, SessionPatch, Timestamp,
-    TurnId,
+    ApprovalOption, ApprovalRule, ApprovalRuleId, ApprovalScope, CheckpointId, Content, Item,
+    ItemId, ItemKind, Session, SessionId, SessionPatch, Timestamp, TurnId,
 };
 
 use crate::error::StoreError;
 use crate::sql::{
-    self, CHECKPOINT_COLUMNS, ITEM_COLUMNS, SESSION_COLUMNS, SKELETON_COLUMNS, as_int, as_text,
-    checkpoint_kind_text, status_text,
+    self, APPROVAL_RULE_COLUMNS, CHECKPOINT_COLUMNS, ITEM_COLUMNS, SESSION_COLUMNS,
+    SKELETON_COLUMNS, approval_decision_text, as_int, as_text, checkpoint_kind_text, status_text,
 };
 use crate::store::CheckpointRecord;
 use crate::tree::{self, SkeletonRow};
@@ -235,6 +235,31 @@ pub enum StoreCmd {
         /// How many rows actually went away.
         reply: Reply<u64>,
     },
+    /// Insert one `approval_rules` row.
+    RecordApprovalRule {
+        /// Where the rule applies.
+        scope: ApprovalScope,
+        /// What it matches: a tool name in v1.
+        matcher: String,
+        /// Allow-always or deny-always.
+        decision: ApprovalOption,
+        /// The rule as stored, id and timestamp included.
+        reply: Reply<ApprovalRule>,
+    },
+    /// Every approval rule, or those one workspace may apply, oldest first.
+    ApprovalRules {
+        /// `None` for every rule; `Some(workspace)` for `global` plus that workspace.
+        workspace: Option<PathBuf>,
+        /// The rules.
+        reply: Reply<Vec<ApprovalRule>>,
+    },
+    /// Delete one `approval_rules` row.
+    DeleteApprovalRule {
+        /// Which rule. An id that is not there is not an error.
+        id: ApprovalRuleId,
+        /// True when a row actually went away.
+        reply: Reply<bool>,
+    },
     /// Everything a whole-tree export needs, read in one pass: every item oldest-first, and
     /// each item's descendant tips.
     ///
@@ -371,6 +396,23 @@ impl Writer {
                 }
                 StoreCmd::DeleteCheckpoints { ids, reply } => {
                     reply_send(reply, self.delete_checkpoints(&ids).await);
+                }
+                StoreCmd::RecordApprovalRule {
+                    scope,
+                    matcher,
+                    decision,
+                    reply,
+                } => {
+                    reply_send(
+                        reply,
+                        self.record_approval_rule(scope, &matcher, decision).await,
+                    );
+                }
+                StoreCmd::ApprovalRules { workspace, reply } => {
+                    reply_send(reply, self.approval_rules(workspace.as_deref()).await);
+                }
+                StoreCmd::DeleteApprovalRule { id, reply } => {
+                    reply_send(reply, self.delete_approval_rule(id).await);
                 }
                 StoreCmd::ExportBody { session, reply } => {
                     reply_send(reply, self.export_body(session).await);
@@ -1089,6 +1131,98 @@ impl Writer {
         }
         tx.commit().await.map_err(StoreError::database)?;
         Ok(removed)
+    }
+
+    // -------------------------------------------------------- approval rules
+
+    async fn record_approval_rule(
+        &self,
+        scope: ApprovalScope,
+        matcher: &str,
+        decision: ApprovalOption,
+    ) -> Result<ApprovalRule, StoreError> {
+        // An empty matcher matches nothing: the row would look like a stored decision to every
+        // reader while changing no behaviour, so it is a caller bug and refused as one. A
+        // once-decision is not a rule at all — persisting it would claim the user asked to
+        // remember something they explicitly asked to be asked again — and `is_valid_decision`
+        // is the protocol's own definition of that line, not a second one maintained here.
+        if matcher.is_empty() {
+            return Err(StoreError::Invalid(
+                "an approval rule must name the tool it matches".to_owned(),
+            ));
+        }
+        if !ApprovalRule::is_valid_decision(decision) {
+            return Err(StoreError::Invalid(format!(
+                "{decision:?} is not a remembered decision; a rule carries allow_always or \
+                 deny_always"
+            )));
+        }
+        let rule = ApprovalRule {
+            id: ApprovalRuleId::new(),
+            scope,
+            matcher: matcher.to_owned(),
+            decision,
+            created_at: Timestamp::now(),
+        };
+        self.conn
+            .execute(
+                "INSERT INTO approval_rules (id, scope, matcher, decision, created_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                (
+                    rule.id.to_string(),
+                    rule.scope.as_storage(),
+                    rule.matcher.clone(),
+                    approval_decision_text(rule.decision),
+                    rule.created_at.as_unix_millis(),
+                ),
+            )
+            .await
+            .map_err(StoreError::database)?;
+        Ok(rule)
+    }
+
+    async fn approval_rules(
+        &self,
+        workspace: Option<&Path>,
+    ) -> Result<Vec<ApprovalRule>, StoreError> {
+        // `id` breaks `created_at` ties, the same tiebreak `checkpoints_for_workspace` uses:
+        // two rules recorded inside one millisecond are ordinary when a UI persists a pair of
+        // answers, and "first matching rule wins" needs an order the engine cannot choose.
+        let mut query = format!("SELECT {APPROVAL_RULE_COLUMNS} FROM approval_rules");
+        if workspace.is_some() {
+            // A workspace sees its own rules and the global ones, nothing else — a rule recorded
+            // for one checkout must not grant (or refuse) anything in another. Both sides are
+            // bound in the `ApprovalScope::as_storage` spelling, the single source of the text
+            // form, so a lookup cannot miss rows over a spelling difference.
+            query.push_str(" WHERE scope = ?1 OR scope = ?2");
+        }
+        query.push_str(" ORDER BY created_at ASC, id ASC");
+        let rows = match workspace {
+            None => self.conn.query(query, ()).await,
+            Some(workspace) => {
+                let global = ApprovalScope::Global.as_storage();
+                let scoped = ApprovalScope::Workspace(workspace.to_path_buf()).as_storage();
+                self.conn.query(query, [global, scoped]).await
+            }
+        }
+        .map_err(StoreError::database)?;
+        // `read_approval_rule` answers `None` for a row whose scope or decision this build cannot
+        // interpret (and warns), so one bad row does not take the whole list down with it: the
+        // table has no CHECK constraints, and an inert rule is safer than unreadable permissions.
+        // `collect` still drains the result set on a real error, as every reader here must.
+        let rules = sql::collect(rows, |row| sql::read_approval_rule(row, 0)).await?;
+        Ok(rules.into_iter().flatten().collect())
+    }
+
+    async fn delete_approval_rule(&self, id: ApprovalRuleId) -> Result<bool, StoreError> {
+        // The engine's affected-row count, not an echo of the request: `false` means the row was
+        // already gone, which a retry after a dropped reply must not turn into an error.
+        let removed = self
+            .conn
+            .execute("DELETE FROM approval_rules WHERE id = ?1", [id.to_string()])
+            .await
+            .map_err(StoreError::database)?;
+        Ok(removed > 0)
     }
 
     // ------------------------------------------------------------- plumbing

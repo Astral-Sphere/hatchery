@@ -6,9 +6,9 @@
 use std::path::{Path, PathBuf};
 
 use hatchery_protocol::{
-    CheckpointId, CheckpointKind, Content, Item, ItemId, ItemKind, ModelRef, Session, SessionId,
-    SessionModeId, SessionPatch, SessionStatus, StopReason, Timestamp, TurnCompletion, TurnId,
-    Usage,
+    ApprovalOption, ApprovalRuleId, ApprovalScope, CheckpointId, CheckpointKind, Content, Item,
+    ItemId, ItemKind, ModelRef, Session, SessionId, SessionModeId, SessionPatch, SessionStatus,
+    StopReason, Timestamp, TurnCompletion, TurnId, Usage,
 };
 use hatchery_store::{CheckpointRecord, SessionStore, StoreError, TursoStore};
 
@@ -1632,6 +1632,421 @@ async fn an_empty_commit_id_is_refused() {
             .expect("read")
             .is_empty(),
         "the refused row does not land"
+    );
+}
+
+// -------------------------------------------------------------- approval rules
+
+/// Inserts an approval rule behind the store's back.
+///
+/// Used for the rows the store itself will not write: chosen timestamps (the ordering assertions
+/// have to be about the order, not about how fast two inserts ran) and spellings the store refuses
+/// but the table's lack of CHECK constraints allows.
+async fn insert_rule_directly(
+    conn: &turso::Connection,
+    id: ApprovalRuleId,
+    scope: &str,
+    matcher: &str,
+    decision: &str,
+    created_at: i64,
+) {
+    conn.execute(
+        "INSERT INTO approval_rules (id, scope, matcher, decision, created_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        (
+            id.to_string(),
+            scope.to_owned(),
+            matcher.to_owned(),
+            decision.to_owned(),
+            created_at,
+        ),
+    )
+    .await
+    .expect("insert an approval rule behind the store's back");
+}
+
+#[tokio::test]
+async fn a_recorded_approval_rule_reads_back_identically() {
+    let fixture = Fixture::new().await;
+    let workspace = PathBuf::from("/ws/one");
+    let scope = ApprovalScope::Workspace(workspace.clone());
+
+    let stored = fixture
+        .store
+        .record_approval_rule(scope.clone(), "write_file", ApprovalOption::AllowAlways)
+        .await
+        .expect("record");
+    assert_eq!(stored.scope, scope);
+    assert_eq!(stored.matcher, "write_file");
+    assert_eq!(stored.decision, ApprovalOption::AllowAlways);
+    assert!(
+        stored.created_at.as_unix_millis() > 0,
+        "the store mints the timestamp rather than leaving it at the epoch"
+    );
+
+    assert_eq!(
+        fixture
+            .store
+            .approval_rules(Some(workspace.as_path()))
+            .await
+            .expect("read back"),
+        vec![stored],
+        "id, scope, matcher, decision and created_at, as written"
+    );
+}
+
+#[tokio::test]
+async fn a_deny_always_rule_reads_back_identically() {
+    let fixture = Fixture::new().await;
+    let workspace = PathBuf::from("/ws/one");
+    let stored = fixture
+        .store
+        .record_approval_rule(
+            ApprovalScope::Workspace(workspace.clone()),
+            "shell",
+            ApprovalOption::DenyAlways,
+        )
+        .await
+        .expect("record");
+    assert_eq!(stored.decision, ApprovalOption::DenyAlways);
+    assert_eq!(
+        fixture
+            .store
+            .approval_rules(Some(workspace.as_path()))
+            .await
+            .expect("read back"),
+        vec![stored]
+    );
+}
+
+#[tokio::test]
+async fn listing_for_a_workspace_returns_global_and_its_own_rules_only() {
+    let fixture = Fixture::new().await;
+    let mine = PathBuf::from("/ws/mine");
+    let theirs = PathBuf::from("/ws/theirs");
+
+    let global = fixture
+        .store
+        .record_approval_rule(ApprovalScope::Global, "shell", ApprovalOption::AllowAlways)
+        .await
+        .expect("record");
+    let ours = fixture
+        .store
+        .record_approval_rule(
+            ApprovalScope::Workspace(mine.clone()),
+            "write_file",
+            ApprovalOption::DenyAlways,
+        )
+        .await
+        .expect("record");
+    let elsewhere = fixture
+        .store
+        .record_approval_rule(
+            ApprovalScope::Workspace(theirs.clone()),
+            "shell",
+            ApprovalOption::AllowAlways,
+        )
+        .await
+        .expect("record");
+
+    let rules = fixture
+        .store
+        .approval_rules(Some(mine.as_path()))
+        .await
+        .expect("read");
+    assert_eq!(
+        rules,
+        vec![global.clone(), ours],
+        "global rules apply everywhere; this workspace's rules apply here"
+    );
+    assert!(
+        !rules.contains(&elsewhere),
+        "another workspace's rule must not leak in"
+    );
+
+    // A workspace nothing was recorded for still sees the global rules — that is the point of a
+    // global rule — and no workspace-scoped ones.
+    assert_eq!(
+        fixture
+            .store
+            .approval_rules(Some(Path::new("/ws/unseen")))
+            .await
+            .expect("read"),
+        vec![global]
+    );
+}
+
+#[tokio::test]
+async fn listing_without_a_workspace_returns_every_rule() {
+    let fixture = Fixture::new().await;
+    let mut expected = Vec::new();
+    for (scope, matcher, decision) in [
+        (ApprovalScope::Global, "shell", ApprovalOption::AllowAlways),
+        (
+            ApprovalScope::Workspace(PathBuf::from("/ws/a")),
+            "write_file",
+            ApprovalOption::DenyAlways,
+        ),
+        (
+            ApprovalScope::Workspace(PathBuf::from("/ws/b")),
+            "shell",
+            ApprovalOption::AllowAlways,
+        ),
+    ] {
+        expected.push(
+            fixture
+                .store
+                .record_approval_rule(scope, matcher, decision)
+                .await
+                .expect("record"),
+        );
+    }
+
+    assert_eq!(
+        fixture.store.approval_rules(None).await.expect("read"),
+        expected,
+        "no workspace filter means every rule, across every scope"
+    );
+}
+
+#[tokio::test]
+async fn a_once_decision_is_refused_and_not_stored() {
+    // A once-decision is not a rule: persisting it would claim the user asked to remember the
+    // answer they explicitly gave for this call only. `approval_rules` has no CHECK constraint on
+    // `decision`, so the store is the only line of defence.
+    let fixture = Fixture::new().await;
+    for decision in [ApprovalOption::AllowOnce, ApprovalOption::Deny] {
+        let error = fixture
+            .store
+            .record_approval_rule(ApprovalScope::Global, "shell", decision)
+            .await
+            .expect_err("only remembered decisions are rules");
+        assert!(
+            matches!(error, StoreError::Invalid(_)),
+            "{decision:?} is a caller bug, not a storage failure: {error}"
+        );
+        assert_eq!(
+            error.to_event_error().code,
+            hatchery_protocol::ErrorCode::InvalidRequest
+        );
+    }
+
+    assert!(
+        fixture
+            .store
+            .approval_rules(None)
+            .await
+            .expect("read")
+            .is_empty(),
+        "a refused row does not land"
+    );
+    let conn = open_directly(&fixture.path).await;
+    assert_eq!(
+        count_directly(&conn, "SELECT count(*) FROM approval_rules").await,
+        0,
+        "nothing reached the table"
+    );
+}
+
+#[tokio::test]
+async fn an_empty_matcher_is_refused_and_not_stored() {
+    // An empty matcher matches nothing: the row would look like a stored decision to every reader
+    // while changing no behaviour, so it is refused as the caller bug it is rather than stored.
+    let fixture = Fixture::new().await;
+    let error = fixture
+        .store
+        .record_approval_rule(ApprovalScope::Global, "", ApprovalOption::AllowAlways)
+        .await
+        .expect_err("a rule must name what it matches");
+    assert!(
+        matches!(error, StoreError::Invalid(_)),
+        "a caller bug, not a storage failure: {error}"
+    );
+    assert!(
+        fixture
+            .store
+            .approval_rules(None)
+            .await
+            .expect("read")
+            .is_empty(),
+        "the refused row does not land"
+    );
+    let conn = open_directly(&fixture.path).await;
+    assert_eq!(
+        count_directly(&conn, "SELECT count(*) FROM approval_rules").await,
+        0
+    );
+}
+
+#[tokio::test]
+async fn delete_approval_rule_reports_whether_a_row_went_away() {
+    let fixture = Fixture::new().await;
+    let rule = fixture
+        .store
+        .record_approval_rule(ApprovalScope::Global, "shell", ApprovalOption::AllowAlways)
+        .await
+        .expect("record");
+
+    assert!(
+        fixture
+            .store
+            .delete_approval_rule(rule.id)
+            .await
+            .expect("delete"),
+        "a row that was there went away"
+    );
+    assert!(
+        !fixture
+            .store
+            .delete_approval_rule(rule.id)
+            .await
+            .expect("already gone is not an error"),
+        "the second delete removed nothing"
+    );
+    assert!(
+        fixture
+            .store
+            .approval_rules(None)
+            .await
+            .expect("read")
+            .is_empty()
+    );
+    let conn = open_directly(&fixture.path).await;
+    assert_eq!(
+        count_directly(&conn, "SELECT count(*) FROM approval_rules").await,
+        0,
+        "the row is gone from the table, not merely hidden from the list"
+    );
+}
+
+#[tokio::test]
+async fn two_rules_for_the_same_scope_and_matcher_are_both_stored() {
+    // The table has no uniqueness constraint, and the store must not invent one: a user can
+    // remove and re-add a decision, and the protocol's delete names a row id rather than a
+    // (scope, matcher) pair precisely because that pair is not unique.
+    let fixture = Fixture::new().await;
+    let first = fixture
+        .store
+        .record_approval_rule(ApprovalScope::Global, "shell", ApprovalOption::AllowAlways)
+        .await
+        .expect("record");
+    let second = fixture
+        .store
+        .record_approval_rule(ApprovalScope::Global, "shell", ApprovalOption::AllowAlways)
+        .await
+        .expect("record");
+    assert_ne!(first.id, second.id, "each row gets its own handle");
+
+    assert_eq!(
+        fixture.store.approval_rules(None).await.expect("read"),
+        vec![first, second],
+        "both rows are kept, in insertion order"
+    );
+}
+
+#[tokio::test]
+async fn approval_rules_come_back_oldest_first_with_id_breaking_ties() {
+    // The engine promises no row order, so ordering is part of the contract rather than an
+    // accident of storage. Rows are inserted behind the store's back because the store mints
+    // `created_at` itself, and this assertion needs a chosen clock.
+    let fixture = Fixture::new().await;
+    let conn = open_directly(&fixture.path).await;
+
+    let oldest = ApprovalRuleId::new();
+    let middle = ApprovalRuleId::new();
+    let newest = ApprovalRuleId::new();
+    // Inserted newest-first: an implementation that leaves the order to the engine returns these
+    // in the wrong order and fails.
+    insert_rule_directly(&conn, newest, "global", "newest", "allow_always", 3_000).await;
+    insert_rule_directly(&conn, oldest, "global", "oldest", "deny_always", 1_000).await;
+    insert_rule_directly(&conn, middle, "global", "middle", "allow_always", 2_000).await;
+
+    // Two rows inside one millisecond, inserted newest-id-first: UUIDv7 ids ascend, so `id` is a
+    // creation-order tiebreak and the answer is the reverse of the insertion order.
+    let tie_low = ApprovalRuleId::new();
+    let tie_high = ApprovalRuleId::new();
+    assert!(tie_low < tie_high);
+    insert_rule_directly(&conn, tie_high, "global", "tie-high", "allow_always", 4_000).await;
+    insert_rule_directly(&conn, tie_low, "global", "tie-low", "deny_always", 4_000).await;
+    drop(conn);
+
+    let rules = fixture.store.approval_rules(None).await.expect("read");
+    assert_eq!(
+        rules
+            .iter()
+            .map(|rule| rule.matcher.as_str())
+            .collect::<Vec<_>>(),
+        vec!["oldest", "middle", "newest", "tie-low", "tie-high"]
+    );
+    assert_eq!(
+        fixture
+            .store
+            .approval_rules(None)
+            .await
+            .expect("read again"),
+        rules,
+        "and the same way every time"
+    );
+}
+
+#[tokio::test]
+async fn unreadable_approval_rows_are_skipped_rather_than_failing_the_list() {
+    // `approval_rules` has no CHECK constraints on `scope` or `decision`, so a row written by a
+    // newer build (or by hand) can carry a spelling this build does not know. One such row must
+    // not make every rule unreadable: it is skipped and inert, which is the safe failure for a
+    // table whose rows grant permission.
+    let fixture = Fixture::new().await;
+    let good = fixture
+        .store
+        .record_approval_rule(ApprovalScope::Global, "shell", ApprovalOption::AllowAlways)
+        .await
+        .expect("record");
+
+    let conn = open_directly(&fixture.path).await;
+    insert_rule_directly(
+        &conn,
+        ApprovalRuleId::new(),
+        "session:abc",
+        "shell",
+        "allow_always",
+        1_000,
+    )
+    .await;
+    insert_rule_directly(
+        &conn,
+        ApprovalRuleId::new(),
+        "global",
+        "shell",
+        "allow_once",
+        2_000,
+    )
+    .await;
+    insert_rule_directly(
+        &conn,
+        ApprovalRuleId::new(),
+        "workspace:",
+        "shell",
+        "allow_always",
+        3_000,
+    )
+    .await;
+    drop(conn);
+
+    assert_eq!(
+        fixture
+            .store
+            .approval_rules(None)
+            .await
+            .expect("a bad row must not hide the good ones"),
+        vec![good.clone()]
+    );
+    assert_eq!(
+        fixture
+            .store
+            .approval_rules(Some(Path::new("/ws")))
+            .await
+            .expect("the scoped list skips them the same way"),
+        vec![good]
     );
 }
 

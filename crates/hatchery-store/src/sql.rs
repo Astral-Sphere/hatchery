@@ -9,8 +9,9 @@ use serde_json::Value as Json;
 use turso::{Connection, Value};
 
 use hatchery_protocol::{
-    CheckpointKind, Item, ItemId, ItemKind, ItemKindTag, ModelRef, Session, SessionModeId,
-    SessionStatus, Timestamp, TurnId, UnknownItemKind,
+    ApprovalOption, ApprovalRule, ApprovalRuleId, ApprovalScope, CheckpointKind, Item, ItemId,
+    ItemKind, ItemKindTag, ModelRef, Session, SessionModeId, SessionStatus, Timestamp, TurnId,
+    UnknownItemKind,
 };
 
 use crate::error::StoreError;
@@ -26,6 +27,9 @@ pub const ITEM_COLUMNS: &str = "id, session_id, parent_id, turn_id, kind, payloa
 /// Columns of `checkpoints`, in the order the row readers expect.
 pub const CHECKPOINT_COLUMNS: &str =
     "id, session_id, item_id, workspace, commit_id, kind, created_at";
+
+/// Columns of `approval_rules`, in the order the row readers expect.
+pub const APPROVAL_RULE_COLUMNS: &str = "id, scope, matcher, decision, created_at";
 
 /// Columns of the tree skeleton: everything the tree walk needs, no payload.
 pub const SKELETON_COLUMNS: &str = "id, parent_id, kind, turn_id";
@@ -235,6 +239,56 @@ pub fn read_checkpoint(row: &turso::Row, offset: usize) -> Result<CheckpointReco
     })
 }
 
+/// Reads an `approval_rules` row, or `None` when this build cannot interpret it.
+///
+/// `approval_rules` has no CHECK constraints: `scope` and `decision` are free text, so a row
+/// written by a newer build (or by hand) can carry a spelling this build does not know. Such a
+/// row is skipped with a warning rather than returned as an error — one unreadable rule must not
+/// make every rule unreadable, and a rule this build cannot interpret is inert, which is the safe
+/// failure for a table whose rows grant permission. A bad `id` is still an error: it is the
+/// primary key, and nothing can be done with a row that cannot be named.
+pub fn read_approval_rule(
+    row: &turso::Row,
+    offset: usize,
+) -> Result<Option<ApprovalRule>, StoreError> {
+    let raw_id = text(&get(row, offset)?, "approval_rules.id")?;
+    let scope_text = text(&get(row, offset + 1)?, "approval_rules.scope")?;
+    let matcher = text(&get(row, offset + 2)?, "approval_rules.matcher")?;
+    let decision_text = text(&get(row, offset + 3)?, "approval_rules.decision")?;
+    let created_at = Timestamp::from_unix_millis(integer(
+        &get(row, offset + 4)?,
+        "approval_rules.created_at",
+    )?);
+
+    let id: ApprovalRuleId = raw_id
+        .parse()
+        .map_err(|_| StoreError::Database("approval_rules.id is not a uuid".to_owned()))?;
+    let Some(scope) = ApprovalScope::from_storage(&scope_text) else {
+        tracing::warn!(
+            id = %raw_id,
+            scope = %scope_text,
+            "skipping an approval rule whose scope is not a known spelling"
+        );
+        return Ok(None);
+    };
+    let Some(decision) = parse_approval_decision(&decision_text) else {
+        tracing::warn!(
+            id = %raw_id,
+            decision = %decision_text,
+            "skipping an approval rule whose decision is not a remembered decision"
+        );
+        return Ok(None);
+    };
+
+    Ok(Some(ApprovalRule {
+        id,
+        scope,
+        matcher,
+        decision,
+        created_at,
+    }))
+}
+
 /// Reads a skeleton row: `id, parent_id, kind, turn_id`.
 pub fn read_skeleton(row: &turso::Row) -> Result<crate::tree::SkeletonRow, StoreError> {
     let id: ItemId = text(&get(row, 0)?, "items.id")?
@@ -313,6 +367,33 @@ pub fn checkpoint_kind_text(kind: CheckpointKind) -> &'static str {
         CheckpointKind::PreWrite => "pre_write",
         CheckpointKind::PreShell => "pre_shell",
         CheckpointKind::Manual => "manual",
+    }
+}
+
+/// Parses the `approval_rules.decision` spelling.
+///
+/// `None` for anything this build cannot apply as a rule — including `allow_once` and `deny`,
+/// which are decision spellings but not remembered decisions, so a row carrying one is not a rule
+/// (`ApprovalRule` docs). Hand-written rather than derived from serde, and pinned against the
+/// serde spelling by `approval_decision_spellings_round_trip`: a rename in the protocol would
+/// otherwise silently orphan every row already written with the old spelling.
+#[must_use]
+pub fn parse_approval_decision(text: &str) -> Option<ApprovalOption> {
+    match text {
+        "allow_always" => Some(ApprovalOption::AllowAlways),
+        "deny_always" => Some(ApprovalOption::DenyAlways),
+        _ => None,
+    }
+}
+
+/// The `approval_rules.decision` spelling.
+#[must_use]
+pub fn approval_decision_text(decision: ApprovalOption) -> &'static str {
+    match decision {
+        ApprovalOption::AllowOnce => "allow_once",
+        ApprovalOption::AllowAlways => "allow_always",
+        ApprovalOption::Deny => "deny",
+        ApprovalOption::DenyAlways => "deny_always",
     }
 }
 
@@ -428,6 +509,34 @@ mod tests {
         assert!(
             parse_checkpoint_kind("automatic").is_err(),
             "unknown kinds are refused rather than guessed"
+        );
+    }
+
+    #[test]
+    fn approval_decision_spellings_round_trip() {
+        for option in ApprovalOption::ALL {
+            let text = approval_decision_text(*option);
+            // The SQL spelling is the wire spelling. `ApprovalOption` serialises snake_case, and
+            // a serde rename would otherwise leave every rule already on disk unreadable while
+            // both halves of the code each looked consistent.
+            assert_eq!(
+                serde_json::to_string(option).expect("serialize"),
+                format!("\"{text}\"")
+            );
+            if option.is_remembered() {
+                assert_eq!(parse_approval_decision(text), Some(*option));
+            } else {
+                assert_eq!(
+                    parse_approval_decision(text),
+                    None,
+                    "a once-decision is not a rule"
+                );
+            }
+        }
+        assert_eq!(
+            parse_approval_decision("AllowAlways"),
+            None,
+            "the CamelCase variant name is not the spelling"
         );
     }
 

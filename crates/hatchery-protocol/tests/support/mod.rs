@@ -14,26 +14,28 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 use hatchery_protocol::method::{
-    ApprovalRespondParams, ApprovalRespondResult, BranchDeleteParams, BranchDeleteResult,
-    BranchListParams, BranchListResult, BranchNode, BranchSwitchParams, BranchSwitchResult,
-    ClientInfo, ConfigEntry, ConfigGetParams, ConfigGetResult, ConfigOrigin, ConfigPatch,
-    ConfigSetParams, ConfigSetResult, DaemonCapabilities, EditItemParams, EditItemResult,
-    ExportJsonlParams, ExportJsonlResult, HelloParams, HelloResult, PromptRenderParams,
-    PromptRenderResult, PromptSection, RewindParams, RewindReport, RewindResult,
-    SessionCancelParams, SessionCancelResult, SessionDeleteParams, SessionDeleteResult,
-    SessionListParams, SessionListResult, SessionLoadParams, SessionLoadResult, SessionNewParams,
-    SessionNewResult, SessionPromptParams, SessionPromptResult, SessionRenameParams,
-    SessionRenameResult, SetConfigParams, SetConfigResult, SetModeParams, SetModeResult,
+    ApprovalRespondParams, ApprovalRespondResult, ApprovalRulesDeleteParams,
+    ApprovalRulesDeleteResult, ApprovalRulesListParams, ApprovalRulesListResult,
+    BranchDeleteParams, BranchDeleteResult, BranchListParams, BranchListResult, BranchNode,
+    BranchSwitchParams, BranchSwitchResult, ClientInfo, ConfigEntry, ConfigGetParams,
+    ConfigGetResult, ConfigOrigin, ConfigPatch, ConfigSetParams, ConfigSetResult,
+    DaemonCapabilities, EditItemParams, EditItemResult, ExportJsonlParams, ExportJsonlResult,
+    HelloParams, HelloResult, PromptRenderParams, PromptRenderResult, PromptSection, RewindParams,
+    RewindReport, RewindResult, SessionCancelParams, SessionCancelResult, SessionDeleteParams,
+    SessionDeleteResult, SessionListParams, SessionListResult, SessionLoadParams,
+    SessionLoadResult, SessionNewParams, SessionNewResult, SessionPromptParams,
+    SessionPromptResult, SessionRenameParams, SessionRenameResult, SetConfigParams,
+    SetConfigResult, SetModeParams, SetModeResult,
 };
 use hatchery_protocol::{
-    ApprovalId, ApprovalOption, ApprovalRequest, BranchNote, Checkpoint, CheckpointKind,
-    Compaction, Content, ContentPart, DaemonEvent, ErrorCode, ErrorObject, EventError, Item,
-    ItemId, ItemIdRange, ItemKind, ItemKindTag, JsonRpcVersion, ModeSwitch, ModelRef, Notification,
-    PROTOCOL_VERSION, ReasoningBlock, ReasoningEffort, Request, Response, RiskLevel,
-    SUPPORTED_PROTOCOL_VERSIONS, ServerEvent, Session, SessionEvent, SessionModeId, SessionPatch,
-    SessionStatus, SignatureBlock, SpilledOutput, StopReason, Timestamp, ToolArtifact, ToolCall,
-    ToolCallSummary, ToolOutput, ToolProgress, ToolResult, ToolStatus, TurnCompletion, TurnId,
-    Usage,
+    ApprovalId, ApprovalOption, ApprovalRequest, ApprovalRule, ApprovalRuleId, ApprovalScope,
+    BranchNote, Checkpoint, CheckpointKind, Compaction, Content, ContentPart, DaemonEvent,
+    ErrorCode, ErrorObject, EventError, Item, ItemId, ItemIdRange, ItemKind, ItemKindTag,
+    JsonRpcVersion, ModeSwitch, ModelRef, Notification, PROTOCOL_VERSION, ReasoningBlock,
+    ReasoningEffort, Request, Response, RiskLevel, SUPPORTED_PROTOCOL_VERSIONS, ServerEvent,
+    Session, SessionEvent, SessionModeId, SessionPatch, SessionStatus, SignatureBlock,
+    SpilledOutput, StopReason, Timestamp, ToolArtifact, ToolCall, ToolCallSummary, ToolOutput,
+    ToolProgress, ToolResult, ToolStatus, TurnCompletion, TurnId, Usage,
 };
 
 /// Session id used by every sample.
@@ -46,6 +48,8 @@ pub const ITEM_ID_2: &str = "01890f47-0000-7000-8000-000000000003";
 pub const TURN_ID: &str = "01890f47-0000-7000-8000-000000000004";
 /// Approval id used by every sample.
 pub const APPROVAL_ID: &str = "01890f47-0000-7000-8000-000000000005";
+/// Approval rule id used by the rule samples.
+pub const APPROVAL_RULE_ID: &str = "01890f47-0000-7000-8000-000000000006";
 
 /// A fixed timestamp, so goldens never move.
 pub const TIMESTAMP: Timestamp = Timestamp::from_unix_millis(1_780_000_000_000);
@@ -77,6 +81,24 @@ pub fn turn_id() -> TurnId {
 /// The fixed approval id.
 pub fn approval_id() -> ApprovalId {
     APPROVAL_ID.parse().expect("APPROVAL_ID is a valid uuid")
+}
+
+/// The fixed approval-rule id.
+pub fn approval_rule_id() -> ApprovalRuleId {
+    APPROVAL_RULE_ID
+        .parse()
+        .expect("APPROVAL_RULE_ID is a valid uuid")
+}
+
+/// One persisted rule, for the list/delete samples.
+pub fn approval_rule() -> ApprovalRule {
+    ApprovalRule {
+        id: approval_rule_id(),
+        scope: ApprovalScope::Workspace(PathBuf::from("/home/dev/project")),
+        matcher: "write_file".to_owned(),
+        decision: ApprovalOption::AllowAlways,
+        created_at: TIMESTAMP,
+    }
 }
 
 /// A fully populated session.
@@ -497,6 +519,18 @@ pub fn method_params() -> Vec<(&'static str, Value)> {
             }),
         ),
         (
+            m::APPROVAL_RULES_LIST,
+            to_value(&ApprovalRulesListParams {
+                session_id: Some(session_id()),
+            }),
+        ),
+        (
+            m::APPROVAL_RULES_DELETE,
+            to_value(&ApprovalRulesDeleteParams {
+                rule_id: approval_rule_id(),
+            }),
+        ),
+        (
             m::CONFIG_GET,
             to_value(&ConfigGetParams {
                 key_path: Some("providers".to_owned()),
@@ -676,6 +710,16 @@ pub fn method_results() -> Vec<(&'static str, Value)> {
         (
             m::APPROVAL_RESPOND,
             to_value(&ApprovalRespondResult { handled: true }),
+        ),
+        (
+            m::APPROVAL_RULES_LIST,
+            to_value(&ApprovalRulesListResult {
+                rules: vec![approval_rule()],
+            }),
+        ),
+        (
+            m::APPROVAL_RULES_DELETE,
+            to_value(&ApprovalRulesDeleteResult { deleted: true }),
         ),
         (
             m::CONFIG_GET,
@@ -881,6 +925,8 @@ pub fn params_validator(method: &str) -> Check {
         m::SESSION_DELETE => as_type::<SessionDeleteParams>(),
         m::SESSION_RENAME => as_type::<SessionRenameParams>(),
         m::APPROVAL_RESPOND => as_type::<ApprovalRespondParams>(),
+        m::APPROVAL_RULES_LIST => as_type::<ApprovalRulesListParams>(),
+        m::APPROVAL_RULES_DELETE => as_type::<ApprovalRulesDeleteParams>(),
         m::CONFIG_GET => as_type::<ConfigGetParams>(),
         m::CONFIG_SET => as_type::<ConfigSetParams>(),
         m::PROMPT_RENDER => as_type::<PromptRenderParams>(),
@@ -910,6 +956,8 @@ pub fn results_validator(method: &str) -> Check {
         m::SESSION_DELETE => as_type::<SessionDeleteResult>(),
         m::SESSION_RENAME => as_type::<SessionRenameResult>(),
         m::APPROVAL_RESPOND => as_type::<ApprovalRespondResult>(),
+        m::APPROVAL_RULES_LIST => as_type::<ApprovalRulesListResult>(),
+        m::APPROVAL_RULES_DELETE => as_type::<ApprovalRulesDeleteResult>(),
         m::CONFIG_GET => as_type::<ConfigGetResult>(),
         m::CONFIG_SET => as_type::<ConfigSetResult>(),
         m::PROMPT_RENDER => as_type::<PromptRenderResult>(),
@@ -1105,6 +1153,8 @@ pub fn params_stem(method: &str) -> &'static str {
         m::SESSION_DELETE => "params_session_delete",
         m::SESSION_RENAME => "params_session_rename",
         m::APPROVAL_RESPOND => "params_approval_respond",
+        m::APPROVAL_RULES_LIST => "params_approval_rules_list",
+        m::APPROVAL_RULES_DELETE => "params_approval_rules_delete",
         m::CONFIG_GET => "params_config_get",
         m::CONFIG_SET => "params_config_set",
         m::PROMPT_RENDER => "params_prompt_render",
@@ -1134,6 +1184,8 @@ pub fn result_stem(method: &str) -> &'static str {
         m::SESSION_DELETE => "result_session_delete",
         m::SESSION_RENAME => "result_session_rename",
         m::APPROVAL_RESPOND => "result_approval_respond",
+        m::APPROVAL_RULES_LIST => "result_approval_rules_list",
+        m::APPROVAL_RULES_DELETE => "result_approval_rules_delete",
         m::CONFIG_GET => "result_config_get",
         m::CONFIG_SET => "result_config_set",
         m::PROMPT_RENDER => "result_prompt_render",

@@ -120,6 +120,15 @@ uuid_newtype! {
 }
 
 uuid_newtype! {
+    /// Identifies one row of the `approval_rules` table.
+    ///
+    /// A rule outlives every request it answers, so it needs its own handle: the protocol's
+    /// `approval/rules/delete` names one, and a tool name plus a scope is not unique once a user
+    /// has removed and re-added the same rule.
+    ApprovalRuleId
+}
+
+uuid_newtype! {
     /// Identifies one row of the `checkpoints` table.
     ///
     /// Not the item id and not the commit id: a checkpoint can exist without an item (the safety
