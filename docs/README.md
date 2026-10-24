@@ -27,6 +27,19 @@ Hatchery 是一个用 Rust 编写的开源 AI Agent Harness，支持 CLI 与原�
 | 配置 / 提示词 / i18n | [design/platform.md](design/platform.md) | [worklog/platform.md](worklog/platform.md) | 横切 |
 | 测试体系 | [design/testing.md](design/testing.md) | [worklog/testing.md](worklog/testing.md) | 横切（`hatchery-testkit` + 所有 crate） |
 
+## 代码布局
+
+| 路径 | 内容 |
+|---|---|
+| `crates/` | 11 个 crate（10 个产品 crate + dev-only 的 `hatchery-testkit`），分层见 [architecture.md](architecture.md) §3。M0 已实现的三个：`hatchery-protocol`（wire 类型与帧）、`hatchery-kernel`（turn 循环）、`hatchery-store`（schema + writer actor，`migrations/v1.sql` 是它的 DDL） |
+| `xtask/` | 开发者任务：`cargo xtask layering`（分层契约检查）、`cargo xtask coverage`；`i18n-extract`/`record-fixtures` 是 fail-loud 占位 |
+| `scripts/ci.sh` | 门禁序列的**唯一真相**，本地与 GitHub Actions 跑同一条命令 |
+| `.github/workflows/` | `pr.yml`（三平台：ubuntu / macos / windows MSYS2 ucrt64 + windows-gnu）、`nightly.yml` |
+| `.config/nextest.toml` | 测试分组：default / ci / invariants / slow / gui / live（命名前缀约定见 [design/testing.md](design/testing.md) §1） |
+| `clippy.toml` | 不变量 4 的编译期强制清单（作用域：只在 `hatchery-tools` deny） |
+| `.cargo/config.toml` | `cargo xtask` 别名 + 全 workspace 的 `-C target-cpu=native`（ADR-0012；发布产物必须覆盖此 flag） |
+| `rust-toolchain.toml` | `channel = "stable"` + rustfmt/clippy；MSRV 见根 `Cargo.toml` 的 `rust-version`（实测 1.90） |
+
 ## 约定
 
 - 文档语言为中文，代码标识符、协议方法名、技术术语保留英文。

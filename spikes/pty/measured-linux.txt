@@ -1,0 +1,249 @@
+
+==============================================================================
+## D10 PTY spike — portable-pty 0.9.0 — MEASURED ON THIS MACHINE
+==============================================================================
+          target_os                          linux
+          target_arch                        x86_64
+          probe                              spikes/pty (own workspace, not built by the gate)
+          library                            portable-pty 0.9.0 (crates.io, same pin as references/codex codex-rs/Cargo.toml:422)
+          kernel                             Linux 7.2.8-200.fc44.x86_64 #1 SMP PREEMPT_DYNAMIC Fri Sep 25 21:05:44 UTC 2026 x86_64
+          label convention                   OBSERVED / HAZARD / VERDICT = measured here.  READ-FROM-SOURCE = not measured.
+
+==============================================================================
+## M1 — streaming output while the child lives
+==============================================================================
+OBSERVED: payload: sh -c 'for i in $(seq 1 20); do echo line-$i; sleep 0.05; done'
+OBSERVED: child pid=106611 pgid=? sid=? kill-0=dead /proc-state=None
+OBSERVED: reader: 20 chunks, 171 bytes total; loop ended at Some(1020) ms with Ok(0) — EOF
+OBSERVED: child exit observed at 1021 ms: Success [exit_code=0 signal=None success=true]
+OBSERVED: 20 of 20 chunks (171 of 171 bytes) arrived BEFORE the child exited
+
+          chunk arrival table (t = ms since the reader thread started):
+            #1   t=    1 ms  len=8     "line-1\r\n"
+            #2   t=   52 ms  len=8     "line-2\r\n"
+            #3   t=  103 ms  len=8     "line-3\r\n"
+            #4   t=  154 ms  len=8     "line-4\r\n"
+            #5   t=  205 ms  len=8     "line-5\r\n"
+            #6   t=  255 ms  len=8     "line-6\r\n"
+            #7   t=  306 ms  len=8     "line-7\r\n"
+            #8   t=  357 ms  len=8     "line-8\r\n"
+            #9   t=  408 ms  len=8     "line-9\r\n"
+            #10  t=  459 ms  len=9     "line-10\r\n"
+            #11  t=  510 ms  len=9     "line-11\r\n"
+            #12  t=  561 ms  len=9     "line-12\r\n"
+            #13  t=  612 ms  len=9     "line-13\r\n"
+            #14  t=  663 ms  len=9     "line-14\r\n"
+            #15  t=  714 ms  len=9     "line-15\r\n"
+            #16  t=  765 ms  len=9     "line-16\r\n"
+            #17  t=  816 ms  len=9     "line-17\r\n"
+            #18  t=  867 ms  len=9     "line-18\r\n"
+            #19  t=  918 ms  len=9     "line-19\r\n"
+            #20  t=  969 ms  len=9     "line-20\r\n"
+OBSERVED: chunk sizes: min=8 max=9 distinct=2 (payload wrote 20 lines)
+OBSERVED: line discipline: LF bytes = 20, CRLF sequences = 20 (the payload wrote LF only)
+VERDICT:  STREAMING WORKS. 20 chunks / 171 bytes reached the master while the child was still alive, and the reader returned EOF at 1020 ms after exit. Granularity is arbitrary read() chunks, not lines — 2 distinct sizes across 20 chunks — so line splitting and any ring buffer must live in our code, not the library's.
+HAZARD:   the PTY translates LF -> CRLF (ONLCR): 20 CRLF sequences for 20 LF bytes. Output captured through a PTY is NOT byte-identical to the child's stdout, so TerminalOutcome, ToolCallProgress payloads and any golden test must normalise CRLF. portable-pty passes termios = NULL to openpty(), i.e. it never disables the translation and offers no API to change it (get_termios() is read-only).
+HAZARD:   the reader MUST live on its own thread: MasterPty::try_clone_reader() returns a blocking Box<dyn Read + Send> with no readiness, poll or timeout API, and the unix backend has no async support (the crate's async examples wrap the raw fd in smol's Async). A tokio TerminalBackend needs spawn_blocking + a channel, or tokio::io::unix::AsyncFd over MasterPty::as_raw_fd().
+
+--- M1b — same child, but the parent keeps its copy of the slave fd --------
+OBSERVED: child pid=106638 exited at Some(1020) ms; reader loop finished while the parent's slave fd was still open: None
+OBSERVED: reader outcome at that point: "<still blocked in read()>"
+OBSERVED: after dropping the parent's slave fd the reader finished at Some(2522) ms with outcome Some("Ok(0) — EOF")
+OBSERVED: bytes collected: 171
+HAZARD:   CONFIRMED: while the parent holds the slave fd the reader never sees EOF even though the child is dead — read() blocks indefinitely. PtyPair declares `slave` first so it drops first, but a wrapper that stores the PtyPair (or the slave) inside a session struct will hang its reader thread AND anything waiting for output. LocalPty must drop the slave immediately after spawn_command().
+VERDICT:  dropping the slave right after spawn is mandatory, not optional.
+
+==============================================================================
+## M2 — orphan grandchildren on kill  (the load-bearing measurement)
+==============================================================================
+OBSERVED: method: spawn in a PTY, read the grandchild pid the payload prints, kill through portable-pty's own Child::kill(), then assert liveness with kill(pid, 0) — the same assertion testing.md §3.5 asks the gate to make. Every payload pid is registered and hard-killed at the end of the run.
+
+--- case: control: the long sleeper IS the direct child (no grandchild) ------
+OBSERVED: child  pid=106670 pgid=106670 sid=106670 kill-0=ALIVE /proc-state=Some('S')
+                    grandchild <none>
+                    master.as_raw_fd()=Some(3) process_group_leader() [tcgetpgrp]=Some(106670) tty=Some("/dev/pts/7") size=rows=24 cols=80 px=0x0
+OBSERVED: Child::kill() -> Ok(()); the call itself blocked for 50 ms
+OBSERVED: +300 ms after kill: child dead | grandchild unknown (no instrument on this platform)
+OBSERVED: try_wait() after kill: Terminated by Hangup [exit_code=1 signal=Some("Hangup") success=false] (observed 750 ms after reader start)
+OBSERVED: +400 ms after dropping slave and master (PTY closed): grandchild unknown (no instrument on this platform)
+VERDICT:  control OK — the direct child is terminated by Child::kill()
+
+--- case: background job in the child's group: `sleep 300 & echo $!; wait` ---
+OBSERVED: child  pid=106676 pgid=106676 sid=106676 kill-0=ALIVE /proc-state=Some('S')
+                    grandchild pid=106678 pgid=106676 sid=106676 kill-0=ALIVE /proc-state=Some('S')
+                    master.as_raw_fd()=Some(3) process_group_leader() [tcgetpgrp]=Some(106676) tty=Some("/dev/pts/7") size=rows=24 cols=80 px=0x0
+                    grandchild /proc SigIgn = 0000000000000006
+OBSERVED: Child::kill() -> Ok(()); the call itself blocked for 50 ms
+OBSERVED: +300 ms after kill: child dead | grandchild dead
+OBSERVED: try_wait() after kill: Terminated by Hangup [exit_code=1 signal=Some("Hangup") success=false] (observed 750 ms after reader start)
+OBSERVED: +400 ms after dropping slave and master (PTY closed): grandchild dead
+VERDICT:  no orphan — the grandchild died
+
+--- case: reparented to init, same group: `( sleep 300 & echo $! )` ----------
+OBSERVED: child  pid=106683 pgid=106683 sid=106683 kill-0=ALIVE /proc-state=Some('S')
+                    grandchild pid=106686 pgid=106683 sid=106683 kill-0=ALIVE /proc-state=Some('S')
+                    master.as_raw_fd()=Some(3) process_group_leader() [tcgetpgrp]=Some(106683) tty=Some("/dev/pts/7") size=rows=24 cols=80 px=0x0
+                    grandchild /proc SigIgn = 0000000000000006
+OBSERVED: Child::kill() -> Ok(()); the call itself blocked for 50 ms
+OBSERVED: +300 ms after kill: child dead | grandchild dead
+OBSERVED: try_wait() after kill: Terminated by Hangup [exit_code=1 signal=Some("Hangup") success=false] (observed 750 ms after reader start)
+OBSERVED: +400 ms after dropping slave and master (PTY closed): grandchild dead
+VERDICT:  no orphan — the grandchild died
+
+--- case: NEW session: `setsid sh -c 'echo $$; exec sleep 300' &` ------------
+OBSERVED: child  pid=106691 pgid=106691 sid=106691 kill-0=ALIVE /proc-state=Some('S')
+                    grandchild pid=106693 pgid=106693 sid=106693 kill-0=ALIVE /proc-state=Some('S')
+                    master.as_raw_fd()=Some(3) process_group_leader() [tcgetpgrp]=Some(106691) tty=Some("/dev/pts/7") size=rows=24 cols=80 px=0x0
+                    grandchild /proc SigIgn = 0000000000000006
+OBSERVED: Child::kill() -> Ok(()); the call itself blocked for 50 ms
+OBSERVED: +300 ms after kill: child dead | grandchild ALIVE
+OBSERVED: try_wait() after kill: Terminated by Hangup [exit_code=1 signal=Some("Hangup") success=false] (observed 750 ms after reader start)
+OBSERVED: +400 ms after dropping slave and master (PTY closed): grandchild ALIVE
+VERDICT:  ORPHANED — the grandchild outlives both Child::kill() and closing the PTY
+OBSERVED: positive control A: our own killpg(child_pid=106691, SIGKILL) returned false; the grandchild's pgid was Some(106693); grandchild is now ALIVE
+OBSERVED: positive control B: killpg(grandchild_pgid=Some(106693), SIGKILL) returned true; grandchild is now dead
+HAZARD:   the child's process group is NOT enough: a grandchild that left the group (setsid, or job control) is unreachable from the pid the library hands us. Only enumerating descendants — or a Windows Job Object, which contains by handle inheritance rather than by group — closes that hole.
+
+--- case: in-group but SIGHUP-immune: `trap '' HUP; sleep 300 & echo $!; wait` 
+OBSERVED: child  pid=106709 pgid=106709 sid=106709 kill-0=ALIVE /proc-state=Some('S')
+                    grandchild pid=106711 pgid=106709 sid=106709 kill-0=ALIVE /proc-state=Some('S')
+                    master.as_raw_fd()=Some(3) process_group_leader() [tcgetpgrp]=Some(106709) tty=Some("/dev/pts/7") size=rows=24 cols=80 px=0x0
+                    grandchild /proc SigIgn = 0000000000000007
+OBSERVED: Child::kill() -> Ok(()); the call itself blocked for 200 ms
+OBSERVED: +300 ms after kill: child ALIVE | grandchild ALIVE
+OBSERVED: try_wait() after kill: Terminated by Killed [exit_code=1 signal=Some("Killed") success=false] (observed 900 ms after reader start)
+OBSERVED: +400 ms after dropping slave and master (PTY closed): grandchild ALIVE
+VERDICT:  ORPHANED — the grandchild outlives both Child::kill() and closing the PTY
+OBSERVED: positive control A: our own killpg(child_pid=106709, SIGKILL) returned true; the grandchild's pgid was Some(106709); grandchild is now dead
+
+--- case: job control ON, own group: `set -m; sleep 300 & echo $!; wait` -----
+OBSERVED: child  pid=106720 pgid=106720 sid=106720 kill-0=ALIVE /proc-state=Some('S')
+                    grandchild pid=106722 pgid=106722 sid=106720 kill-0=ALIVE /proc-state=Some('S')
+                    master.as_raw_fd()=Some(3) process_group_leader() [tcgetpgrp]=Some(106720) tty=Some("/dev/pts/7") size=rows=24 cols=80 px=0x0
+                    grandchild /proc SigIgn = 0000000000000000
+OBSERVED: Child::kill() -> Ok(()); the call itself blocked for 50 ms
+OBSERVED: +300 ms after kill: child dead | grandchild ALIVE
+OBSERVED: try_wait() after kill: Terminated by Hangup [exit_code=1 signal=Some("Hangup") success=false] (observed 750 ms after reader start)
+OBSERVED: +400 ms after dropping slave and master (PTY closed): grandchild ALIVE
+VERDICT:  ORPHANED — the grandchild outlives both Child::kill() and closing the PTY
+OBSERVED: positive control A: our own killpg(child_pid=106720, SIGKILL) returned false; the grandchild's pgid was Some(106722); grandchild is now ALIVE
+OBSERVED: positive control B: killpg(grandchild_pgid=Some(106722), SIGKILL) returned true; grandchild is now dead
+HAZARD:   the child's process group is NOT enough: a grandchild that left the group (setsid, or job control) is unreachable from the pid the library hands us. Only enumerating descendants — or a Windows Job Object, which contains by handle inheritance rather than by group — closes that hole.
+
+--- M2 summary ---------------------------------------------------------------
+          control: the long sleeper IS the direct child (no grandchild)  control OK — the direct child is terminated by Child::kill()
+          background job in the child's group: `sleep 300 & echo $!; wai… no orphan — the grandchild died
+          reparented to init, same group: `( sleep 300 & echo $! )`      no orphan — the grandchild died
+          NEW session: `setsid sh -c 'echo $$; exec sleep 300' &`        ORPHANED — the grandchild outlives both Child::kill() and cl…
+          in-group but SIGHUP-immune: `trap '' HUP; sleep 300 & echo $!;… ORPHANED — the grandchild outlives both Child::kill() and cl…
+          job control ON, own group: `set -m; sleep 300 & echo $!; wait` ORPHANED — the grandchild outlives both Child::kill() and cl…
+HAZARD:   Child::kill() signals ONE pid. Read from portable-pty 0.9.0 src/lib.rs, `impl ChildKiller for std::process::Child`: it sends SIGHUP to self.id(), polls try_wait 5 times with 50 ms sleeps (~200 ms grace), then falls through to std::process::Child::kill() = SIGKILL to the same single pid. There is no killpg, no group waitpid, nothing that touches descendants.
+OBSERVED: INTERPRETATION of the pattern above, not a measurement: the cases where the grandchild died all had it inside the tty's FOREGROUND process group, and the two cases where it survived had it outside (a new session, or SIG_IGN on SIGHUP). That is consistent with the Linux kernel's disassociate_ctty() path sending SIGHUP to the controlling terminal's foreground group when the SESSION LEADER dies — i.e. the cleanup above is a side effect of the child being a session leader, not of anything portable-pty did. The `set -m` job-control case is the discriminating experiment: it puts an ordinary `sleep 300 &` into its own, non-foreground group and should therefore orphan. Read its VERDICT line above to see whether that held.
+
+--- M2b — release() semantics: close the PTY WITHOUT killing the child -----
+OBSERVED: before closing: child pid=106735 pgid=106735 sid=106735 kill-0=ALIVE /proc-state=Some('S') | grandchild pid=106737 pgid=106735 sid=106735 kill-0=ALIVE /proc-state=Some('S') | tcgetpgrp=Some(106735)
+OBSERVED: +500 ms after dropping slave+master with NO kill: child ALIVE | grandchild ALIVE
+VERDICT:  the child SURVIVED closing the PTY. release() would leave a running process with no way to observe or stop it — the wrapper must kill explicitly and must not rely on drop.
+HAZARD:   the background grandchild also survived a bare PTY close.
+OBSERVED: ZOMBIE CHECK — the child was killed with no wait() anywhere: kill(pid, 0) = ALIVE (so `kill -0` still reports ALIVE), /proc state = Some('Z'), is_zombie = true
+HAZARD:   MEASURED: a killed-but-unreaped child still answers kill(pid, 0). The assertion testing.md §3.5 names — "cancel 后无孤儿进程（kill -0 断言）" — therefore cannot distinguish a zombie from a live orphan, and a LocalPty test built only on it would pass on a process table full of zombies. portable-pty's unix Child IS a std::process::Child, whose Drop does not reap, so every kill path must be paired with wait()/try_wait() or the daemon accumulates one zombie per shell call.
+
+==============================================================================
+## M3 — does the library give us a process-group handle?
+==============================================================================
+
+--- M3a — session / process-group structure of a live child ----------------
+OBSERVED: child pid=106751 pgid=106751 sid=106751 kill-0=ALIVE /proc-state=Some('S')
+OBSERVED: PID == PGID == SID ? true
+OBSERVED: master.as_raw_fd()=Some(3)  master.process_group_leader() [tcgetpgrp]=Some(106751)  master.tty_name()=Some("/dev/pts/7")  master.get_size()=rows=24 cols=80 px=0x0
+OBSERVED: tcgetpgrp reports the child's own pid? true
+OBSERVED: Child::kill() -> Ok(())
+VERDICT:  HALF YES: portable-pty's unix backend calls setsid() in pre_exec, so the child is its own session AND process-group leader (PID == PGID == SID, measured above while alive) and takes the PTY as controlling terminal (TIOCSCTTY; controlling_tty defaults to true). A killpg(child_pid) issued by OUR code therefore reaches every grandchild still in that group — M2's positive control A shows it working.
+
+--- M3b — what process_group_leader() reports when a background job exists -
+OBSERVED: child      pid=106758 pgid=106758 sid=106758 kill-0=ALIVE /proc-state=Some('S')
+OBSERVED: grandchild pid=106760 pgid=106758 sid=106758 kill-0=ALIVE /proc-state=Some('S')
+OBSERVED: master.process_group_leader() = Some(106758) — one value, and it names the child's group
+OBSERVED: Child::kill() -> Ok(())
+
+--- M3c — what CommandBuilder gives the child when the caller sets nothing -
+OBSERVED: the child's own report: "CWD=/home/jimmy\r⏎TTY=/dev/pts/9\r⏎SHELL_VAR=/bin/bash\r⏎"
+OBSERVED: exit: Success [exit_code=0 signal=None success=true]
+OBSERVED: the probe's own cwd is "/home/jimmy/projects/hatchery/spikes/pty" — compare it with CWD= above
+HAZARD:   HALF NO: there is no API to signal the group. The entire termination surface is ChildKiller::kill(&mut self) plus clone_killer(), and both target one pid. MasterPty::process_group_leader() does exist (unix-only) but it is tcgetpgrp() — a READ-ONLY query returning the slave's FOREGROUND group, with no matching signalling call. A wrapper must bring its own killpg (libc, or nix which portable-pty already depends on), and this workspace sets unsafe_code = "deny", so that means either a local #[allow(unsafe_code)] or a new safe-wrapper dependency.
+HAZARD:   process_group_leader() reports the foreground group only (M3b): a grandchild that job control moved into its own group, or that called setsid, is invisible to it. Keying the kill off child_pid-as-pgid is strictly more reliable on unix than tcgetpgrp, and even that misses the setsid case.
+HAZARD:   CommandBuilder defaults cwd to $HOME, not the process cwd (src/cmdbuilder.rs as_command(): dir = self.cwd.filter(is_dir).unwrap_or(home)), and it resolves the program through its own search_path. TerminalSpec must set cwd explicitly or every shell tool call runs in the user's home directory.
+READ-FROM-SOURCE (not measured here): codex's utils/pty/src/process_group.rs (309 lines) exists to fill exactly this gap. It provides set_process_group()/detach_from_tty() for pre_exec, kill_process_group_by_pid()/kill_process_group()/terminate_process_group()/interrupt_process_group() over libc::killpg with SIGKILL/SIGTERM/SIGINT, a Linux-only set_parent_death_signal() using prctl(PR_SET_PDEATHSIG) plus a getppid() re-check to close the fork/exec race, and a macOS-only fallback that enumerates group members with proc_listpgrppids() and signals them individually when killpg returns EPERM. portable-pty supplies none of it. codex's own pty.rs comment records the same finding this section measured: "portable-pty establishes the spawned PTY child as a new session leader on Unix, so PID == PGID".
+
+==============================================================================
+## M4 — cancel while output is flowing
+==============================================================================
+
+--- M4a — kill from the main thread while the reader thread is blocked in read() 
+OBSERVED: killed pid=106777 mid-stream after 5 chunks / 40 bytes (207 ms in); Child::kill() itself blocked for 50 ms -> Ok(())
+OBSERVED: reader thread: finished=Some(207) ms, outcome=Some("Ok(0) — EOF"), bytes=40
+OBSERVED: try_wait after kill: Terminated by Hangup [exit_code=1 signal=Some("Hangup") success=false]
+OBSERVED: child pid=106777 pgid=? sid=? kill-0=dead /proc-state=None after kill+wait
+VERDICT:  reader UNBLOCKED ~0 ms after the kill, outcome Some("Ok(0) — EOF"). No hang, no error to handle: the library maps the pty's EIO to Ok(0) so the reader sees clean EOF.
+OBSERVED: wait()/try_wait() returns after kill — no hang.
+
+--- M4b — clone_killer() on another thread while this one blocks in Child::wait() 
+OBSERVED: clone_killer().kill() from the main thread at 207 ms -> Ok(())
+OBSERVED: the thread blocked in Child::wait(): Terminated by Hangup [exit_code=1 signal=Some("Hangup") success=false] — returned after 207 ms
+OBSERVED: reader thread finished=Some(207) outcome=Some("Ok(0) — EOF") bytes=40
+OBSERVED: child 106789 now dead
+VERDICT:  cancel from another thread works: clone_killer() is Send + Sync exactly as its doc comment promises ("send it signals independently from a thread that may be blocked in .wait"), and the blocked wait() returns. This is the shape LocalPty's cancel path needs.
+
+==============================================================================
+## M5 — runaway output: kernel buffering, backpressure, truncation headroom
+==============================================================================
+
+--- M5a — `yes | head -c 100000000` with nobody reading for 2 s ------------
+OBSERVED: after 2000 ms with no reader: FIONREAD(master fd Some(3)) = Some(4095) bytes held in the kernel
+OBSERVED: child 106810: try_wait = None (still running); kill-0 = ALIVE; /proc state = Some('S') (S = interruptible sleep, i.e. blocked on write)
+OBSERVED: a 100 MB payload had delivered only Some(4095) bytes after 2 s of nobody reading, and the child was still running => the writer is BLOCKED, not buffered without limit and not silently dropping.
+OBSERVED: the pipeline's own pids, enumerated from /proc/106810/task/*/children: [106811, 106812]
+OBSERVED:   pid=106811 pgid=106810 sid=106810 kill-0=ALIVE /proc-state=Some('S')
+OBSERVED:   pid=106812 pgid=106810 sid=106810 kill-0=ALIVE /proc-state=Some('S')
+OBSERVED: Child::kill() on the BLOCKED flood child -> Ok(()); +600 ms the child is dead
+OBSERVED:   pipeline member after the kill: pid=106811 pgid=? sid=? kill-0=dead /proc-state=None
+OBSERVED:   pipeline member after the kill: pid=106812 pgid=? sid=? kill-0=dead /proc-state=None
+OBSERVED: pipeline members still RUNNING after Child::kill(): []
+VERDICT:  the timeout kill DID take the whole pipeline with it — but not because the library signalled it. `yes` and `head` were both in the child's process group, which is also the tty's FOREGROUND group, so they died from the same kernel SIGHUP that M2 measured. M2's `set -m` case shows the identical payload shape orphaning as soon as the grandchild is not in the foreground group. Do not read this as "pipelines are safe".
+VERDICT:  backpressure is real and the ceiling is small: 4095 bytes sat in the kernel and the child blocked. Nothing grows without bound and nothing is dropped silently, so the ring buffer is a policy choice on OUR side (drop-oldest + a truncation marker), not something the OS does for us. It also means a stalled consumer FREEZES the child — the reader must never stop draining while a tool runs, or the timeout kill fires on a child that was merely waiting for us.
+
+--- M5b — draining the same flood: throughput and line-discipline inflation 
+OBSERVED: drained 150000000 bytes in 11.26 s = 12.7 MiB/s; the reader stopped because Some("EOF (Ok(0))")
+OBSERVED: the payload wrote 100000000 bytes containing 50000000 LF bytes; with ONLCR the master should yield 150000000 bytes. Measured 150000000. Matches: true
+OBSERVED: child after the drain: try_wait = Some(Success [exit_code=0 signal=None success=true]); kill-0 = dead
+HAZARD:   CONFIRMED at scale: the line discipline inflated the child's output by 50000000 bytes (50%). A newline-heavy payload can nearly DOUBLE in size between the child's write() and our ring buffer, so the D12 spill threshold and any per-call output budget must be sized against what the PTY delivers, not what the child wrote.
+
+--- M5c — byte-exact integrity of a 4 MiB payload with no newlines ---------
+OBSERVED: child 106848 exit=Some("Success [exit_code=0 signal=None success=true]") reader_done=Some(12) outcome=Some("Ok(0) — EOF")
+OBSERVED: expected 4194304 bytes of 'X'; received 4194304 bytes; every byte is 'X': true; 1231 chunks; wall 0.02 s = 171.7 MiB/s
+VERDICT:  lossless: all 4194304 bytes arrived byte-for-byte, nothing dropped or reordered.
+OBSERVED: throughput contrast: 171.7 MiB/s for newline-free output vs 12.7 MiB/s for the `yes` payload in M5b — a 13.5x penalty purely from the line discipline processing one LF every 2 bytes. Sizing D12's spill threshold or a tool-call timeout on the fast number would be wrong for real shell output, which is newline-heavy.
+VERDICT:  at 172 MiB/s a runaway child produces tens of MiB per second, so the ring-buffer budget (D12's spill threshold) is the only thing between `yes` and the model's context window.
+HAZARD:   the largest read() chunk is bounded by OUR buffer, not by the library: a truncating ring buffer must count bytes as they are read, because the kernel will block the child rather than discard. There is no library-side cap to rely on, and portable-pty offers no buffered/capped reader of its own.
+
+==============================================================================
+## M6 — build cost (measured outside the binary)
+==============================================================================
+OBSERVED: a binary cannot time its own compilation. The cold-build wall time and the dependency counts are measured by the shell commands recorded in the spike report: `cargo build` from a clean target directory, and `cargo tree | wc -l`.
+
+==============================================================================
+## CLEANUP
+==============================================================================
+OBSERVED: 26 pids were registered by this run: [106611, 106638, 106670, 106676, 106678, 106683, 106686, 106691, 106693, 106709, 106711, 106720, 106722, 106735, 106737, 106751, 106758, 106760, 106769, 106777, 106789, 106810, 106811, 106812, 106822, 106848]
+OBSERVED: final sweep — still running and hard-killed: []; already zombies: []; already gone: [106611, 106638, 106670, 106676, 106678, 106683, 106686, 106691, 106693, 106709, 106711, 106720, 106722, 106735, 106737, 106751, 106758, 106760, 106769, 106777, 106789, 106810, 106811, 106812, 106822, 106848]; reaped by waitpid: []
+OBSERVED: sweep of the whole process table for the payload's signature (`sleep 300`) plus any registered pid that shows as `<defunct>`:
+                    <empty — no stray processes>
+OBSERVED: pids still answering kill(pid, 0) after the sweep: [] (/proc usable here: true)
+VERDICT:  no stray processes left behind — nothing running, nothing defunct.
+HAZARD:   1 pid(s) were observed as ZOMBIES during this run ([106735]): killed but never reaped, because the Child handle was dropped without a wait(). std::process::Child's Drop does not reap, and portable-pty's unix Child IS a std::process::Child — so a LocalPty that kills without waiting leaks one zombie per shell call for the lifetime of the daemon. Consequence for the gate: `kill -0 <pid>`, the assertion testing.md §3.5 names, SUCCEEDS for a zombie, so on its own it cannot prove "no orphan process". The LocalPty test must also reap (Child::wait/try_wait) or read the process state, or it will pass on a table full of zombies. This probe reaps in its own sweep, which is why the listing above is empty.
+
+==============================================================================
+## END
+==============================================================================
+OBSERVED: all measurements ran to completion on this platform.
+OBSERVED: This run measured ONE platform. macOS and Windows are not measured here; the Windows/macOS mechanisms in the accompanying report are read from references/codex/codex-rs/utils/pty/src and from portable-pty 0.9.0's own source.

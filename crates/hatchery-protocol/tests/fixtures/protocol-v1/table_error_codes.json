@@ -1,0 +1,58 @@
+[
+  {
+    "code": -32700,
+    "name": "parse_error"
+  },
+  {
+    "code": -32600,
+    "name": "invalid_request"
+  },
+  {
+    "code": -32601,
+    "name": "method_not_found"
+  },
+  {
+    "code": -32602,
+    "name": "invalid_params"
+  },
+  {
+    "code": -32603,
+    "name": "internal_error"
+  },
+  {
+    "code": -32000,
+    "name": "session_not_found"
+  },
+  {
+    "code": -32001,
+    "name": "generation_mismatch"
+  },
+  {
+    "code": -32002,
+    "name": "turn_in_progress"
+  },
+  {
+    "code": -32003,
+    "name": "approval_denied"
+  },
+  {
+    "code": -32004,
+    "name": "approval_timed_out"
+  },
+  {
+    "code": -32005,
+    "name": "store_error"
+  },
+  {
+    "code": -32006,
+    "name": "llm_error"
+  },
+  {
+    "code": -32007,
+    "name": "config_error"
+  },
+  {
+    "code": -32008,
+    "name": "unsupported_protocol_version"
+  }
+]

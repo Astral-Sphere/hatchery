@@ -21,24 +21,26 @@ env_key = "DEEPSEEK_API_KEY"          # 密钥只从环境读取，不落盘
 wire = "chat-completions"              # 或 "responses"
 reasoning_effort = "high"              # Off|Low|Medium|High|Max
 show_reasoning = true                  # UI 展示开关（不影响回传）
-models = ["deepseek-chat", "deepseek-reasoner"]
+models = ["deepseek-flash"]
 
 [providers.my-gateway]
 base_url = "https://gw.example.com/v1"
 env_key = "GW_KEY"
 wire = "chat-completions"
 http_headers = { "X-Custom" = "1" }
-retry = { max = 4, backoff_ms = 500 }
+retry = { max_attempts = 4, backoff_ms = 500 }
 ```
 
 ```rust
 pub struct ProviderConfig {
-    pub base_url: Url,
+    pub base_url: String,                    // 纯文本 URL；不含 /chat/completions 后缀
     pub env_key: String,
-    pub wire: WireApi,                       // ChatCompletions | Responses
-    pub headers: HeaderMap,
-    pub retry: RetryPolicy,
+    pub wire: WireApi,                       // ChatCompletions | Responses（M1 只实现前者，配置成后者 fatal 拒绝）
+    pub http_headers: BTreeMap<String, String>,
+    pub retry: RetryPolicy,                  // { max_attempts, backoff_ms, max_backoff_ms, jitter_percent }
     pub reasoning: ReasoningConfig,          // 默认 effort + 展示开关
+    pub models: Vec<String>,
+    pub capabilities: Vec<(String, ModelCapabilities)>,
 }
 ```
 
@@ -51,8 +53,8 @@ canonical：`Off | Low | Medium | High | Max`。内置默认表（借鉴 qwen-co
 | provider 族 | wire 表达 |
 |---|---|
 | OpenAI / Responses | `reasoning.effort: minimal\|low\|medium\|high`（Max→high） |
-| DeepSeek | 无 effort 参数；Off→`deepseek-chat`，其余→`deepseek-reasoner`（模型切换即 effort） |
-| Qwen (DashScope 兼容) | `enable_thinking: bool` + `thinking_budget`（Low..Max 映射预算档） |
+| DeepSeek | `thinking: { type: "enabled"/"disabled" }`；当前世代（2026-09-30 校准）为混合推理模型，**默认开**，该开关关掉推理，模型不再切换 |
+| Qwen (DashScope 兼容) | `enable_thinking: bool` + `thinking_budget`（Low..Max 映射预算档）；当前世代混合模型**默认开**，显式传参保证确定性 |
 | 智谱 GLM | `thinking: { type: "enabled"/"disabled" }` |
 | 通用 OpenAI 兼容 | `reasoning_effort` 透传；不支持则忽略并记录一次 warning |
 
@@ -60,11 +62,10 @@ canonical：`Off | Low | Medium | High | Max`。内置默认表（借鉴 qwen-co
 
 ```rust
 pub struct ModelCapabilities {
-    pub reasoning_field: ReasoningField,   // ReasoningEffort | EnableThinking | ThinkingBudget | ModelSwitch | None
+    pub reasoning: ReasoningWire,          // Effort | QwenThinking | ThinkingSwitch | ModelSwitch | None
     pub echo_reasoning: bool,              // 是否支持/要求历史回传 reasoning_content
     pub signature_blocks: bool,            // 是否有不透明签名块（Responses encrypted_content 等）
-    pub max_context_tokens: Option<u64>,
-}
+}                                        // （规划期的 max_context_tokens 已裁掉：M1 没有读它的路径）
 ```
 
 ## 4. reasoning 数据通路

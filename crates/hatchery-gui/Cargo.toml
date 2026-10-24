@@ -1,0 +1,27 @@
+[package]
+name = "hatchery-gui"
+description = "Native desktop frontend: GTK4 + libadwaita, gettext i18n, RTL through Pango"
+keywords = ["agent", "gui", "gtk4", "libadwaita", "hatchery"]
+categories = ["gui"]
+readme = "README.md"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+
+[lib]
+name = "hatchery_gui"
+path = "src/lib.rs"
+
+[[bin]]
+name = "hatchery-gui"
+path = "src/main.rs"
+
+[dependencies]
+hatchery-protocol.workspace = true
+
+[lints]
+workspace = true

@@ -1,6 +1,6 @@
 # ADR-0006: 代码回滚用影子 Git 检查点
 
-状态：accepted（2026-09-28）
+状态：accepted（2026-09-28）。**后端选型已由 [ADR-0012](0012-shadow-git-git2-vendored.md) 关闭**：影子 Git 用 `git2`（vendored libgit2），不依赖用户机器上的 git 二进制。本 ADR 的其余决策——独立 git-dir、检查点时机、预算熔断、`RewindScope`——继续有效；下文凡提到 `git --git-dir=… --work-tree=…` 的地方，实现形态以 ADR-0012 为准。
 
 ## 背景
 

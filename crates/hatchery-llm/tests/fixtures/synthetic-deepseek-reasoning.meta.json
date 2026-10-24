@@ -1,0 +1,1 @@
+{"provenance":"synthetic","provider":"deepseek","model":"deepseek-reasoner","shape":"reasoning deltas with leading/trailing whitespace and a CJK fold, then text; usage reports reasoning_tokens","recorded_at":null,"note":"byte shapes mirror the providers documented stream examples; replaced by real recordings via cargo xtask record-fixtures"}

@@ -1,0 +1,15 @@
+{
+  "generation": 3,
+  "request": {
+    "args_digest": "write ~/.ssh/config (outside the workspace)",
+    "options": [
+      "allow_once",
+      "deny"
+    ],
+    "risk": "writes_outside",
+    "tool": "write_file"
+  },
+  "request_id": "01890f47-0000-7000-8000-000000000005",
+  "session": "01890f47-0000-7000-8000-000000000001",
+  "type": "approval_requested"
+}

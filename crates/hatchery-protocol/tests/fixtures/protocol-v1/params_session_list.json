@@ -1,0 +1,8 @@
+{
+  "cursor": "cursor-1",
+  "filter": {
+    "mode": "code",
+    "title_contains": "store"
+  },
+  "limit": 50
+}

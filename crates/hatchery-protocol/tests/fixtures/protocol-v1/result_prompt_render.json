@@ -1,0 +1,10 @@
+{
+  "sections": [
+    {
+      "id": "identity",
+      "source": "builtin",
+      "text": "You are hatchery."
+    }
+  ],
+  "text": "identity\nmode\n"
+}

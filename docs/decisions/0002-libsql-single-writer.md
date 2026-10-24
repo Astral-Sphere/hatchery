@@ -1,6 +1,6 @@
 # ADR-0002: 存储用 daemon 内嵌 libSQL（WAL）+ 单写者 actor
 
-状态：accepted（2026-09-28）
+状态：accepted（2026-09-28）。**引擎选型部分已被 [ADR-0010](0010-storage-engine-turso.md) 取代**：M0a 实测后选定 `turso` 0.7.2（纯 Rust）而非 `libsql` crate。本 ADR 的其余决策——daemon 内嵌、WAL、单写者 actor、`SessionStore` trait 隔离、JSONL 导出逃生门——继续有效，下文「引擎」相关表述以 ADR-0010 为准。
 
 ## 背景
 

@@ -1,0 +1,8 @@
+{
+  "boot_token": "boot-1234",
+  "client": {
+    "name": "hatchery-cli",
+    "version": "0.1.0"
+  },
+  "protocol_version": "1.0.0"
+}

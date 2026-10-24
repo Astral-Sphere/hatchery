@@ -1,0 +1,26 @@
+data: {"id":"67fecc6c-7df5-45ed-8b8d-ed159d354751","object":"chat.completion.chunk","created":1790843640,"model":"deepseek-flash","system_fingerprint":"aeb56401ca74e127821c4f9126dcb669","choices":[{"index":0,"delta":{"role":"assistant","content":""},"logprobs":null,"finish_reason":null}],"usage":null}
+
+data: {"id":"67fecc6c-7df5-45ed-8b8d-ed159d354751","object":"chat.completion.chunk","created":1790843640,"model":"deepseek-flash","system_fingerprint":"aeb56401ca74e127821c4f9126dcb669","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_00_2NYVbgkeQC0tMfDeLMOY1114","type":"function","function":{"name":"record_ping","arguments":""}}]},"logprobs":null,"finish_reason":null}],"usage":null}
+
+data: {"id":"67fecc6c-7df5-45ed-8b8d-ed159d354751","object":"chat.completion.chunk","created":1790843640,"model":"deepseek-flash","system_fingerprint":"aeb56401ca74e127821c4f9126dcb669","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{"}}]},"logprobs":null,"finish_reason":null}],"usage":null}
+
+data: {"id":"67fecc6c-7df5-45ed-8b8d-ed159d354751","object":"chat.completion.chunk","created":1790843640,"model":"deepseek-flash","system_fingerprint":"aeb56401ca74e127821c4f9126dcb669","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\""}}]},"logprobs":null,"finish_reason":null}],"usage":null}
+
+data: {"id":"67fecc6c-7df5-45ed-8b8d-ed159d354751","object":"chat.completion.chunk","created":1790843640,"model":"deepseek-flash","system_fingerprint":"aeb56401ca74e127821c4f9126dcb669","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"value"}}]},"logprobs":null,"finish_reason":null}],"usage":null}
+
+data: {"id":"67fecc6c-7df5-45ed-8b8d-ed159d354751","object":"chat.completion.chunk","created":1790843640,"model":"deepseek-flash","system_fingerprint":"aeb56401ca74e127821c4f9126dcb669","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\""}}]},"logprobs":null,"finish_reason":null}],"usage":null}
+
+data: {"id":"67fecc6c-7df5-45ed-8b8d-ed159d354751","object":"chat.completion.chunk","created":1790843640,"model":"deepseek-flash","system_fingerprint":"aeb56401ca74e127821c4f9126dcb669","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":": "}}]},"logprobs":null,"finish_reason":null}],"usage":null}
+
+data: {"id":"67fecc6c-7df5-45ed-8b8d-ed159d354751","object":"chat.completion.chunk","created":1790843640,"model":"deepseek-flash","system_fingerprint":"aeb56401ca74e127821c4f9126dcb669","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\""}}]},"logprobs":null,"finish_reason":null}],"usage":null}
+
+data: {"id":"67fecc6c-7df5-45ed-8b8d-ed159d354751","object":"chat.completion.chunk","created":1790843640,"model":"deepseek-flash","system_fingerprint":"aeb56401ca74e127821c4f9126dcb669","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"hello"}}]},"logprobs":null,"finish_reason":null}],"usage":null}
+
+data: {"id":"67fecc6c-7df5-45ed-8b8d-ed159d354751","object":"chat.completion.chunk","created":1790843640,"model":"deepseek-flash","system_fingerprint":"aeb56401ca74e127821c4f9126dcb669","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\""}}]},"logprobs":null,"finish_reason":null}],"usage":null}
+
+data: {"id":"67fecc6c-7df5-45ed-8b8d-ed159d354751","object":"chat.completion.chunk","created":1790843640,"model":"deepseek-flash","system_fingerprint":"aeb56401ca74e127821c4f9126dcb669","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"}"}}]},"logprobs":null,"finish_reason":null}],"usage":null}
+
+data: {"id":"67fecc6c-7df5-45ed-8b8d-ed159d354751","object":"chat.completion.chunk","created":1790843640,"model":"deepseek-flash","system_fingerprint":"aeb56401ca74e127821c4f9126dcb669","choices":[{"index":0,"delta":{"content":""},"logprobs":null,"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":306,"completion_tokens":33,"total_tokens":339,"prompt_tokens_details":{"cached_tokens":128},"prompt_cache_hit_tokens":128,"prompt_cache_miss_tokens":178}}
+
+data: [DONE]
+

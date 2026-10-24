@@ -1,0 +1,24 @@
+{
+  "created_at": 1780000000004,
+  "id": "01890f47-0000-7000-8000-000000000002",
+  "kind": "tool_result",
+  "parent": "01890f47-0000-7000-8000-000000000003",
+  "payload": {
+    "call": "01890f47-0000-7000-8000-000000000003",
+    "is_error": false,
+    "output": {
+      "artifacts": [
+        {
+          "path": "/tmp/out.txt"
+        }
+      ],
+      "spilled": {
+        "bytes": 120000,
+        "path": "/tmp/state/tool-results/1.txt"
+      },
+      "text": "fn chain(…) { … }"
+    }
+  },
+  "session": "01890f47-0000-7000-8000-000000000001",
+  "turn": "01890f47-0000-7000-8000-000000000004"
+}

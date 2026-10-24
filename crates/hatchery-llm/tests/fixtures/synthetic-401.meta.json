@@ -1,0 +1,1 @@
+{"provenance":"synthetic","provider":"deepseek","model":"deepseek-chat","shape":"authentication error body","recorded_at":null,"note":"byte shapes mirror the providers documented stream examples; replaced by real recordings via cargo xtask record-fixtures"}

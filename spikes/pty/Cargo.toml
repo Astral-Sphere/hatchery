@@ -1,0 +1,28 @@
+# D10 measurement spike (docs/roadmap.md risk 1, docs/design/testing.md §3.5).
+#
+# The empty [workspace] table below is load-bearing: it makes this directory its own
+# workspace root, so `cargo metadata` / `cargo build --workspace` from the repository
+# root never see this crate and `portable-pty` never enters the project's Cargo.lock.
+# That matters because D10 is still open — a new dependency must not land in the
+# project lock file before the decision is made.
+#
+# Run with:  cargo run --manifest-path spikes/pty/Cargo.toml
+[workspace]
+
+[package]
+name = "pty-spike"
+version = "0.0.0"
+edition = "2024"
+# Matches the project's rust-version so a failure here is attributable to the library,
+# not to a looser toolchain. The MSRV gate is `cargo +1.90.0 check --workspace --locked`.
+rust-version = "1.90"
+publish = false
+license = "GPL-3.0-only"
+
+[dependencies]
+portable-pty = "0.9.0"
+
+# Observation instruments only (kill(pid, 0), getpgid, getsid, FIONREAD). portable-pty
+# already depends on libc on unix, so this adds zero crates to the unix graph.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

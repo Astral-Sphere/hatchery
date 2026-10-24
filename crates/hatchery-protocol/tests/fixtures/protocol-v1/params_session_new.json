@@ -1,0 +1,8 @@
+{
+  "mode": "code",
+  "model": {
+    "model": "deepseek-reasoner",
+    "provider": "deepseek"
+  },
+  "workspace": "/home/dev/project"
+}

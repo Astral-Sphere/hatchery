@@ -1,6 +1,6 @@
 # ADR-0008: GUI 用 gtk4-rs + libadwaita，i18n 用 gettext
 
-状态：accepted（2026-09-28）
+状态：accepted（2026-09-28）。**i18n 部分已被 [ADR-0011](0011-i18n-fluent.md) 取代**：M0a 实测发现 gtk4-rs/glib 并不集成 gettext，且 `gettext-rs` 需要 vendored 编译 C 版 libintl，故应用文案改用 fluent。本 ADR 的其余决策——gtk4-rs + libadwaita、tokio↔GTK 桥接纪律、RTL 交给 Pango、flatpak 打包——继续有效。
 
 ## 背景
 

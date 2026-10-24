@@ -1,0 +1,14 @@
+data: {"id":"2","choices":[{"index":0,"delta":{"role":"assistant","reasoning_content":" 先想 "},"finish_reason":null}],"created":1718345020,"model":"deepseek-reasoner","object":"chat.completion.chunk"}
+
+data: {"id":"2","choices":[{"index":0,"delta":{"reasoning_content":"\t再想\n"},"finish_reason":null}],"created":1718345020,"model":"deepseek-reasoner","object":"chat.completion.chunk"}
+
+data: {"id":"2","choices":[{"index":0,"delta":{"content":"答案"},"finish_reason":null}],"created":1718345020,"model":"deepseek-reasoner","object":"chat.completion.chunk"}
+
+data: {"id":"2","choices":[{"index":0,"delta":{"content":" 是 42。"},"finish_reason":null}],"created":1718345020,"model":"deepseek-reasoner","object":"chat.completion.chunk"}
+
+data: {"id":"2","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"created":1718345020,"model":"deepseek-reasoner","object":"chat.completion.chunk"}
+
+data: {"id":"2","choices":[],"created":1718345020,"model":"deepseek-reasoner","object":"chat.completion.chunk","usage":{"completion_tokens":31,"prompt_tokens":12,"total_tokens":43,"completion_tokens_details":{"reasoning_tokens":18}}}
+
+data: [DONE]
+

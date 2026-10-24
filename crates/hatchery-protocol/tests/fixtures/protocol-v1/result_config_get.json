@@ -1,0 +1,9 @@
+{
+  "entries": [
+    {
+      "key": "providers.deepseek.reasoning_effort",
+      "origin": "user",
+      "value": "high"
+    }
+  ]
+}

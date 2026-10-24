@@ -32,6 +32,7 @@
 
 ## 后果
 
-- item 树 + 级联删除的 SQL 需要递归 CTE，M0 就要把 schema 和核心查询写对并有测试。
+- item 树的级联删除靠外键 `ON DELETE CASCADE`，树遍历在 Rust 内做（引擎无 `WITH RECURSIVE`，见 ADR-0010）；两者已于 M0a 实测成立（`crates/hatchery-store/tests/spike_engine.rs`），M0b 补完 schema 落地与 store 层查询测试。
+- 删除分支时若 `active_head` 仍在子树内，引擎的外键会直接拒绝——应用层校验之外还有一层数据库兜底。
 - 删除分支与影子 Git 检查点的引用完整性：检查点记录挂在 item 上，级联删除时一并处理。
 - UI 需要分支可视化（树/时间线），GTK 端工作量增加，但这也是差异化卖点。

@@ -1,0 +1,78 @@
+# Invariant 4 (docs/architecture.md §5): tool implementations reach the outside world only
+# through the capability seam (ADR-0004).
+#
+# Scope: these lists apply to every crate, but the two `disallowed_*` lints are `allow`ed in the
+# workspace `[lints]` table and `deny`ied in `hatchery-tools` alone — by that crate's own complete
+# local `[lints]` table, because Cargo lint tables are command-line flags that beat any source-level
+# `#![deny]`, and a workspace inheritance cannot mix with a local table (measured 2026-10-01).
+# daemon, store, capabilities and xtask touch the OS legitimately, and hatchery-acp spawns external
+# agent processes (docs/design/acp.md §2).
+#
+# Every `std::fs` ban has a `tokio::fs` twin: the seam is about *which* API a tool calls, not about
+# which runtime it is on, and `hatchery-tools` already depends on tokio — enabling its `fs` feature
+# would otherwise reduce this whole list to a suggestion. `hatchery-capabilities` is the one crate
+# that enables it, for `LocalFs`, because it *is* the seam.
+#
+# The `tokio::process::Command` twins are deliberately absent. No crate enables tokio's `process`
+# feature, so clippy answers every one of those paths with "does not refer to a reachable function"
+# — one warning per path in every gate run (measured 2026-10-07: they do not fail `-D warnings`,
+# being config diagnostics rather than lints, they just train the eye to skip warnings). They belong here the
+# moment a crate enables that feature; `std::process::Command` is banned meanwhile, and so is the
+# type.
+#
+# A path clippy cannot resolve is silently ignored, so a typo here is a hole rather than an error.
+# Every path listed below was probed by calling it from a scratch module in `hatchery-tools` with
+# tokio's `fs` feature temporarily enabled, and clippy flagged each one (2026-10-07); a standing
+# compile-fail probe is M2 Phase 7.
+disallowed-methods = [
+    { path = "std::fs::read", reason = "use FsBackend::read (ADR-0004)" },
+    { path = "std::fs::read_to_string", reason = "use FsBackend::read (ADR-0004)" },
+    { path = "std::fs::read_dir", reason = "use FsBackend::read_dir (ADR-0004)" },
+    { path = "std::fs::write", reason = "use FsBackend::write (ADR-0004)" },
+    { path = "std::fs::copy", reason = "use FsBackend (ADR-0004)" },
+    { path = "std::fs::rename", reason = "use FsBackend (ADR-0004)" },
+    { path = "std::fs::remove_file", reason = "use FsBackend (ADR-0004)" },
+    { path = "std::fs::remove_dir", reason = "use FsBackend (ADR-0004)" },
+    { path = "std::fs::remove_dir_all", reason = "use FsBackend (ADR-0004)" },
+    { path = "std::fs::create_dir", reason = "use FsBackend (ADR-0004)" },
+    { path = "std::fs::create_dir_all", reason = "use FsBackend (ADR-0004)" },
+    { path = "std::fs::metadata", reason = "use FsBackend::metadata (ADR-0004)" },
+    { path = "std::fs::symlink_metadata", reason = "use FsBackend::metadata (ADR-0004)" },
+    { path = "std::fs::read_link", reason = "use FsBackend::metadata (ADR-0004)" },
+    { path = "std::fs::hard_link", reason = "use FsBackend (ADR-0004)" },
+    { path = "std::fs::set_permissions", reason = "use FsBackend (ADR-0004)" },
+    { path = "std::fs::File::open", reason = "use FsBackend (ADR-0004)" },
+    { path = "std::fs::File::create", reason = "use FsBackend (ADR-0004)" },
+    { path = "std::fs::OpenOptions::open", reason = "use FsBackend (ADR-0004)" },
+    { path = "tokio::fs::read", reason = "use FsBackend::read (ADR-0004)" },
+    { path = "tokio::fs::read_to_string", reason = "use FsBackend::read (ADR-0004)" },
+    { path = "tokio::fs::read_dir", reason = "use FsBackend::read_dir (ADR-0004)" },
+    { path = "tokio::fs::write", reason = "use FsBackend::write (ADR-0004)" },
+    { path = "tokio::fs::copy", reason = "use FsBackend (ADR-0004)" },
+    { path = "tokio::fs::rename", reason = "use FsBackend (ADR-0004)" },
+    { path = "tokio::fs::remove_file", reason = "use FsBackend (ADR-0004)" },
+    { path = "tokio::fs::remove_dir", reason = "use FsBackend (ADR-0004)" },
+    { path = "tokio::fs::remove_dir_all", reason = "use FsBackend (ADR-0004)" },
+    { path = "tokio::fs::create_dir", reason = "use FsBackend (ADR-0004)" },
+    { path = "tokio::fs::create_dir_all", reason = "use FsBackend (ADR-0004)" },
+    { path = "tokio::fs::metadata", reason = "use FsBackend::metadata (ADR-0004)" },
+    { path = "tokio::fs::symlink_metadata", reason = "use FsBackend::metadata (ADR-0004)" },
+    { path = "tokio::fs::read_link", reason = "use FsBackend::metadata (ADR-0004)" },
+    { path = "tokio::fs::hard_link", reason = "use FsBackend (ADR-0004)" },
+    { path = "tokio::fs::set_permissions", reason = "use FsBackend (ADR-0004)" },
+    { path = "tokio::fs::File::open", reason = "use FsBackend (ADR-0004)" },
+    { path = "tokio::fs::File::create", reason = "use FsBackend (ADR-0004)" },
+    { path = "tokio::fs::OpenOptions::open", reason = "use FsBackend (ADR-0004)" },
+    { path = "std::process::Command::new", reason = "use TerminalBackend (ADR-0004)" },
+    { path = "std::process::Command::output", reason = "use TerminalBackend (ADR-0004)" },
+    { path = "std::process::Command::status", reason = "use TerminalBackend (ADR-0004)" },
+    { path = "std::process::Command::spawn", reason = "use TerminalBackend (ADR-0004)" },
+    { path = "std::process::abort", reason = "a harness must not abort the daemon" },
+    { path = "std::env::set_var", reason = "unsound in edition 2024; tests use TempWorkspace" },
+]
+
+disallowed-types = [
+    { path = "std::process::Command", reason = "use TerminalBackend (ADR-0004)" },
+    { path = "std::fs::File", reason = "use FsBackend (ADR-0004)" },
+    { path = "tokio::fs::File", reason = "use FsBackend (ADR-0004)" },
+]
