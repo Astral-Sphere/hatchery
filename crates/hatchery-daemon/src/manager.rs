@@ -349,6 +349,15 @@ impl SessionManager {
             .session(params.session_id)
             .await
             .map_err(store_error)?;
+        // A turn in flight is the more actionable refusal: the caller retries after it, whereas
+        // GenerationMismatch would blame a generation that may have moved for an unrelated
+        // reason. It also keeps the protocol's answer to "two prompts at once" stable.
+        if self
+            .runtime_for(session.id)
+            .is_some_and(|runtime| runtime.is_busy())
+        {
+            return Err(ManagerError(crate::core::turn_in_progress()));
+        }
         if params
             .generation
             .is_some_and(|seen| seen < session.generation)
