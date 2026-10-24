@@ -24,14 +24,16 @@
 ```toml
 [ui]                language = "zh-CN"  theme = "auto"  show_reasoning = true
 [daemon]            idle_timeout_min = 30
-[store]             checkpoint_budget_mb = 500  disk_fuse_gb = 2
+[checkpoints]       workspace_budget_mb = 500  global_budget_mb = 2048  max_file_mb = 10  ignore_rules = ""
+[approval]          timeout_seconds = 120  allow = []  deny = []
+[context]           max_input_tokens = 96000
 [providers.X]       # llm.md §2
-[modes.custom-name] # ADR-0005 自定义模式：tools include/exclude、approval、prompt variant
-[acp_agents.name]   # acp.md §2
-[approval_rules]    # 与 DB 中 approval_rules 表同步展示（DB 为准，config 只读快照）
+[modes.custom-name] # ADR-0005 自定义模式：tools include/exclude、approval、prompt variant（尚未实现）
+[acp_agents.name]   # acp.md §2（M3）
+[approval_rules]    # 与 DB 中 approval_rules 表同步展示（DB 为准，config 只读快照；尚未实现）
 ```
 
-**现状对账（2026-10-07）**：以上是目标结构。**今天被读取的 key 只有三类**——`ui.{show_reasoning,theme,language,response_language}`、`daemon.idle_timeout_min`、`providers.<id>.*` 子树（`is_known_key`，config.rs:158，是唯一判定点）。`[store]` 的检查点预算、`[modes.*]`、`[approval_rules]` 与工具策略（capabilities.md §4 的 `ToolPolicy`、§2 的 `Budget`）**全部是 M2 新增，当前 schema 里一个都没有表示**；`[acp_agents.*]` 属 M3。所以 M2 Phase 2 要成对地做两件事：① 把这些 key 加进 schema；② 给它们配上安全边界——`STRICT_KEYS`（config.rs:154，「解析失败不得降级」的那份清单）**现在是空表**，其注释直说「接进 `filter_keys` 与 typed reader 是 M2 的任务」。在它接上之前，§1.1 那句「项目级配置不得覆盖安全硬门与审批持久规则」还只是意图：今天没有任何一个安全 key 存在，所以也没有任何东西可被项目级配置覆盖掉。
+**现状对账（2026-10-24）**：今天被读取的 key 是 `ui.*`、`daemon.idle_timeout_min`、`providers.<id>.*`、`checkpoints.{workspace_budget_mb,global_budget_mb,max_file_mb,ignore_rules}`（Phase 1）、`approval.{timeout_seconds,allow,deny}`（Phase 2）、`context.max_input_tokens`（Phase 4）。`is_known_key` 是唯一判定点；`STRICT_KEYS = ["approval.allow","approval.deny"]`，**项目层**对它们的赋值被丢弃并记 error（invariant 5），错误类型的值也走同一路径。`[modes.*]` 的自定义模式仍缺模式注册表（Phase 6）；`[approval_rules]` 以 DB 为准，config 里没有消费者；`[acp_agents.*]` 属 M3。草图里的 `[store]` 表名从未落地——检查点预算在 `[checkpoints]`。
 
 ## 2. 提示词系统
 

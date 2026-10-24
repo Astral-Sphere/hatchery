@@ -37,6 +37,35 @@
 
 ## 变更日志
 
+### 2026-10-24 · Phase 4：PTY、shell、web_fetch、spill 与上下文预算
+
+**交付**：`TerminalHandle` 换成流式形状（`next_chunk` / `wait` / `kill` / `release`，全部 `&self`，让消费者在一个 `select!` 里同时看输出与退出）；`TerminalOutcome` 合并成一路输出 + `dropped_bytes`（PTY 只有一个设备）。`LocalPty` 用 portable-pty 0.9 + nix：显式 cwd、CRLF 归一化、head 1 MiB + tail 7 MiB 捕获、进程组 SIGKILL、控制线程、退出后 250ms EOF 宽限、取消 watcher + Drop 双保险；非 unix 拒绝。`MemoryTerminal` 进 testkit。`shell`（`sh -c`、流式进度、120s/600s 超时、危险模式一次性批准）与 `web_fetch`（reqwest 0.13 + htmd、http(s)、5 MiB、30s/120s、二进制拒绝、Network 一次性审批）进 `code_tools()`；Code 绑 `LocalPty`，Chat 仍 `NoTerminal`。注册表在输出离开 backend 时统一脱敏 + spill（D12：64 KiB / `<data_dir>/tool-results/` / head-tail 16 KiB / 0600）。`[context] max_input_tokens`（默认 96000、下限 4096）+ `StoreHistory` 的裁剪（先削旧工具结果到 4000 字符、再整轮丢最旧 round）。
+
+**偏离草图与理由（机制级）**：
+
+1. **`release` 在 PTY 上就是 `kill`**。探针实测关掉 master/slave 后 500ms 子进程仍活着；「交回一个没人看管的活进程」不是所有权转移而是泄漏，`unified_exec`（M5）才有资格改这个契约。
+2. **不用库的 `clone_killer()` 直接杀，改成一个控制线程同时负责 reap 与 signal**。库的 `kill()` 只发一个 pid（探针 5 个场景 3 个留孤儿），所以必须 `killpg`；而「另一个线程 wait 完、这个线程再 killpg」存在 pid 被 reap 后复用、误杀无关进程组的窗口。控制线程每 20ms 轮询 `try_wait`，只在子进程仍活着时发信号，reap 与 signal 永不并发。
+3. **捕获是 head+tail 而不是纯环形**。构建日志的尾部解释失败，头部解释命令；纯尾环会丢掉命令本身，纯头会丢掉最后的错误。上限 8 MiB（1+7），超出部分计数并在结果里说明。
+4. **`wait` 在子进程退出时返回，只给 EOF 250ms 宽限**。孙进程可以一直占着 pty，等 EOF 会挂在一个已经结束的命令上；捕获里已有的字节照常返回。
+5. **spill 放在注册表，不放在每个工具**。这是「模型上下文」的问题，不是工具语义的问题；每个新工具自己封顶会各自漂移（今天 read_file 256 KiB、glob 1000 条、grep 200 条）。工具仍保留带内上限，注册表只处理「离开 backend 之后」。
+6. **spill 目录是 `<data_dir>/tool-results`，不是草图写的 `~/.local/state`**。manager 已经持有一个数据根，多穿第二个 XDG 根不换来任何行为差异；目录名与现有 store/影子仓库同级，测试也只需要一个临时根。
+7. **`web_fetch` 每次都要批准，不提供 `AllowAlways`**。D8 的 matcher 只有工具名，`AllowAlways` 会变成「允许所有域名」，比用户看到的宽；域名规则需要更细的 matcher，尚未存在。
+8. **`WebFetch::new()` 自己装 ferritls provider**。reqwest 的 `rustls-no-provider` 在**构造 Client 时**就断言进程已有 provider，即使只发 http；daemon 启动时已装过，所以这是 no-op，tools-only 测试则靠它自洽。不引第二套 TLS 后端；`ferritls-rustls` 必须 `default-features = false`，否则 `simd` 拉进 nightly 的 `portable_simd`。
+9. **Chat 不含 `web_fetch`**。ADR-0005 说 Chat 无审批，而 Network 级工具在 Chat 下没有应答方；capabilities §3 的三个处置里选「移出 Chat」，并在文档留痕（幅度不足以另立 ADR）。
+10. **危险模式只给 `AllowOnce/Deny`，不给 `DenyAlways`**。规则的 matcher 是工具名，记住一次「拒绝」会拒掉以后所有 shell 调用，比用户正在看的命令宽。
+11. **上下文裁剪是静默的，不做摘要**。compaction/摘要仍是 M5；v1 只保证请求不超预算、system prompt 与最新 user 不被删。估算器不是 tokenizer，`[context]` 是操作员的校正旋钮。
+
+**实测发现（测试跑红/构建失败才暴露的）**：
+
+- `shell` 的 `select!` 里 `wait` 排在 `next_chunk` 之前（`biased`）会丢掉进程退出前刚写的进度；单测 `a_command_streams_its_output_and_reports_the_exit_code` 抓到了，改成进度优先、`wait` 兜底。
+- `regex` crate **不支持 look-ahead**，赋值脱敏原计划用一个 `(?=…)` 同时表达「值至少 8 位且含数字/大写」；改成先匹配、再在 Rust 里判断值形状。
+- `reqwest` 的 `rustls-no-provider` 在 `Client::new()` 就 panic（见偏离 8），不是等到 HTTPS 请求。
+- `trim_to_budget` 在 `iter_mut()` 循环里调 `estimate_tokens(messages)` 借用了同一向量；改成索引循环，借用在下标访问后即结束。
+
+**验证**：`./scripts/ci.sh` 八道门全绿（toolchain fmt clippy build tests invariants doctests determinism，21s）；`cargo llvm-cov clean --workspace && cargo xtask coverage` 821 条测试后全部门槛达标（capabilities 90.1/85、tools 92.4/85、daemon 90.8/80、kernel 95.6/85、protocol 93.3/80、store 93.8/85、llm 96.8/85、cli 84.9/60）。新增测试：PTY 9 条（含进程组孤儿断言读 `/proc` 状态）、shell 9 条、web_fetch 8 条、脱敏 7 条、spill 5 条、上下文预算 5 条、`[context]` 配置 3 条、接缝级 2 条（真 `shell` 走 `LocalPty`、超大输出在注册表处落盘）。
+
+**本阶段未做（各有归属）**：Windows PTY 子进程（Job Object/ConPTY）待 TUI 之后；`web_fetch` 域名规则；JS/cookie/charset；shell 的 stdin 仍是 pty、unified exec M5；`setsid` 逃逸孙进程（无 cgroup）；shell/web_fetch 的活 runtime e2e → Phase 7 场景 3–6；compaction → M5。
+
 ### 2026-10-24 · 评审⑧：并发读、编辑顺序与一批契约修复
 
 **两个 Critical**：① `prompt` 的 session 快照在 turn 闸门外读，而 `set_mode` 在同一闸门内写库——并发时按旧模式装配，库说 code、runtime 仍是 chat 的工具表。改为闸门内重读并复核 generation。② `edit_item` 先 `rewind_code` 再 `edit_fork`，对 ToolCall/Checkpoint 行发 `edit + both` 会先回滚工作区、再返回 `NotEditable`，用户被告知失败但文件已经变了。改为新增 `SessionStore::ensure_editable`（与 `edit_fork` 共用一个 `ensure_editable_item`），restore 前先拒绝。

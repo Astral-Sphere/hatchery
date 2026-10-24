@@ -18,9 +18,9 @@
 - [x] (M0b) trait 全家定义（LlmProvider/ToolHost/HistorySource/EventSink）+ StreamEvent/ChatOptions/Message 类型
 - [x] (M0b) Turn 状态机实现 + fake provider 脚本化单测（含 Interrupt 在各状态的行为矩阵）
 - [x] (M0b) Turn Tool Snapshot 最小版：turn 开始时 `snapshot()` 冻结一次（完整语义 M2）
-- [ ] (M2 · Phase 4) 上下文组装 v1（token 预算最简版：估算 + 最旧 round 裁剪）——`HistorySource::view` 已给出接缝（2026-10-03 由 M1 改标 M2：M1 装配是纯机械映射、不做预算，见 daemon 的 `StoreHistory`；工具大输出进树后才是刚需）。**与 `ToolOutput::Spilled` 同排 Phase 4**：两者是「工具输出太大」这同一个问题的两半，来源是 shell 与 web_fetch
+- [x] (M2 · Phase 4，2026-10-24) 上下文组装 v1：`StoreHistory::view()` 末尾裁剪；`[context] max_input_tokens`（默认 96000、下限 4096）；ASCII/4 + 非 ASCII + 每消息 4；先削最旧工具结果到 4000 字符、再整轮丢最旧 round；system 与最新 user 永不丢。压缩/摘要仍 M5
 - [ ] (M2 · Phase 0，收口 M1) max_rounds 熔断与 TurnCompletion 语义在真实对话下验证（脚本化验证已做：`the_default_fuse_is_finite_and_generous` state.rs:178、`a_fuse_already_at_its_limit_ends_the_turn_without_a_provider_call` tests/turn_state_machine.rs:1451）
-- [ ] (M2 · Phase 4) ToolOutput::Spilled 路径（形状已就位、**全仓库无人构造**；阈值与落盘位置是 **D12**）
+- [x] (M2 · Phase 4，2026-10-24) ToolOutput::Spilled 路径：注册表在输出离开 backend 时构造（D12：64 KiB、`<data_dir>/tool-results`、head/tail 16 KiB、0600）
 - [ ] (M2 · Phase 1) **D13**：`ToolInvocation`（tools.rs:22-27）带出工具收集到的检查点，kernel 在 **ToolResult item 之前**追加 Checkpoint item，链变成 `… → ToolCall → Checkpoint → ToolResult`——M1 的 `TurnInput { turn, content }` 之后第一处 kernel 改动
 - [x] (M2 · Phase 0，2026-10-07 完成) **D15**：system prompt 经 `HistorySource::view()` 以 system `Message` 进请求（`ChatOptions` 无 system 字段，message.rs:257-279，也不该有）。**kernel 侧无需改动**——`Message::system`（message.rs:56）与 llm 的 `Role::System => WireMessage::system(text)`（translate.rs:134）都已就位；要动的是 daemon 的 `StoreHistory` 与**不变量 2 的边界**（重划为只管分支历史，system prompt 是可复现的派生态、由 `prompt/render` 的 golden 单独钉）。**结果**：如预判，kernel 与 llm 一行未改（`Message::system` 从零消费者变成一个）；`prompt/render` 现在对活着的 runtime 返回冻结那一份，不变量测试断言「两次请求的 system 文本逐字节相同 + 等于 `prompt/render` 的 text」。D15 的理由①（config 变更会重组装）经实测不成立，更正写在 design/kernel.md §6 与 design/daemon.md 开放问题 5
 - [ ] (M5) compaction 钩子

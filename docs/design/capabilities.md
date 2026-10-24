@@ -42,9 +42,15 @@ pub trait TerminalBackend {
         -> Result<Box<dyn TerminalHandle>, TermError>;
 }
 pub trait TerminalHandle {
-    async fn wait(&mut self) -> Result<TerminalOutcome, TermError>;   // M1：进程结束后一次性全量输出
-    fn kill(&mut self);
-    // M2 形状：再加「输出流 + release」——没有输出流就没有 ToolCallProgress，见下
+    async fn next_chunk(&self) -> Option<String>;              // 流式输出，CRLF 已归一化
+    async fn wait(&self) -> Result<TerminalOutcome, TermError>; // 进程退出即返回，幂等
+    fn kill(&self);
+    fn release(&self);                                         // PTY 上 == kill，见下
+}
+pub struct TerminalOutcome {
+    pub output: String,          // PTY 只有一个设备：stdout 与 stderr 合流
+    pub exit_code: Option<i32>,  // 被信号杀死时为 None
+    pub dropped_bytes: u64,      // 捕获上限丢掉的字节数
 }
 
 pub trait ApprovalGate   // request(ApprovalRequest) → ApprovalOption（批准后由 daemon 回灌 kernel）
@@ -68,13 +74,16 @@ pub struct Backends {
 3. **`Tool` 比草图多一个 `summarize`**。摘要需要工具语义（`read_file a.txt` 与 `grep todo` 的一行摘要不同），注册表的通用回退只兜底未知工具。
 4. `read_dir` 提前进 M1（草图写「M2 加 list/glob 支持」）：glob/grep 必须有目录原语才能在接缝内行走，这是它的只读子集。留在 M2 的是**模式过滤下推**（把 glob 语义交给 backend）。
 
-### `TerminalHandle`：M1 的形状不足以支撑 shell 工具
+### `TerminalHandle`：M1 的形状不足以支撑 shell 工具（Phase 4 已替换）
 
-M1 的 handle 只有 `wait()`（进程结束后一次性返回全部输出）与 `kill()`。这意味着 shell 工具**产不出 `ToolCallProgress`**：进度要求一个在进程还活着时就能拿到字节的输出流，而 `wait()` 的语义正好相反。所以 M2 的「输出流 + `release()`」是**替换形状，不是扩展**——`src/terminal.rs:34` 那句「streaming extend it without replacing it」对流式不成立，随实现一起改掉（`unified_exec` 式的会话复用仍是扩展，那条不变，见开放问题 2）。
+M1 的 handle 只有 `wait()`（进程结束后一次性返回全部输出）与 `kill()`。这意味着 shell 工具**产不出 `ToolCallProgress`**：进度要求一个在进程还活着时就能拿到字节的输出流，而 `wait()` 的语义正好相反。Phase 4 把形状换成了上面的 `next_chunk` / `wait` / `kill` / `release`，不是扩展：
 
-现在改最便宜：`TerminalBackend` 只有一个实现 `NoTerminal`，`TerminalHandle` 一个实现都没有。
+- **全部 `&self`**：消费者必须在同一个 `select!` 里同时等输出与等退出，两个 `&mut self` 无法并发 poll。实现把状态放在内部可变性里，阻塞的读/等在各 backend 自己的线程上。
+- **输出是一路**：PTY 只有一个设备，stdout 与 stderr 由内核终端层合流，分不成两个字段。`dropped_bytes` 让调用方把「输出很短」与「输出被截断」区分开。
+- **`wait` 在进程退出时返回，不等 EOF**：孙进程可以一直占着 pty，等 EOF 会挂在一个已经结束的命令上；PTY backend 只给 250ms 的 EOF 宽限。
+- **`release` 在 PTY 上就是 `kill`**（探针实测，`spikes/pty/`）：关掉 master/slave 之后 500ms 子进程仍然活着，也仍然没有任何人能再观察或停止它。交回一个没人看管的活进程不是「所有权转移」而是泄漏；`unified_exec` 式的会话复用（M5）若要有不同的含义，必须改这个契约，而不是只改实现。
 
-**`release()` 的含义要在 Phase 4 之前定下来**（PTY 探针实测，`spikes/pty/`）。上面那段把 `release()` 与 `kill()` 并列，读起来像是一对可选的收尾动作，而在 PTY backend 上它不可能是「把活着的进程交还给调用方」：实测关掉 master/slave 之后 **500ms 子进程仍然活着**，也仍然没有任何人能再观察或停止它。所以 PTY 上的 `release()` 只有两种诚实的读法——要么它就是 `kill()` 的别名，要么它交回的是一个**没人再看管**的进程（对 `unified_exec` 式的会话复用是唯一合理的读法：所有权转移给注册表，而不是消失）。两种都能实现，但语义必须写进 trait 文档，否则第一个实现者会随手选一个。
+`TerminalBackend` 现在有两个实现：`NoTerminal`（Chat）与 `LocalPty`（Code，见下）。
 
 ### 值类型的归属（M0b 定案）
 
@@ -102,10 +111,10 @@ M1 的 handle 只有 `wait()`（进程结束后一次性返回全部输出）与
 
 ### 本地实现（本 crate 提供）
 
-三者中 `LocalFs` 的只读与写路径、`DaemonApproval` 已落地（M2 Phase 1 / Phase 2）；`LocalPty` 仍是 Phase 4，今天是设计而非代码。
+三者中 `LocalFs` 的只读与写路径、`DaemonApproval`、`LocalPty` 都已落地（Phase 1 / Phase 2 / Phase 4）。`LocalPty` 目前只兑现 Linux（macOS 走同一份 POSIX 代码）；Windows 的子进程实现（Job Object/ConPTY）按 D10 顺延到 TUI 之后，非 unix 直接返回 `Unavailable`。
 
 - `LocalFs`：tokio::fs + 路径校验（工作区逃逸检查、危险路径硬门）+ **写前打影子 Git 检查点**。
-- `LocalPty`：实现 TerminalBackend；PTY 会话注册表（后台进程、复用、超时杀进程）；输出环形缓冲（截断保护，借鉴 codex unified_exec）。**库选型 = D10**（spike 提前到 M2 Phase 1 并行做，实现落 Phase 4）：候选 `portable-pty`（codex 用 `portable-pty = "0.9.0"`，references/codex/codex-rs/Cargo.toml:422），但它在 Windows 侧还要额外挂带 `jobapi`/`jobapi2` 的 `winapi`（references/codex/codex-rs/utils/pty/Cargo.toml）——即 Job Object，因为**杀 PTY 不留孤儿孙进程**要靠它，而那正是「cancel 后无孤儿进程（`kill -0` 断言）」这条测试在 windows-gnu CI 上的坑。spike 必须在三平台上实测孤儿进程、取消与输出流后再定。
+- `LocalPty`（Phase 4）：portable-pty 0.9 + nix。显式 cwd（库默认 `$HOME`）、CRLF 归一化（ONLCR）、head 1 MiB + tail 7 MiB 捕获、**进程组 SIGKILL**、一个控制线程同时负责 reap 与 signal（避免 reap 后 pid 复用再 kill）、退出后 250ms EOF 宽限、取消 watcher + Drop 双保险。**库选型 D10**：Linux 七组实测支持 portable-pty 作 PTY/流式底座，但它的 `kill()` 只发一个 pid（5 个场景 3 个留孤儿），所以进程树围堵是**必须的包装而不是可选的增强**；Windows 侧 portable-pty 0.9 完全不含 Job Object，codex 是换掉 child 实现而不是包一层，因此那一栏顺延。`unified_exec` 式会话复用仍是 M5；`release` 在 PTY 上就是 kill（见 §1）。
 - `DaemonApproval`：**实现住 daemon 的 `src/approvals.rs`，不在这里**——它要 hub、session 与 generation 来发 `ApprovalRequested`，capabilities 看不到这些；本 crate 只保留 `ApprovalGate` trait。落地形状：pending 注册表按 kernel 给的 `request_id` 登记 waiter（**先登记再 publish**，否则脚本化前端会撞上未注册的窗口）、超时答 deny（fail-closed）、`approval/respond` 路由到该 runtime 的 `AgentCommand::decide`。`AllowAlways/DenyAlways` 在决定之后写 `approval_rules`，下一次 `approval_for` 由 daemon 的 `GatedTools` 装饰器先读规则（拒绝优先、与行序无关；读取失败转成「问」）。
 
 ### 委派实现（hatchery-acp 提供，实现同样的 trait）
@@ -249,7 +258,7 @@ pre-write 快照恰好等于 `target_item` 时刻的工作区状态，因此扫�
 | MCP 工具（M5） | 按配置 | rmcp client | 默认 Executes 级审批 |
 | WASM 插件工具（M5 评估占位，ADR-0009） | 按配置 | wasmtime + WASI（沙箱化） | 默认 Executes 级审批；实施前须过新 ADR |
 
-工具输出统一 `ToolOutput { text, artifacts?, spilled? }`；超阈值 spill 到 `~/.local/state/hatchery/tool-results/`，库存引用。阈值与落盘位置 = **D12**；「谁来 spill」——工具自己还是注册表统一做——**尚未裁决**（protocol 侧的 `ToolOutput.spilled`/`SpilledOutput` 值类型已在，但还没有任何构造方；今天各工具是在带内封顶：`read_file` 的字节帽、glob/grep 的条数上限）。
+工具输出统一 `ToolOutput { text, artifacts?, spilled? }`。**D12 已落地（Phase 4）**：注册表在输出离开 backend 的那一刻统一处理——先脱敏，再按 **64 KiB** 内联阈值 spill 到 `<daemon data dir>/tool-results/`（0600，文件名含时间戳/pid/序号），`text` 变成 head/tail 各 16 KiB 的预览加完整文件路径；没有 sink 或写盘失败时退化成截断 + 原因，绝不静默丢。工具自己的带内上限保留（`read_file` 256 KiB、glob 1000 条、grep 200 条），注册表是最后一道。草图写的 `~/.local/state` 改为 daemon 已有的数据目录：manager 已经持有一个根，多穿一个 XDG 根不换来行为差异。
 
 ### Chat 模式的审批真空（M2 Phase 2 裁决）
 
@@ -261,32 +270,47 @@ M1 已经在 `read_file` 上撞到过它，裁决是「越界读取直接以错�
 2. 照 `read_file` 的先例：未获批的域名以错误结果返回。
 3. Chat 也绑一个 gate（与 ADR-0005 的「无审批」直接冲突，等于给 Chat 加一档）。
 
-若选 1，这是对 ADR-0005 模式表的一处偏离——按约定**不改 ADR**，在本文档与 worklog 留痕即可（幅度不足以另立 ADR；若 Chat 的工具面后续继续变动，再合并成一份新 ADR 并标 supersedes）。
+**已选 1（Phase 4）**：`code_tools()` 有 `web_fetch`，`chat_tools()` 仍只有 `read_file`/`glob`/`grep`；`web_fetch` 的审批是 `Network` 且一次性（域名规则不存在，见 §5）。这是对 ADR-0005 模式表的一处偏离——按约定**不改 ADR**，在本文档与 worklog 留痕即可（幅度不足以另立 ADR；若 Chat 的工具面后续继续变动，再合并成一份新 ADR 并标 supersedes）。
 
 ### 依赖前提（M2 要先补的洞）
 
-- **`web_fetch` 需要自己的 HTTP client 依赖**：今天**没有任何产品 crate 有通用 HTTP client**（`reqwest` 只是经 `openai-interface` 传递进 hatchery-llm），而 `wiremock` 是 testkit 专属、明确「never of a product crate」。HTML→Markdown 同样一个 crate 都没有（无 `htmd`/`html2md`）。两半合并为 **D17**（Phase 4）——不能分开选，因为选型同时决定新依赖面的大小。
-- **`write_file`/`edit` 的预览 diff 没有来源**：`git2` 出的是检查点之间的 diff，而预览要的是「旧缓冲 vs 新内容」、此时还没有 commit（见 §2）。
+- **`web_fetch` 的 HTTP client 与 HTML→MD（D17，Phase 4 已落地）**：`reqwest 0.13`（与 hatchery-llm 同一个版本，`rustls-no-provider`，复用 daemon 启动时装的 ferritls provider）+ `htmd 0.5.6`（Apache-2.0；`html2md` 是 GPL-3.0+ 且解析器更旧）。`wiremock` 仍是 testkit 专属，只作 dev-dependency 出现在 tools 的测试里。
+- **`write_file`/`edit` 的预览 diff**（Phase 2 已落地）：`preview.rs` 用 `similar`（`text` feature）算「旧缓冲 vs 新内容」的同一个 `Diff`，超限退化成 `Excerpt`；它只进 tools，不进 capabilities。
 
 ## 4. 模式装配（daemon 侧）
 
 ```rust
-fn assemble(mode: &SessionMode, backends: Backends) -> ToolRegistry {
-    let mut reg = ToolRegistry::new();
-    for spec in mode.tools.enabled() { reg.register(builtin(spec, &backends)); }
-    reg  // turn 开始时被 kernel 冻结快照
+fn policy_for(mode: &SessionModeId) -> ToolPolicy {
+    match mode.as_str() {
+        SessionModeId::CODE => ToolPolicy::all(),
+        _ => ToolPolicy::including(["read_file", "glob", "grep"]),
+    }
+}
+fn tools_for(session: &Session) -> ToolRegistry {
+    let backends = Backends {
+        fs,
+        terminal: if session.mode.as_str() == CODE { LocalPty } else { NoTerminal },
+        checkpointer,
+        spill: Some(FileSpill::new(data_dir.join("tool-results"))),
+    };
+    let policy = policy_for(&session.mode);
+    let mut registry = ToolRegistry::new(backends);
+    for tool in hatchery_tools::code_tools() {
+        if policy.allows(&tool.def().name) { registry.register(tool); }
+    }
+    registry  // turn 开始时被 kernel 冻结快照
 }
 ```
 
-- `ToolPolicy` 支持 include/exclude 列表与 per-tool 配置（如 shell 的 timeout、web_fetch 的域名白名单）。
-- 用户自定义模式在 config.toml 声明三元组（ADR-0005）。
+- `ToolPolicy` 支持 `all` / `including` / `excluding`。**per-tool 配置没有消费者**：shell 的 timeout 是工具参数而不是策略，web_fetch 的域名白名单不存在（D8 的 matcher 只有工具名）。
+- 用户自定义模式在 config.toml 声明三元组仍是目标（ADR-0005），今天的 `policy_for` 只认 chat/code，未知模式回退到 Chat 的安全方向；`[modes.*]` 的读取与模式注册表排 Phase 6。
 
-本节全是 **M2 Phase 2 的交付物**：`assemble(mode, backends)`、`builtin(spec, &backends)` 与 `ToolPolicy` 都还不存在，`register()` 目前返回 `()`（注册句柄按 ADR-0009 的反预拆分刹车推到 M5，见 §1）。今天的装配是硬编码在 daemon 里的 `SessionManager::chat_tools()`（crates/hatchery-daemon/src/manager.rs:612-628）：内联造 `LocalFs` + `NoTerminal`，循环 `hatchery_tools::chat_tools()`；而 `SessionManager::assemble`（manager.rs:523）**从不读 `session.mode`**，所以本节描述的「按模式装配」今天是**模式盲**的——code 会话拿到的是与 chat 完全相同的只读三件套 + `NoTerminal`。`Backends` 也要在这里扩出 `approval` 与 `checkpoint` 两个字段。
+本节是 **M2 Phase 2 的交付物，Phase 4 扩了终端与 spill**：`ToolPolicy`（`all`/`including`/`excluding`）与 `SessionManager::policy_for(mode)` 已落地；`SessionManager::tools_for(session)` 读 `session.mode`，Code 用 `ToolPolicy::all()` 并绑 `LocalPty`（要求工作区），Chat 用三件只读 + `NoTerminal`，未知模式回退到 Chat 的安全方向。`Backends` 现在有 `fs`/`terminal`/`checkpointer`/`spill` 四个字段；`builtin(spec, &backends)` 仍没有 per-tool 配置的消费者（ADR-0009），`register()` 仍返回 `()`（注册句柄 M5）。
 
 ## 5. 安全硬门（不可覆盖，architecture.md 不变量 5）
 
 - 路径门：`~/.ssh`、`~/.config/hatchery`（自身配置/密钥）、`.git/hooks`、`.env*` 等的写入永远需要显式审批，规则表不可 allow-always。
-- 凭据门：工具**输出**在离开 backend 的那一刻检测高熵密钥形态并脱敏（`redact` 层，M2 Phase 4）——**脱敏发生在接缝处，不是入库时**，理由见下。
+- 凭据门（**Phase 4 已落地**）：工具**输出**在离开 backend 的那一刻检测并脱敏（`capabilities::redact`）——**发生在接缝处，不是入库时**，理由见下。识别的形状：PEM 私钥块、已知 token 前缀（`sk-`/`ghp_`/`AKIA`/`glpat-` 等）、`Authorization: Bearer`、URL userinfo、以及「值至少 8 位且含数字/大写」的 `password=`/`token=` 赋值；普通代码、git hash 与 `password = None` 不误伤。工具**参数**不改存储，仍按「检出凭据 → 触发审批/告警」处理。
 - 所有硬门有对应测试，且测试断言「项目级配置无法关闭它们」（借鉴 atomcode PRECEDENCE 测试）。
 
 ### 「规则不可 allow-always」怎么表达（不动 `RiskLevel`）

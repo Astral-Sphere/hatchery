@@ -19,7 +19,7 @@
 - [x] (M0) `cargo-llvm-cov` 未装时 `xtask coverage` fail-loud 报安装命令（不静默跳过）
 - [x] (M0) 三平台 CI 首跑通过（第 2 次尝试；windows MSYS2 ucrt64 那条也过了）
 - [x] (M0b) store 属性测试参考模型（testkit 里独立写的 `ReferenceTree`）+ kill -9 崩溃测试框架（测试二进制自重入，无需专用二进制）
-- [ ] (M1) testkit 余下部分：MockWire(sse fixture)/Memory 后端三件套/TempWorkspace/TestDaemon/ClientProbe（kernel 四接缝的 fake 与 `ReferenceTree` 已于 M0b 交付）——**MockWire + fixture 加载（09-30）、MemoryFs + TempWorkspace 与 TestDaemon + ClientProbe（10-01）已交付；MemoryTerminal 随 M2 Phase 4 的 PTY（今天不存在，见下面 Phase 4 那条）**
+- [x] (M1，M2 Phase 4 补齐) testkit 余下部分：MockWire(sse fixture)/Memory 后端三件套/TempWorkspace/TestDaemon/ClientProbe 均已交付；`MemoryTerminal` 随 M2 Phase 4 落地（`hatchery-testkit::MemoryTerminal`）
 - [x] (M1) 建 `hatchery-tests` 成员 crate（跨 crate e2e 与不变量套件的家；2026-10-01 落地，13th member + layering 表同步）
 - [x] (M1) MSRV job 进 nightly（`cargo +1.90.0 check --workspace --all-targets --locked`；本地 1.90.0 工具链实测通过），防依赖升级悄悄抬高下限
 - [x] (M1) fixture 录制 xtask + 脱敏（API key 扫描）+ provenance 元数据格式（2026-09-30：`cargo xtask record-fixtures`，sidecar `*.meta.json`，扫描命中即拒写）
@@ -33,10 +33,10 @@
 - [ ] (M2 Phase 1) `TempWorkspace` 补 git init + 文件树 DSL（design §2 一直这么描述；今天只有 `new`/`path`/`write`/`fs()`/`root()`），并把不变量 6 的测试从 spike 的 `Sandbox` 迁到真 `CheckpointStore`——它要的「脏用户仓库」（staged/unstaged/untracked + 一次 commit）今天由 spike 自己的 harness 手搭
 - [ ] (M2 Phase 1) `MemoryFs` 补写路径（`FsBackend` 一加 `write_text_file` 它就编译不过——是有用的 forcing function，也是工作量；今天它只实现三个读方法）
 - [ ] (M2 Phase 2) **`invariant_project_config_cannot_disable_hard_gates`**（M2 DoD「硬门测试全绿」的正主，今天零命中）+ `config.rs:154` 那个空的 `STRICT_KEYS` 接线。前置是审批规则配置本身：没有它就没有「恶意项目配置」可加载，所以排 Phase 2 不是 Phase 0。工作区内硬门（`.env*`、`.git/hooks`）按裁决走 `ApprovalRequest::once_only()`（新增 `RiskLevel` 变体属协议 major bump；kernel 已拒绝不在所给选项里的答案，所以 `once_only` 真不可绕）
-- [ ] (M2 Phase 2) testkit 补 **fake `ApprovalGate`**（trait 全 workspace 零实现；`testkit::Gate` 是无关的计数信号量）与**协议级审批应答器**（现有 `answer_approvals` 拿 `AgentHandle`、绕过协议，测不到 `approval/respond`；要的是驱动 `ClientProbe` 对 `ServerEvent::ApprovalRequested` 作答的等价物）
+- [x] (M2 Phase 2，2026-10-24) testkit 的 `ScriptedGate` 与协议级应答器已交付（`answer_approvals` 的协议级等价物在 `TestDaemon`）；`testkit::Gate` 仍是无关的计数信号量
 - [ ] (M2 Phase 2) 契约测试套件：`FsBackend` / `TerminalBackend` / `ApprovalGate`（`LlmProvider` / `SessionStore` 排 Phase 7）
-- [ ] (M2 Phase 4) `MemoryTerminal`（design §2 与 `testkit/src/lib.rs:19` 都写着 M1–M2 交付，实际不存在；没有它 `shell` 工具没有单测后端）
-- [ ] (M2 Phase 4) PTY 孤儿进程测试（`kill -0` 断言，design §3.5）随 `LocalPty` 落地；三平台（含 windows-gnu 的 Job Object 语义）的孤儿进程/取消/输出流实测是 D10 spike 的产出，spike 提前到 Phase 1 并行做
+- [x] (M2 Phase 4，2026-10-24) `MemoryTerminal` 已落地（`hatchery-testkit::MemoryTerminal`；脚本化 chunks/exit/hang，`shell` 的 9 条单测跑在它身上）
+- [x] (M2 Phase 4，2026-10-24) PTY 孤儿测试已落地（`crates/hatchery-capabilities/tests/pty.rs` 九条；读 `/proc/<pid>/stat`，不用 `kill -0`）；Linux 侧实测由 Phase 1 的 spike 提供。Windows 栏仍待 D10
 - [ ] (M2 Phase 7) e2e 场景 3-6（Chat→Code 切模式 / 编辑分叉重演 + 分支删除 / 写坏文件 → rewind 三 scope / 审批全链路含 fail-closed 超时与 AllowAlways 生效）；**前置是 toolcall SSE fixture 对 `hatchery-tests` 可达**——`sse_fixture` 按调用方 crate 的 `CARGO_MANIFEST_DIR` 解析，录制都在 `crates/hatchery-llm/tests/fixtures/`，而 `hatchery-tests` 连 `tests/fixtures/` 目录都没有，唯一的 SSE 是 `src/support.rs:27-37` 的内联字符串且不含 `tool_calls` delta
 - [ ] (M2 Phase 7) 契约测试套件补齐 `LlmProvider` / `SessionStore`
 - [ ] (M2 Phase 7) `disallowed_methods` 的 compile-fail 测试（trybuild 类）——人工探针复测过（10-01），且禁令已由 hatchery-tools 本地 `[lints]` 表真实生效（crate 属性压不过 Cargo lint 表，09-28 的记录写反了，见 10-01 条目）
