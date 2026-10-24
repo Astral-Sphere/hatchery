@@ -37,6 +37,26 @@
 
 ## 变更日志
 
+### 2026-10-24 · 评审⑨：安全、生命周期与测试可信度
+
+**修复（6 个 Critical + 全部建议）**：
+
+- **`web_fetch` 的重定向**：`Client` 不再用默认的 `Policy::limited(10)`，改为自定义策略——只跟随同 host + 同 port、且不把 https 降级为 http 的跳转；跨 host 的 3xx 原样返回，输出里带 `location:`，模型要抓就得再走一次审批。测试覆盖同 host 跟随与跨 host 停止。
+- **`shell` 的审批永远是 `once_only`**：普通命令原来给四个选项，一次 `AllowAlways`（或 `[approval] allow=["shell"]`）就会让 `GatedTools` 对之后所有 shell 命令返回 `NotNeeded`，绕过 `.env`/`.git/hooks`/`~/.ssh` 的硬门。现在每次命令都问；危险模式表补了 `rm -rf //`、`"$HOME"`、`${HOME}`、`--no-preserve-root`。
+- **脱敏**：键名允许 `[A-Za-z0-9_]*` 前缀，`DB_PASSWORD`/`AWS_SECRET_ACCESS_KEY`/`OPENAI_API_KEY`/`token=` 都能命中；值改为引号感知扫描（带空格的引号值、`SecretKey::new()` 这类表达式不误伤）；补了空用户 URL、密码含 `@`、PGP 私钥块、`Authorization: Basic/Digest`。
+- **进度也脱敏**：`registry.invoke` 在把 `ToolProgress` 交给内核前套同一层 `redact`；最终输出与 spill 文件仍是整段脱敏。跨两个 reader chunk 拆开的密钥仍有残余，已在注释与文档写明。
+- **`shell` 的 EOF 超时**：`next_chunk() == None` 不再 `break` 出带 timeout/cancel 的 `select!`，而是置 `eof` 并继续等 `wait`/timeout/cancel；`exec </dev/null …; sleep` 这类关闭 stdio 的命令仍会在 `timeout_secs` 被杀。
+- **`LocalPty` 的生命周期**：`pgid` 直接取 `pid`（spawn 已 `setsid()`；`tcgetpgrp` 是前台组，会和 `set -m` 抢跑）；Linux 控制线程用 `waitid(WNOWAIT)` 观察退出但**不 reap**，在僵尸仍钉住 pgid 时排空 kill 请求并 `killpg`，收到 sender 断开后再 `waitpid`；leader 退出后的后台子进程终于能被 `kill`/`release`/`Drop` 杀到。新增 `TerminalOutcome.stream_incomplete` 区分「捕获满了」与「reader 没等到 EOF」。
+- **其余**：`shave` 改 head+tail 2,000+2,000 并保留 `full output at` 指针；`[context]` 非正值夹到 4,096、错类型被 `type_accepts` 丢弃；spill 序号改为进程级静态；`MemoryTerminal` 缓存 outcome（幂等）且 `notify_one` 不再丢唤醒；`TermError` 的 cwd 越界文档改为 `Io`，`try_wait`/`waitid` 错误走 `Err`；`shell`/`web_fetch` 在 `needs_approval` 里先 `parse`，确定失败的调用不弹审批；`shell` 的 tool description 明写命令写入在 checkpoint/undo 之外。
+
+**测试可信度**：进程组测试换成探针里 `Child::kill()` 也杀不死的同组 SIGHUP 免疫 payload（`trap '' HUP; sleep 60 & echo $!; wait`）；新增 leader 退出后 Drop 杀后台子进程、`stream_incomplete`/250ms EOF 宽限、Capture head cap、`StoreHistory::view` 小预算、trimming 工具配对、shave 尾部与 spill 指针、web_fetch 5 MiB/charset、脱敏正反例、MemoryTerminal 幂等/丢唤醒等测试。`/proc` 状态断言与 Linux-only 的 post-exit kill 测试统一 `#[cfg(target_os = "linux")]`；macOS 只共用代码，未测量。
+
+**实测/机制**：pty master 关闭会把 SIGHUP 发给前台组，所以「reader 已 EOF 但进程仍活着」的测试必须让进程 `trap '' HUP`；`waitid(WNOWAIT)` 期间僵尸的 pid 就是 pgid，不能被复用，`killpg` 因此可证安全；`notify_waiters` 不存 permit，用 `notify_one` 才补上 kill 与 await 之间的窗口；`regex` 没有 look-ahead，键名/值形状必须在 Rust 里判断。
+
+**验证**：`./scripts/ci.sh` 八道门全绿（26s）；`cargo llvm-cov clean --workspace && cargo xtask coverage` 全部门槛达标（capabilities 90.4/85、tools 93.1/85、daemon 90.9/80、kernel 95.6/85、protocol 93.3/80、store 93.8/85、llm 96.8/85、cli 85.0/60、testkit 91.8）。
+
+**保留/未做**：macOS 的 post-exit group kill（没有 `waitid(WNOWAIT)` 的 nix 绑定，测试也只在 Linux 跑）；shell 写入仍在 checkpoint 之外（本轮按裁决只写文档）；跨 host 重定向需要新审批而不是自动跟随；进度脱敏的跨 chunk 残余；`setsid`/`set -m` 逃逸的孙进程仍杀不到（无 cgroup）。
+
 ### 2026-10-24 · Phase 4：PTY、shell、web_fetch、spill 与上下文预算
 
 **交付**：`TerminalHandle` 换成流式形状（`next_chunk` / `wait` / `kill` / `release`，全部 `&self`，让消费者在一个 `select!` 里同时看输出与退出）；`TerminalOutcome` 合并成一路输出 + `dropped_bytes`（PTY 只有一个设备）。`LocalPty` 用 portable-pty 0.9 + nix：显式 cwd、CRLF 归一化、head 1 MiB + tail 7 MiB 捕获、进程组 SIGKILL、控制线程、退出后 250ms EOF 宽限、取消 watcher + Drop 双保险；非 unix 拒绝。`MemoryTerminal` 进 testkit。`shell`（`sh -c`、流式进度、120s/600s 超时、危险模式一次性批准）与 `web_fetch`（reqwest 0.13 + htmd、http(s)、5 MiB、30s/120s、二进制拒绝、Network 一次性审批）进 `code_tools()`；Code 绑 `LocalPty`，Chat 仍 `NoTerminal`。注册表在输出离开 backend 时统一脱敏 + spill（D12：64 KiB / `<data_dir>/tool-results/` / head-tail 16 KiB / 0600）。`[context] max_input_tokens`（默认 96000、下限 4096）+ `StoreHistory` 的裁剪（先削旧工具结果到 4000 字符、再整轮丢最旧 round）。

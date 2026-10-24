@@ -33,7 +33,7 @@
 [approval_rules]    # 与 DB 中 approval_rules 表同步展示（DB 为准，config 只读快照；尚未实现）
 ```
 
-**现状对账（2026-10-24）**：今天被读取的 key 是 `ui.*`、`daemon.idle_timeout_min`、`providers.<id>.*`、`checkpoints.{workspace_budget_mb,global_budget_mb,max_file_mb,ignore_rules}`（Phase 1）、`approval.{timeout_seconds,allow,deny}`（Phase 2）、`context.max_input_tokens`（Phase 4）。`is_known_key` 是唯一判定点；`STRICT_KEYS = ["approval.allow","approval.deny"]`，**项目层**对它们的赋值被丢弃并记 error（invariant 5），错误类型的值也走同一路径。`[modes.*]` 的自定义模式仍缺模式注册表（Phase 6）；`[approval_rules]` 以 DB 为准，config 里没有消费者；`[acp_agents.*]` 属 M3。草图里的 `[store]` 表名从未落地——检查点预算在 `[checkpoints]`。
+**现状对账（2026-10-24）**：今天被读取的 key 是 `ui.*`、`daemon.idle_timeout_min`、`providers.<id>.*`、`checkpoints.{workspace_budget_mb,global_budget_mb,max_file_mb,ignore_rules}`（Phase 1）、`approval.{timeout_seconds,allow,deny}`（Phase 2）、`context.max_input_tokens`（Phase 4）非正值夹到 `MIN_INPUT_TOKENS`（4,096），错类型被 `type_accepts` 丢弃并告警；`0`/负数不再回退到 96,000。`is_known_key` 是唯一判定点；`STRICT_KEYS = ["approval.allow","approval.deny"]`，**项目层**对它们的赋值被丢弃并记 error（invariant 5），错误类型的值也走同一路径。`[modes.*]` 的自定义模式仍缺模式注册表（Phase 6）；`[approval_rules]` 以 DB 为准，config 里没有消费者；`[acp_agents.*]` 属 M3。草图里的 `[store]` 表名从未落地——检查点预算在 `[checkpoints]`。
 
 ## 2. 提示词系统
 

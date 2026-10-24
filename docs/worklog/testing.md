@@ -36,7 +36,7 @@
 - [x] (M2 Phase 2，2026-10-24) testkit 的 `ScriptedGate` 与协议级应答器已交付（`answer_approvals` 的协议级等价物在 `TestDaemon`）；`testkit::Gate` 仍是无关的计数信号量
 - [ ] (M2 Phase 2) 契约测试套件：`FsBackend` / `TerminalBackend` / `ApprovalGate`（`LlmProvider` / `SessionStore` 排 Phase 7）
 - [x] (M2 Phase 4，2026-10-24) `MemoryTerminal` 已落地（`hatchery-testkit::MemoryTerminal`；脚本化 chunks/exit/hang，`shell` 的 9 条单测跑在它身上）
-- [x] (M2 Phase 4，2026-10-24) PTY 孤儿测试已落地（`crates/hatchery-capabilities/tests/pty.rs` 九条；读 `/proc/<pid>/stat`，不用 `kill -0`）；Linux 侧实测由 Phase 1 的 spike 提供。Windows 栏仍待 D10
+- [x] (M2 Phase 4，评审⑨ 补强) PTY 孤儿测试已落地（`tests/pty.rs` 十一条；SIGHUP 免疫 payload、leader 退出后 Drop、EOF 宽限；读 `/proc/<pid>/stat`，不用 `kill -0`）；`/proc` 与 post-exit kill 只在 Linux 跑，macOS 未测量。Windows 栏仍待 D10
 - [ ] (M2 Phase 7) e2e 场景 3-6（Chat→Code 切模式 / 编辑分叉重演 + 分支删除 / 写坏文件 → rewind 三 scope / 审批全链路含 fail-closed 超时与 AllowAlways 生效）；**前置是 toolcall SSE fixture 对 `hatchery-tests` 可达**——`sse_fixture` 按调用方 crate 的 `CARGO_MANIFEST_DIR` 解析，录制都在 `crates/hatchery-llm/tests/fixtures/`，而 `hatchery-tests` 连 `tests/fixtures/` 目录都没有，唯一的 SSE 是 `src/support.rs:27-37` 的内联字符串且不含 `tool_calls` delta
 - [ ] (M2 Phase 7) 契约测试套件补齐 `LlmProvider` / `SessionStore`
 - [ ] (M2 Phase 7) `disallowed_methods` 的 compile-fail 测试（trybuild 类）——人工探针复测过（10-01），且禁令已由 hatchery-tools 本地 `[lints]` 表真实生效（crate 属性压不过 Cargo lint 表，09-28 的记录写反了，见 10-01 条目）

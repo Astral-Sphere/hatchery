@@ -61,7 +61,7 @@ pub struct Backends {
     pub fs,                                   // Phase 1 起是 CheckpointedFs 的内层
     pub terminal,
     pub checkpointer: Option<Arc<dyn Checkpointer>>,  // Phase 1 已加；None = Chat，没有写就没有 undo 点
-    // M2 Phase 2 再加 approval
+    pub spill: Option<Arc<dyn SpillSink>>,            // Phase 4：超 64 KiB 的输出去处；None = 截断
 }
 ```
 
@@ -114,7 +114,7 @@ M1 的 handle 只有 `wait()`（进程结束后一次性返回全部输出）与
 三者中 `LocalFs` 的只读与写路径、`DaemonApproval`、`LocalPty` 都已落地（Phase 1 / Phase 2 / Phase 4）。`LocalPty` 目前只兑现 Linux（macOS 走同一份 POSIX 代码）；Windows 的子进程实现（Job Object/ConPTY）按 D10 顺延到 TUI 之后，非 unix 直接返回 `Unavailable`。
 
 - `LocalFs`：tokio::fs + 路径校验（工作区逃逸检查、危险路径硬门）+ **写前打影子 Git 检查点**。
-- `LocalPty`（Phase 4）：portable-pty 0.9 + nix。显式 cwd（库默认 `$HOME`）、CRLF 归一化（ONLCR）、head 1 MiB + tail 7 MiB 捕获、**进程组 SIGKILL**、一个控制线程同时负责 reap 与 signal（避免 reap 后 pid 复用再 kill）、退出后 250ms EOF 宽限、取消 watcher + Drop 双保险。**库选型 D10**：Linux 七组实测支持 portable-pty 作 PTY/流式底座，但它的 `kill()` 只发一个 pid（5 个场景 3 个留孤儿），所以进程树围堵是**必须的包装而不是可选的增强**；Windows 侧 portable-pty 0.9 完全不含 Job Object，codex 是换掉 child 实现而不是包一层，因此那一栏顺延。`unified_exec` 式会话复用仍是 M5；`release` 在 PTY 上就是 kill（见 §1）。
+- `LocalPty`（Phase 4）：portable-pty 0.9 + nix。显式 cwd（库默认 `$HOME`）、CRLF 归一化（ONLCR）、head 1 MiB + tail 7 MiB 捕获、**进程组 SIGKILL**、`pgid = pid`（spawn 已 `setsid()`；`tcgetpgrp` 是前台组，会和 `set -m` 抢跑）、Linux 控制线程用 `waitid(WNOWAIT)` 保持僵尸以钉住 pgid，收到 kill 并 `killpg` 后才 `waitpid`——leader 退出后的后台子进程仍能被 `kill`/`Drop` 杀到；退出后 250ms EOF 宽限，`TerminalOutcome.stream_incomplete` 区分「捕获满了」与「reader 没等到 EOF」；取消 watcher + Drop 双保险。**库选型 D10**：Linux 七组实测支持 portable-pty 作 PTY/流式底座，但它的 `kill()` 只发一个 pid（5 个场景 3 个留孤儿），所以进程树围堵是**必须的包装而不是可选的增强**；**macOS 只共用 POSIX 代码、未测量**（`/proc` 断言与 post-exit kill 都 `#[cfg(target_os = "linux")]`）；Windows 侧 portable-pty 0.9 完全不含 Job Object，codex 是换掉 child 实现而不是包一层，因此那一栏顺延。`unified_exec` 式会话复用仍是 M5；`release` 在 PTY 上就是 kill（见 §1）。
 - `DaemonApproval`：**实现住 daemon 的 `src/approvals.rs`，不在这里**——它要 hub、session 与 generation 来发 `ApprovalRequested`，capabilities 看不到这些；本 crate 只保留 `ApprovalGate` trait。落地形状：pending 注册表按 kernel 给的 `request_id` 登记 waiter（**先登记再 publish**，否则脚本化前端会撞上未注册的窗口）、超时答 deny（fail-closed）、`approval/respond` 路由到该 runtime 的 `AgentCommand::decide`。`AllowAlways/DenyAlways` 在决定之后写 `approval_rules`，下一次 `approval_for` 由 daemon 的 `GatedTools` 装饰器先读规则（拒绝优先、与行序无关；读取失败转成「问」）。
 
 ### 委派实现（hatchery-acp 提供，实现同样的 trait）
@@ -248,17 +248,17 @@ pre-write 快照恰好等于 `target_item` 时刻的工作区状态，因此扫�
 
 | 工具 | 模式 | 接缝 | 审批默认 |
 |---|---|---|---|
-| `read_file` | Chat+Code | FsBackend | 工作区内无需审批。工作区外分模式：**Code** → Executes 级审批；**Chat** → 无审批（ADR-0005），越界读取直接以错误结果返回给模型 |
+| `read_file` | Chat+Code | FsBackend | 工作区内读取无需审批；越界由 `LocalFs` 直接拒绝（Chat/Code 相同，`needs_approval` 返回 `None`） |
 | `glob` / `grep` | Chat+Code | FsBackend（`read_dir` 已进 M1；M2 加模式过滤下推）| 无需 |
-| `write_file` / `edit` | Code | FsBackend（写前检查点） | WritesWorkspace，规则可持久化 |
-| `shell` | Code | TerminalBackend | Executes；命令摘要展示；危险模式（rm -rf、sudo、curl\|sh）→ DenyAlways 提示 |
-| `web_fetch` | Chat+Code | 内置 http client（唯一例外的直连，Network 风险级） | 首次审批，可持久化域名规则 |
+| `write_file` / `edit` | Code | FsBackend（写前检查点） | WritesWorkspace，规则可持久化；敏感路径强制 `once_only` |
+| `shell` | Code | TerminalBackend | Executes；**审批永远 `once_only`**（工具级 `AllowAlways` 会绕过路径硬门）；危险模式在摘要里标出；命令写入不在 checkpoint/undo 内 |
+| `web_fetch` | Code | 内置 http client（唯一例外的直连，Network 风险级） | **每次 `once_only`**；域名级规则尚不存在（D8 的 matcher 只有工具名） |
 | `checkpoint_diff` / `rewind` | Code | CheckpointStore | 无需（只读）/ 需确认（restore）；`--purge` 额外审批 + 待删清单 |
 | `subagent`（M3） | Code | ACP client | 继承父会话策略 |
 | MCP 工具（M5） | 按配置 | rmcp client | 默认 Executes 级审批 |
 | WASM 插件工具（M5 评估占位，ADR-0009） | 按配置 | wasmtime + WASI（沙箱化） | 默认 Executes 级审批；实施前须过新 ADR |
 
-工具输出统一 `ToolOutput { text, artifacts?, spilled? }`。**D12 已落地（Phase 4）**：注册表在输出离开 backend 的那一刻统一处理——先脱敏，再按 **64 KiB** 内联阈值 spill 到 `<daemon data dir>/tool-results/`（0600，文件名含时间戳/pid/序号），`text` 变成 head/tail 各 16 KiB 的预览加完整文件路径；没有 sink 或写盘失败时退化成截断 + 原因，绝不静默丢。工具自己的带内上限保留（`read_file` 256 KiB、glob 1000 条、grep 200 条），注册表是最后一道。草图写的 `~/.local/state` 改为 daemon 已有的数据目录：manager 已经持有一个根，多穿一个 XDG 根不换来行为差异。
+工具输出统一 `ToolOutput { text, artifacts?, spilled? }`。**D12 已落地（Phase 4）**：注册表在输出离开 backend 的那一刻统一处理——先脱敏，再按 **64 KiB** 内联阈值 spill 到 `<daemon data dir>/tool-results/`（0600，文件名含时间戳/pid/序号），`text` 变成 head/tail 各 16 KiB 的预览加完整文件路径；没有 sink 或写盘失败时退化成截断 + 原因，绝不静默丢。文件名里的序号是**进程级**静态计数（评审⑨ 改）：每个会话一个 `FileSpill`，同一毫秒的第一次 spill 也不能碰撞。工具自己的带内上限保留（`read_file` 256 KiB、glob 1000 条、grep 200 条），注册表是最后一道。草图写的 `~/.local/state` 改为 daemon 已有的数据目录：manager 已经持有一个根，多穿一个 XDG 根不换来行为差异。
 
 ### Chat 模式的审批真空（M2 Phase 2 裁决）
 
@@ -310,7 +310,8 @@ fn tools_for(session: &Session) -> ToolRegistry {
 ## 5. 安全硬门（不可覆盖，architecture.md 不变量 5）
 
 - 路径门：`~/.ssh`、`~/.config/hatchery`（自身配置/密钥）、`.git/hooks`、`.env*` 等的写入永远需要显式审批，规则表不可 allow-always。
-- 凭据门（**Phase 4 已落地**）：工具**输出**在离开 backend 的那一刻检测并脱敏（`capabilities::redact`）——**发生在接缝处，不是入库时**，理由见下。识别的形状：PEM 私钥块、已知 token 前缀（`sk-`/`ghp_`/`AKIA`/`glpat-` 等）、`Authorization: Bearer`、URL userinfo、以及「值至少 8 位且含数字/大写」的 `password=`/`token=` 赋值；普通代码、git hash 与 `password = None` 不误伤。工具**参数**不改存储，仍按「检出凭据 → 触发审批/告警」处理。
+- 凭据门（**Phase 4 已落地，评审⑨ 补全**）：工具**输出**与 **`ToolCallProgress`** 在离开 backend 的那一刻检测并脱敏（`capabilities::redact`）——**发生在接缝处，不是入库时**，理由见下。识别的形状：PEM/PGP 私钥块、已知 token 前缀（`sk-`/`ghp_`/`AKIA`/`glpat-` 等）、`Authorization: Bearer/Basic/Digest`、URL userinfo（允许空用户与密码含 `@`）、以及键名带 `[A-Za-z0-9_]*` 前缀的赋值（`DB_PASSWORD=`/`AWS_SECRET_ACCESS_KEY=`/`OPENAI_API_KEY=`/`token=`），值用引号感知扫描（带空格的引号值算字面量，`SecretKey::new()` 这类表达式不误伤）。进度按 chunk 脱敏，跨两个 reader chunk 拆开的密钥仍有残余；最终输出与 spill 文件是整段脱敏。工具**参数**不改存储，仍按「检出凭据 → 触发审批/告警」处理。
+- `shell` 的命令写入不经过 `FsBackend`，因此**不在检查点/undo 内**；它的审批永远 `once_only`（工具级 `AllowAlways` 会绕过硬门），tool description 已明写。
 - 所有硬门有对应测试，且测试断言「项目级配置无法关闭它们」（借鉴 atomcode PRECEDENCE 测试）。
 
 ### 「规则不可 allow-always」怎么表达（不动 `RiskLevel`）

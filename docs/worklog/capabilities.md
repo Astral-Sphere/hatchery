@@ -30,8 +30,8 @@
 - [ ] (M2 · Phase 2) **契约测试套件**：`FsBackend` / `TerminalBackend` / `ApprovalGate` 各一套。这是「换绑定不换工具」在没有 ACP 协议时**唯一可机器验证**的形态；绑定矩阵的 ACP 行留作有文档的接缝，真验证在 M3
 - [x] (M2 · Phase 2，Phase 4 补终端) **模式装配**：`ToolPolicy` + `SessionManager::policy_for` / `tools_for` 已落地；Code 用 `ToolPolicy::all()` 并绑 `LocalPty`，Chat 三件只读 + `NoTerminal`，未知模式回退 Chat。`builtin(spec, &backends)` 仍没有 per-tool 配置消费者（ADR-0009），`register()` 仍返回 `()`（M5）
 - [x] (M2 · Phase 4，2026-10-24) **`TerminalHandle` 输出流 + `release`**：已换成 `next_chunk`/`wait`/`kill`/`release`（全部 `&self`，可在一个 `select!` 里同时看输出与退出）；输出合并 + `dropped_bytes`；`release` 在 PTY 上就是 kill（探针实测关掉 master/slave 后 500ms 子进程仍活着）
-- [x] (M2 · Phase 4，2026-10-24) LocalPty + shell 工具：portable-pty 0.9 + nix；显式 cwd、CRLF 归一化、head 1 MiB + tail 7 MiB、进程组 SIGKILL、控制线程、退出后 250ms EOF 宽限、取消/Drop；非 unix 拒绝。shell：`sh -c`、流式进度、120/600s 超时、危险模式一次性。D10 的 Linux/macOS 栏兑现，Windows 待 TUI
-- [x] (M2 · Phase 4，2026-10-24) web_fetch + spill + 凭据脱敏：reqwest 0.13（rustls-no-provider，复用 ferritls）+ htmd；http(s)、5 MiB、30/120s、二进制拒绝、Network 一次性审批。脱敏在接缝处（PEM/前缀/Bearer/URL/赋值），参数不改存储。D12：64 KiB、`<data_dir>/tool-results`、head/tail 16 KiB、0600
+- [x] (M2 · Phase 4，评审⑨ 补强) LocalPty + shell 工具：portable-pty 0.9 + nix；显式 cwd、CRLF 归一化、head 1 MiB + tail 7 MiB、进程组 SIGKILL、控制线程、退出后 250ms EOF 宽限、取消/Drop；非 unix 拒绝。shell：`sh -c`、流式进度、120/600s 超时、危险模式一次性。评审⑨ 补：`pgid = pid`、Linux `waitid(WNOWAIT)`、leader 退出后 Drop 杀组、`stream_incomplete`、shell 永远 `once_only`、EOF 后仍守 `timeout_secs`。D10 的 Linux 栏兑现，macOS 未测量，Windows 待 TUI
+- [x] (M2 · Phase 4，评审⑨ 补强) web_fetch + spill + 凭据脱敏：reqwest 0.13（rustls-no-provider，复用 ferritls）+ htmd；http(s)、5 MiB、30/120s、二进制拒绝、Network 一次性审批。脱敏在接缝处（PEM/前缀/Bearer/URL/赋值），参数不改存储。D12：64 KiB、`<data_dir>/tool-results`、head/tail 16 KiB、0600。评审⑨ 补：同 host+port 重定向、UPPER_SNAKE/引号/PGP/Basic、进度脱敏、进程级 spill 序号
 - [x] (M2 · Phase 4，2026-10-24) **spill 由谁做**：裁决为注册表统一做（输出离开 backend 时），工具保留带内上限；D12 已落地
 - [x] (M2 · Phase 4，2026-10-24) **D17**：reqwest 0.13（锁文件已有版本，`rustls-no-provider`，复用项目 ferritls provider）+ htmd 0.5.6（Apache-2.0）；不引第二套 TLS 后端
 - [ ] (M2 · Phase 7) disallowed_methods 的 compile-fail 测试（M0a 已人工实测 lint 生效，见 worklog/testing.md）；`trybuild` 尚未在任何依赖表里

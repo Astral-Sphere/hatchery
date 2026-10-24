@@ -174,7 +174,7 @@ pub trait HistorySource { async fn view(&self) -> Result<HistoryView, KernelErro
 
 - 按 provider 能力表过滤/保留 reasoning 块（ADR-0007）；
 - compaction item 替换其覆盖区间；
-- token 预算裁剪（**M2 Phase 4 已落地**）：daemon 的 `StoreHistory::view()` 末尾裁剪；`[context] max_input_tokens`（默认 96000、下限 4096），估算 ASCII/4 + 非 ASCII + 每消息 4；**先削最旧工具结果到 4000 字符、再整轮丢最旧 round**，system prompt 与最新 user 永不丢。与 `ToolOutput::Spilled`（D12，Phase 4）是「工具输出太大」这同一个问题的两半；压缩/摘要（compaction）仍 M5；
+- token 预算裁剪（**M2 Phase 4 已落地**）：daemon 的 `StoreHistory::view()` 末尾裁剪；`[context] max_input_tokens`（默认 96000、下限 4096），估算 ASCII/4 + 非 ASCII + 每消息 4；**先削最旧工具结果到 4,000 字符（head+tail 各 2,000，保留 spill 指针）、再整轮丢最旧 round**，system prompt 与最新 user 永不丢。与 `ToolOutput::Spilled`（D12，Phase 4）是「工具输出太大」这同一个问题的两半；压缩/摘要（compaction）仍 M5；
 - **system prompt 作为一条 `Role::System` 的 `Message` 排在最前**（**已落地**，2026-10-07 · Phase 0 · D15）。
 
 store 只返回**有序 item 链**（storage.md §4），这些过滤都在 daemon——它们需要 provider 能力表，而 store 没有也不该有。
