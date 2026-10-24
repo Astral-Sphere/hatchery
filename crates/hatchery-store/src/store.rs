@@ -113,6 +113,13 @@ pub trait SessionStore: Send + Sync {
     /// here rather than in a branch walk the daemon would have to guess at.
     async fn session_of_item(&self, item: ItemId) -> Result<SessionId, StoreError>;
 
+    /// Refuses an item that cannot be edited, without writing anything.
+    ///
+    /// Exists so a caller can ask *before* it performs an expensive or destructive step: the
+    /// daemon restores the working tree first, and must not do that for a `ToolCall`. The rule
+    /// lives here and `edit_fork` calls the same helper, so the two answers cannot drift.
+    async fn ensure_editable(&self, session: SessionId, item: ItemId) -> Result<(), StoreError>;
+
     /// The active branch, root first, payloads included.
     ///
     /// `head` of `None` means the session's active head. Payload filtering — reasoning
@@ -409,6 +416,15 @@ impl SessionStore for TursoStore {
     async fn session_of_item(&self, item: ItemId) -> Result<SessionId, StoreError> {
         self.ask(|reply| StoreCmd::SessionOfItem { item, reply })
             .await
+    }
+
+    async fn ensure_editable(&self, session: SessionId, item: ItemId) -> Result<(), StoreError> {
+        self.ask(|reply| StoreCmd::EnsureEditable {
+            session,
+            item,
+            reply,
+        })
+        .await
     }
 
     async fn rebuild_chain(

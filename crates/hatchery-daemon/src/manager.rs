@@ -331,9 +331,8 @@ impl SessionManager {
                 ),
             ));
         }
-        // Resolved before the gate and before any assembly: a model nothing serves is a
+        // Resolved under the gate but before any assembly: a model nothing serves is a
         // configuration error the caller should hear about, and it must not cost a live runtime.
-        let options = self.turn_options(&session)?;
         let gate = Arc::clone(
             self.turn_gates
                 .lock()
@@ -342,6 +341,27 @@ impl SessionManager {
                 .or_default(),
         );
         let _lease = gate.lock().await;
+        // Re-read under the gate. `set_mode` writes the mode row inside this same gate, so a row
+        // read before it is exactly the stale snapshot that would assemble the old catalogue
+        // under the new label — and a generation bump racing the submit is the same mistake.
+        let session = self
+            .store
+            .session(params.session_id)
+            .await
+            .map_err(store_error)?;
+        if params
+            .generation
+            .is_some_and(|seen| seen < session.generation)
+        {
+            return Err(ManagerError::new(
+                ErrorCode::GenerationMismatch,
+                format!(
+                    "the session is at generation {}, the caller submitted at {:?}",
+                    session.generation, params.generation
+                ),
+            ));
+        }
+        let options = self.turn_options(&session)?;
         let runtime = self.ensure_runtime(&session).await?;
         // The runtime slot is the session's lease (invariant 1): one turn at a time, and the
         // refusal is the protocol's own error, not a silently dropped command. The marker is
@@ -452,8 +472,31 @@ impl SessionManager {
         if let Some(runtime) = self.take_runtime(session.id) {
             let live = !runtime.handle.is_closed();
             runtime.shutdown();
-            if live {
-                self.assemble(&updated).await?;
+            if live && let Err(error) = self.assemble(&updated).await {
+                // The row already says the new mode and the old runtime is gone. Leaving it
+                // there would advertise a catalogue nobody can call, and a retry would hit the
+                // `mode == params.mode` early return above and never announce the switch, so put
+                // the row back and tell subscribers what they actually have.
+                match self
+                    .store
+                    .update_session(
+                        session.id,
+                        SessionPatch {
+                            mode: Some(session.mode.clone()),
+                            ..SessionPatch::default()
+                        },
+                    )
+                    .await
+                {
+                    Ok(reverted) => {
+                        self.publish_session_updated(&self.session_for_wire(reverted));
+                    }
+                    Err(rollback) => tracing::error!(
+                        session = %session.id,
+                        "mode switch failed and the row could not be reverted: {rollback}"
+                    ),
+                }
+                return Err(error);
             }
         }
         let current = self.session_for_wire(updated);
@@ -489,11 +532,18 @@ impl SessionManager {
         let _lease = self.gate_for(session_id).await;
         self.ensure_idle(session_id)?;
         let session = self.store.session(session_id).await.map_err(store_error)?;
+        // Ask before restoring anything: `edit_fork` refuses non-message items, and a client that
+        // offered "edit & rewind" on a ToolCall row must not get a rewritten working tree plus an
+        // error saying nothing happened.
+        self.store
+            .ensure_editable(session_id, params.item_id)
+            .await
+            .map_err(store_error)?;
         if matches!(
             params.rewind_scope,
             Some(RewindScope::Code | RewindScope::Both)
         ) {
-            self.rewind_code(&session, params.item_id, false).await?;
+            self.rewind_code(&session, params.item_id).await?;
         }
         let forked = self
             .store
@@ -564,8 +614,7 @@ impl SessionManager {
     ///
     /// The store refuses a subtree that contains the active head, so an accidental delete cannot
     /// leave the session pointing at nothing. `confirm` is the protocol's second confirmation:
-    /// this is the one session operation that cannot be undone, and a mistyped request should not
-    /// be enough.
+    /// deleting a subtree is irreversible, and a mistyped request should not be enough.
     ///
     /// # Errors
     ///
@@ -588,6 +637,15 @@ impl SessionManager {
             .delete_branch(params.session_id, params.head)
             .await
             .map_err(store_error)?;
+        // A subtree delete moves no head, so the protocol's "new head is not a successor" signal
+        // cannot fire. Publish the session anyway: `updated_at` has advanced, and a client that
+        // cares about branches re-lists instead of rendering nodes that no longer exist.
+        let session = self
+            .store
+            .session(params.session_id)
+            .await
+            .map_err(store_error)?;
+        self.publish_session_updated(&self.session_for_wire(session));
         Ok(BranchDeleteResult { deleted_items })
     }
 
@@ -641,9 +699,7 @@ impl SessionManager {
         }
         let mut report = RewindReport::default();
         if matches!(params.scope, RewindScope::Code | RewindScope::Both)
-            && let Some(restored) = self
-                .rewind_code(&session, params.target_item, params.purge_untracked)
-                .await?
+            && let Some(restored) = self.rewind_code(&session, params.target_item).await?
         {
             report.rolled_back = restored.rolled_back;
             report.purged = restored.purged;
@@ -677,7 +733,6 @@ impl SessionManager {
         &self,
         session: &Session,
         target_item: ItemId,
-        purge_untracked: bool,
     ) -> Result<Option<hatchery_capabilities::RestoreReport>, ManagerError> {
         let workspace = session.workspace.as_deref().ok_or_else(|| {
             ManagerError::new(
@@ -709,12 +764,7 @@ impl SessionManager {
             return Ok(None);
         };
         self.checkpoints
-            .restore(
-                session.id,
-                workspace,
-                &commit,
-                hatchery_capabilities::RestoreOptions { purge_untracked },
-            )
+            .restore(session.id, workspace, &commit)
             .await
             .map(Some)
             .map_err(|error| ManagerError::new(ErrorCode::InternalError, error.to_string()))
@@ -728,12 +778,18 @@ impl SessionManager {
     ///
     /// # Errors
     ///
-    /// [`ErrorCode::TurnInProgress`] while a turn is running — a turn's items would be written
-    /// against a session row that is being deleted.
+    /// [`ErrorCode::InvalidRequest`] without `confirm`; [`ErrorCode::TurnInProgress`] while a turn
+    /// is running — a turn's items would be written against a session row that is being deleted.
     pub async fn delete_session(
         &self,
         params: SessionDeleteParams,
     ) -> Result<SessionDeleteResult, ManagerError> {
+        if !params.confirm {
+            return Err(ManagerError::new(
+                ErrorCode::InvalidRequest,
+                "deleting a session is not recoverable; repeat the call with `confirm: true`",
+            ));
+        }
         let _lease = self.gate_for(params.session_id).await;
         self.ensure_idle(params.session_id)?;
         if let Some(runtime) = self.take_runtime(params.session_id) {
@@ -781,20 +837,28 @@ impl SessionManager {
     ///
     /// # Errors
     ///
-    /// The store's failure for an existing file or an unwritable path.
+    /// [`ErrorCode::InvalidRequest`] for a relative path (it would resolve against the daemon's
+    /// cwd, not the caller's); the store's failure for an existing file or an unwritable path.
     pub async fn export(
         &self,
         params: ExportJsonlParams,
     ) -> Result<ExportJsonlResult, ManagerError> {
+        if !params.path.is_absolute() {
+            return Err(ManagerError::new(
+                ErrorCode::InvalidRequest,
+                "the export path must be absolute: a relative path resolves against the daemon's \
+                 working directory, not the caller's",
+            ));
+        }
         let lines = self
             .store
             .export_jsonl(params.session_id, params.path.clone(), params.all_branches)
             .await
             .map_err(store_error)?;
-        Ok(ExportJsonlResult {
-            path: params.path,
-            lines,
-        })
+        // Report the file that was actually opened: the parent may be a symlink, and echoing the
+        // request back would point the user somewhere they cannot find.
+        let path = std::fs::canonicalize(&params.path).unwrap_or(params.path);
+        Ok(ExportJsonlResult { path, lines })
     }
 
     /// The per-session turn gate, cloned out of the map.
@@ -2064,6 +2128,7 @@ mod tests {
         let deleted = manager
             .delete_session(SessionDeleteParams {
                 session_id: created.session.id,
+                confirm: true,
             })
             .await
             .expect("deleted");
@@ -2299,5 +2364,452 @@ mod tests {
             rows.iter().any(|row| row.item.is_none()),
             "the undo-of-undo is recorded without an item: {rows:?}"
         );
+    }
+
+    /// A snapshot of the current worktree, for tests that need a real commit to rewind into.
+    async fn snapshot_commit(manager: &SessionManager, workspace: &std::path::Path) -> String {
+        manager
+            .checkpoints()
+            .store_for(workspace)
+            .await
+            .expect("shadow")
+            .snapshot(hatchery_protocol::CheckpointKind::PreWrite)
+            .await
+            .expect("snapshot")
+            .checkpoint
+            .commit_id
+    }
+
+    #[tokio::test]
+    async fn editing_an_item_restores_code_first_and_forks_the_history() {
+        let (dir, manager, _hub) = manager().await;
+        let workspace = dir.path().join("ws");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let note = workspace.join("note.txt");
+        std::fs::write(&note, "v1\n").expect("write");
+        let session = session_in_workspace(&manager, workspace.clone()).await;
+        let items = chain_of_three(&manager, session.id).await;
+        let commit = snapshot_commit(&manager, &workspace).await;
+        append_checkpoint(&manager, session.id, items[1].id, &commit).await;
+        std::fs::write(&note, "v2\n").expect("write after the snapshot");
+
+        let result = manager
+            .edit_item(EditItemParams {
+                item_id: items[1].id,
+                new_content: hatchery_protocol::Content::text("edited"),
+                rewind_scope: Some(RewindScope::Both),
+            })
+            .await
+            .expect("edited");
+
+        assert_eq!(
+            std::fs::read_to_string(&note).expect("restored"),
+            "v1\n",
+            "the code leg runs before the fork"
+        );
+        assert_ne!(result.branch_head, items[1].id, "the edit is a new item");
+        let fork = manager
+            .store
+            .item(session.id, result.branch_head)
+            .await
+            .expect("fork");
+        assert_eq!(
+            fork.parent,
+            Some(items[0].id),
+            "the replacement takes the original's parent (ADR-0003)"
+        );
+        assert_eq!(result.session.active_branch_head, Some(result.branch_head));
+    }
+
+    #[tokio::test]
+    async fn editing_a_non_message_never_touches_the_working_tree() {
+        let (dir, manager, _hub) = manager().await;
+        let workspace = dir.path().join("ws");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let note = workspace.join("note.txt");
+        std::fs::write(&note, "v1\n").expect("write");
+        let session = session_in_workspace(&manager, workspace.clone()).await;
+        let items = chain_of_three(&manager, session.id).await;
+        let commit = snapshot_commit(&manager, &workspace).await;
+        let checkpoint = append_checkpoint(&manager, session.id, items[2].id, &commit).await;
+        std::fs::write(&note, "v2\n").expect("write after the snapshot");
+
+        let error = manager
+            .edit_item(EditItemParams {
+                item_id: checkpoint.id,
+                new_content: hatchery_protocol::Content::text("edited"),
+                rewind_scope: Some(RewindScope::Both),
+            })
+            .await
+            .expect_err("a checkpoint carries no content");
+        assert_eq!(error.into_event().code, ErrorCode::InvalidRequest);
+        assert_eq!(
+            std::fs::read_to_string(&note).expect("untouched"),
+            "v2\n",
+            "a rejected edit must not have restored anything"
+        );
+        let after = manager.store.session(session.id).await.expect("session");
+        assert_eq!(after.active_branch_head, Some(checkpoint.id));
+    }
+
+    #[tokio::test]
+    async fn a_both_rewind_restores_code_and_then_moves_the_head() {
+        let (dir, manager, _hub) = manager().await;
+        let workspace = dir.path().join("ws");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let note = workspace.join("note.txt");
+        std::fs::write(&note, "v1\n").expect("write");
+        let session = session_in_workspace(&manager, workspace.clone()).await;
+        let items = chain_of_three(&manager, session.id).await;
+        let commit = snapshot_commit(&manager, &workspace).await;
+        append_checkpoint(&manager, session.id, items[2].id, &commit).await;
+        std::fs::write(&note, "v2\n").expect("write after the snapshot");
+
+        let result = manager
+            .rewind(rewind_params(session.id, items[2].id, RewindScope::Both))
+            .await
+            .expect("rewound");
+        assert_eq!(std::fs::read_to_string(&note).expect("restored"), "v1\n");
+        assert_eq!(result.session.active_branch_head, Some(items[2].id));
+        assert!(
+            result
+                .report
+                .rolled_back
+                .iter()
+                .any(|path| path.ends_with("note.txt")),
+            "{:?}",
+            result.report.rolled_back
+        );
+    }
+
+    #[tokio::test]
+    async fn a_purge_rewind_refuses_without_deleting_or_restoring() {
+        let (dir, manager, _hub) = manager().await;
+        let workspace = dir.path().join("ws");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let note = workspace.join("note.txt");
+        std::fs::write(&note, "v1\n").expect("write");
+        let session = session_in_workspace(&manager, workspace.clone()).await;
+        let items = chain_of_three(&manager, session.id).await;
+        let commit = snapshot_commit(&manager, &workspace).await;
+        let checkpoint = append_checkpoint(&manager, session.id, items[2].id, &commit).await;
+        // Untracked *after* the snapshot: a purge would delete this and nothing else.
+        let scratch = workspace.join("scratch.txt");
+        std::fs::write(&scratch, "mine\n").expect("untracked");
+        std::fs::write(&note, "v2\n").expect("write after the snapshot");
+
+        let mut params = rewind_params(session.id, items[2].id, RewindScope::Both);
+        params.purge_untracked = true;
+        let error = manager.rewind(params).await.expect_err("refused");
+        assert_eq!(error.into_event().code, ErrorCode::InvalidRequest);
+        assert!(scratch.is_file(), "the purge must not have run");
+        assert_eq!(
+            std::fs::read_to_string(&note).expect("untouched"),
+            "v2\n",
+            "the refusal must happen before the restore"
+        );
+        let after = manager.store.session(session.id).await.expect("session");
+        assert_eq!(after.active_branch_head, Some(checkpoint.id));
+    }
+
+    #[tokio::test]
+    async fn a_code_rewind_ignores_checkpoints_before_the_target() {
+        let (dir, manager, _hub) = manager().await;
+        let workspace = dir.path().join("ws");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let note = workspace.join("note.txt");
+        std::fs::write(&note, "v0\n").expect("write");
+        let session = session_in_workspace(&manager, workspace.clone()).await;
+
+        // A checkpoint *between* the messages, so it is on the active chain and strictly before
+        // the rewind target. Appending it as a child of the last item would fork the branch, and
+        // the target would no longer be reachable.
+        let first = {
+            let item = Item::new(
+                session.id,
+                ItemKind::UserMessage(hatchery_protocol::Content::text("first")),
+            );
+            manager
+                .store
+                .append_item(item.clone())
+                .await
+                .expect("append");
+            item
+        };
+        let commit = snapshot_commit(&manager, &workspace).await;
+        let checkpoint = append_checkpoint(&manager, session.id, first.id, &commit).await;
+        let second = {
+            let mut item = Item::new(
+                session.id,
+                ItemKind::UserMessage(hatchery_protocol::Content::text("second")),
+            );
+            item.parent = Some(checkpoint.id);
+            manager
+                .store
+                .append_item(item.clone())
+                .await
+                .expect("append");
+            item
+        };
+        let third = {
+            let mut item = Item::new(
+                session.id,
+                ItemKind::UserMessage(hatchery_protocol::Content::text("third")),
+            );
+            item.parent = Some(second.id);
+            manager
+                .store
+                .append_item(item.clone())
+                .await
+                .expect("append");
+            item
+        };
+        std::fs::write(&note, "v1\n").expect("the only write after the target");
+
+        let result = manager
+            .rewind(rewind_params(session.id, third.id, RewindScope::Code))
+            .await
+            .expect("no-op");
+        assert!(result.report.rolled_back.is_empty());
+        assert_eq!(
+            std::fs::read_to_string(&note).expect("untouched"),
+            "v1\n",
+            "a checkpoint before the target must never be restored"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_code_rewind_that_changes_nothing_reports_nothing() {
+        let (dir, manager, _hub) = manager().await;
+        let workspace = dir.path().join("ws");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let note = workspace.join("note.txt");
+        std::fs::write(&note, "v1\n").expect("write");
+        let session = session_in_workspace(&manager, workspace.clone()).await;
+        let items = chain_of_three(&manager, session.id).await;
+        let commit = snapshot_commit(&manager, &workspace).await;
+        append_checkpoint(&manager, session.id, items[2].id, &commit).await;
+
+        let result = manager
+            .rewind(rewind_params(session.id, items[2].id, RewindScope::Code))
+            .await
+            .expect("rewound");
+        assert!(
+            result.report.rolled_back.is_empty(),
+            "the worktree already was the target: {:?}",
+            result.report.rolled_back
+        );
+    }
+
+    #[tokio::test]
+    async fn deleting_a_session_needs_confirmation() {
+        let (_dir, manager, _hub) = manager().await;
+        let created = manager.new_session(new_params()).await.expect("created");
+        let error = manager
+            .delete_session(SessionDeleteParams {
+                session_id: created.session.id,
+                confirm: false,
+            })
+            .await
+            .expect_err("no confirmation");
+        assert_eq!(error.into_event().code, ErrorCode::InvalidRequest);
+        assert!(
+            manager.store.session(created.session.id).await.is_ok(),
+            "a refused delete must not remove anything"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_export_path_must_be_absolute() {
+        let (_dir, manager, _hub) = manager().await;
+        let created = manager.new_session(new_params()).await.expect("created");
+        let error = manager
+            .export(ExportJsonlParams {
+                session_id: created.session.id,
+                path: std::path::PathBuf::from("session.jsonl"),
+                all_branches: false,
+            })
+            .await
+            .expect_err("relative path");
+        assert_eq!(error.into_event().code, ErrorCode::InvalidRequest);
+    }
+
+    #[tokio::test]
+    async fn a_branch_delete_broadcasts_the_session() {
+        let (_dir, manager, hub) = manager().await;
+        let created = manager.new_session(new_params()).await.expect("created");
+        let items = chain_of_three(&manager, created.session.id).await;
+        manager
+            .branch_switch(BranchSwitchParams {
+                session_id: created.session.id,
+                head: items[1].id,
+            })
+            .await
+            .expect("switched");
+        let mut events = hub.subscribe(created.session.id);
+
+        manager
+            .branch_delete(BranchDeleteParams {
+                session_id: created.session.id,
+                head: items[2].id,
+                confirm: true,
+            })
+            .await
+            .expect("deleted");
+
+        let event = events.recv().await.expect("a session update");
+        assert!(matches!(event.event, ServerEvent::SessionUpdated { .. }));
+    }
+
+    #[tokio::test]
+    async fn a_reconnecting_load_carries_the_pending_approval() {
+        use hatchery_capabilities::ApprovalGate as _;
+        let (_dir, manager, hub) = manager().await;
+        let created = manager.new_session(new_params()).await.expect("created");
+        let mut events = hub.subscribe(created.session.id);
+        let gate = Arc::new(crate::approvals::DaemonApproval::new(
+            created.session.id,
+            0,
+            Arc::clone(&hub),
+            Arc::clone(&manager.pending),
+            std::time::Duration::from_secs(5),
+            Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        ));
+        let request_id = hatchery_protocol::ApprovalId::new();
+        let asked = {
+            let gate = Arc::clone(&gate);
+            tokio::spawn(async move {
+                gate.request(
+                    request_id,
+                    hatchery_protocol::ApprovalRequest::new(
+                        "write_file",
+                        "write a file",
+                        hatchery_protocol::RiskLevel::WritesWorkspace,
+                    ),
+                )
+                .await
+            })
+        };
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), events.recv())
+            .await
+            .expect("the question was published")
+            .expect("hub alive");
+        assert!(matches!(
+            event.event,
+            ServerEvent::ApprovalRequested { request_id: id, .. } if id == request_id
+        ));
+
+        let loaded = manager
+            .load(SessionLoadParams {
+                session_id: created.session.id,
+                replay_from: None,
+                generation: None,
+            })
+            .await
+            .expect("load");
+        assert_eq!(loaded.pending_approvals.len(), 1);
+        assert_eq!(loaded.pending_approvals[0].request_id, request_id);
+        assert_eq!(loaded.pending_approvals[0].request.tool, "write_file");
+
+        assert!(manager.respond_approval(request_id, hatchery_protocol::ApprovalOption::AllowOnce));
+        assert_eq!(
+            asked.await.expect("gate task"),
+            hatchery_protocol::ApprovalOption::AllowOnce
+        );
+        let after = manager
+            .load(SessionLoadParams {
+                session_id: created.session.id,
+                replay_from: None,
+                generation: None,
+            })
+            .await
+            .expect("load");
+        assert!(after.pending_approvals.is_empty());
+    }
+
+    /// A manager on the slow wire whose session has a workspace, so a mode switch can reassemble
+    /// into Code.
+    async fn manager_on_a_slow_wire_with_a_workspace(
+        wire: &hatchery_testkit::MockWire,
+    ) -> (tempfile::TempDir, Arc<SessionManager>, SessionId) {
+        let config = Arc::new(LayeredConfig::from_layers(vec![(
+            hatchery_protocol::method::ConfigOrigin::User,
+            table(&format!(
+                "[daemon]\nidle_timeout_min = 0\n\n[providers.testprov]\n\
+                 base_url = \"{url}\"\nenv_key = \"PATH\"\nmodels = [\"m\"]\n",
+                url = wire.url()
+            )),
+        )]));
+        let (dir, manager, _hub) = manager_with_config(config).await;
+        let workspace = dir.path().join("ws");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let created = manager
+            .new_session(SessionNewParams {
+                mode: SessionModeId::chat(),
+                workspace: Some(workspace),
+                model: Some(ModelRef::new("testprov", "m")),
+                title: Some("mode".to_owned()),
+                config_patch: None,
+            })
+            .await
+            .expect("created");
+        (dir, manager, created.session.id)
+    }
+
+    #[tokio::test]
+    async fn set_mode_swaps_a_live_runtime_and_bumps_the_generation() {
+        hatchery_llm::install_tls_provider();
+        let wire = hatchery_testkit::MockWire::replay_sse_after(
+            "data: {\"id\":\"x\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"hi\"}}]}\n\n\
+             data: [DONE]\n\n",
+            std::time::Duration::from_secs(5),
+        )
+        .await;
+        let (_dir, manager, session) = manager_on_a_slow_wire_with_a_workspace(&wire).await;
+
+        manager.attach(session);
+        manager
+            .prompt(SessionPromptParams {
+                session_id: session,
+                content: hatchery_protocol::Content::text("hold"),
+                generation: None,
+            })
+            .await
+            .expect("accepted");
+        manager.cancel(session).await.expect("cancel");
+        wait_until_quiet(&manager).await;
+        let before = manager
+            .store
+            .session(session)
+            .await
+            .expect("session")
+            .generation;
+        let mut events = manager.hub.subscribe(session);
+
+        let result = manager
+            .set_mode(SetModeParams {
+                session_id: session,
+                mode: SessionModeId::code(),
+            })
+            .await
+            .expect("switched");
+
+        assert_eq!(result.session.mode, SessionModeId::code());
+        assert!(
+            result.session.generation > before,
+            "the switch reassembled, and every assembly bumps the generation"
+        );
+        assert_eq!(manager.live_runtimes(), 1, "a live runtime was replaced");
+        let mut saw_switch = false;
+        let mut saw_update = false;
+        for _ in 0..4 {
+            let event = events.recv().await.expect("event");
+            match event.event {
+                ServerEvent::ModeSwitched { .. } => saw_switch = true,
+                ServerEvent::SessionUpdated { .. } => saw_update = true,
+                _ => {}
+            }
+        }
+        assert!(saw_switch && saw_update);
     }
 }

@@ -464,6 +464,13 @@ pub struct RewindResult {
 pub struct SessionDeleteParams {
     /// Which session to delete, items included.
     pub session_id: SessionId,
+    /// Must be `true`.
+    ///
+    /// Deleting a session removes its items, turns and checkpoints and cannot be undone — the
+    /// same irreversibility `session/branch/delete` guards with its own flag. Defaulted so an
+    /// older request shape deserializes, and then refused by the daemon rather than acted on.
+    #[serde(default)]
+    pub confirm: bool,
 }
 
 /// Result of [`SESSION_DELETE`].

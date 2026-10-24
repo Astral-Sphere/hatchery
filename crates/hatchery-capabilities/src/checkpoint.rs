@@ -622,31 +622,7 @@ impl Shadow {
         }
     }
 
-    /// Tracked paths whose working-tree content differs from `head`.
-    ///
-    /// Untracked files are excluded on purpose: a restore only deletes them when
-    /// [`RestoreOptions::purge_untracked`] is set, and those deletions are reported separately in
-    /// `purged`. Ignored paths are excluded by the shadow repository's own ignore rules, which is
-    /// what keeps `.git` and build output out of both lists.
-    fn worktree_drift(
-        &self,
-        repo: &Repository,
-        head: Option<&Tree<'_>>,
-    ) -> Result<Vec<PathBuf>, CheckpointError> {
-        let mut options = git2::DiffOptions::new();
-        options
-            .include_untracked(false)
-            .recurse_untracked_dirs(false);
-        let diff = repo.diff_tree_to_workdir_with_index(head, Some(&mut options))?;
-        let mut paths = Vec::new();
-        for delta in diff.deltas() {
-            if let Some(path) = delta.new_file().path().or_else(|| delta.old_file().path()) {
-                paths.push(PathBuf::from(path));
-            }
-        }
-        Ok(paths)
-    }
-
+    /// A structured tree-to-tree diff, rename detection included.
     fn diff_trees(
         &self,
         repo: &Repository,
@@ -741,6 +717,19 @@ impl Shadow {
         // Undo-of-undo, taken before anything is destroyed — and deliberately *not* made HEAD, see
         // `commit_snapshot`.
         let safety = self.commit_snapshot(repo, CheckpointKind::Manual, false)?;
+        // Make the safety commit reachable *before* the destructive step. The caller writes the
+        // `checkpoints` row only after `restore` returns, so a reset that dies halfway (full
+        // disk, a locked file) would otherwise leave an unreachable commit and no way back. A
+        // ref costs nothing, does not move HEAD, and keeps the undo point findable for a human
+        // (the row remains the index the daemon reads).
+        let safety_oid = Oid::from_str(&safety.checkpoint.commit_id)
+            .map_err(|_| self.unknown_commit(&safety.checkpoint.commit_id))?;
+        repo.reference(
+            "refs/hatchery/safety",
+            safety_oid,
+            true,
+            "hatchery rewind safety snapshot",
+        )?;
         // Staging the work tree is how a snapshot is built, but the index is also what `reset(Hard)`
         // consults to decide what to delete. Left staged, a file no checkpoint ever tracked would
         // look tracked and be removed, turning every rewind into a purge — the one thing
@@ -748,21 +737,30 @@ impl Shadow {
         self.unstage_to(repo, head_before)?;
 
         let rolled_back = {
-            let head_tree = head_before
-                .and_then(|oid| repo.find_commit(oid).ok())
-                .and_then(|commit| commit.tree().ok());
             let target_tree = repo.find_commit(target_oid)?.tree()?;
-            // Two sources, because a snapshot is taken *before* a write: a file edited after the
-            // last snapshot is absent from the commit-level diff, yet the reset will still change
-            // it. Reporting only the commit diff would tell the user "nothing was rolled back"
-            // while their file went back, which a rewind report must never do.
-            let mut paths: Vec<PathBuf> = self
-                .diff_trees(repo, head_tree.as_ref(), Some(&target_tree))?
-                .files
-                .into_iter()
-                .map(|file| PathBuf::from(file.path))
-                .collect();
-            paths.extend(self.worktree_drift(repo, head_tree.as_ref())?);
+            // The report is "what the reset is about to change", so diff the target against the
+            // working tree rather than against a commit. A snapshot is taken *before* a write, so
+            // HEAD can lag the worktree by the last write — and a snapshot also keeps files the
+            // user deleted, which HEAD-vs-target would either miss or misreport.
+            let mut paths = Vec::new();
+            let mut options = git2::DiffOptions::new();
+            options.include_untracked(false);
+            let diff =
+                repo.diff_tree_to_workdir_with_index(Some(&target_tree), Some(&mut options))?;
+            for delta in diff.deltas() {
+                // Both sides: a rename changes the old path (deleted) and the new one (created).
+                for file in [delta.old_file(), delta.new_file()] {
+                    let Some(path) = file.path() else { continue };
+                    let path = slash_separated(path);
+                    // A path in the index but missing from both the target and the worktree is
+                    // changed by nothing; `unstage_to` leaves those entries behind.
+                    let present_in_target = target_tree.get_path(Path::new(&path)).is_ok();
+                    let present_on_disk = self.workspace.join(&path).symlink_metadata().is_ok();
+                    if present_in_target || present_on_disk {
+                        paths.push(PathBuf::from(path));
+                    }
+                }
+            }
             paths.sort();
             paths.dedup();
             paths

@@ -502,6 +502,7 @@ pub fn method_params() -> Vec<(&'static str, Value)> {
             m::SESSION_DELETE,
             to_value(&SessionDeleteParams {
                 session_id: session_id(),
+                confirm: true,
             }),
         ),
         (

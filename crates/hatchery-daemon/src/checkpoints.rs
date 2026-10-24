@@ -147,6 +147,11 @@ impl Checkpoints {
     /// frontend should render it ([`hatchery_store::CheckpointRecord::item`] is optional for
     /// exactly this record).
     ///
+    /// There is deliberately no `purge` switch here: capabilities.md §2 requires an approval and
+    /// a listed manifest before untracked files may be deleted, and this layer has neither. The
+    /// wire-level `purge_untracked` refusal and this hardcoded `false` are the same rule stated
+    /// where the deletion happens, so a future caller cannot bypass it through this wrapper.
+    ///
     /// # Errors
     ///
     /// Whatever the shadow store reports — an unknown commit, a git failure, or an I/O failure.
@@ -157,10 +162,16 @@ impl Checkpoints {
         session: SessionId,
         workspace: &Path,
         commit_id: &str,
-        options: RestoreOptions,
     ) -> Result<RestoreReport, CheckpointError> {
         let shadow = self.store_for(workspace).await?;
-        let report = shadow.restore(commit_id, options).await?;
+        let report = shadow
+            .restore(
+                commit_id,
+                RestoreOptions {
+                    purge_untracked: false,
+                },
+            )
+            .await?;
         if !report.safety.oversized.is_empty() {
             tracing::warn!(
                 workspace = %workspace.display(),
@@ -168,21 +179,35 @@ impl Checkpoints {
                 "the rewind safety snapshot left files out: larger than the size limit"
             );
         }
-        let record = hatchery_store::CheckpointRecord {
-            id: CheckpointId::new(),
-            session,
-            item: None,
-            workspace: recorded_workspace(workspace),
-            commit_id: report.safety.checkpoint.commit_id.clone(),
-            kind: report.safety.checkpoint.kind,
-            created_at: Timestamp::now(),
-        };
-        if let Err(error) = self.store.record_checkpoint(record).await {
-            tracing::error!(
-                %session,
-                workspace = %workspace.display(),
-                "failed to record the rewind safety snapshot: {error}"
-            );
+        // Repeated rewinds to the same target reuse the same safety commit; recording it again
+        // would grow the table (and the budget's view of it) for nothing.
+        let already_indexed = self
+            .store
+            .checkpoints_for_workspace(workspace)
+            .await
+            .map(|rows| {
+                rows.iter().any(|row| {
+                    row.item.is_none() && row.commit_id == report.safety.checkpoint.commit_id
+                })
+            })
+            .unwrap_or(false);
+        if !already_indexed {
+            let record = hatchery_store::CheckpointRecord {
+                id: CheckpointId::new(),
+                session,
+                item: None,
+                workspace: recorded_workspace(workspace),
+                commit_id: report.safety.checkpoint.commit_id.clone(),
+                kind: report.safety.checkpoint.kind,
+                created_at: Timestamp::now(),
+            };
+            if let Err(error) = self.store.record_checkpoint(record).await {
+                tracing::error!(
+                    %session,
+                    workspace = %workspace.display(),
+                    "failed to record the rewind safety snapshot: {error}"
+                );
+            }
         }
         Ok(report)
     }

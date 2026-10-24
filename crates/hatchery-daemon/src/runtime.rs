@@ -188,10 +188,15 @@ pub struct HubSink {
         hatchery_protocol::ApprovalId,
         hatchery_protocol::ApprovalRequest,
     )>,
+    /// The session's approval registry, so `TurnEnded` can drop prompts nobody can answer.
+    pending: Arc<crate::approvals::PendingApprovals>,
 }
 
 impl HubSink {
     /// A sink bound to one runtime.
+    // The sink is exactly the set of handles the runtime already owns. A parts struct would move
+    // the same eight fields behind one name without making a single call site clearer.
+    #[allow(clippy::too_many_arguments)]
     #[must_use]
     pub fn new(
         session: SessionId,
@@ -204,6 +209,7 @@ impl HubSink {
             hatchery_protocol::ApprovalId,
             hatchery_protocol::ApprovalRequest,
         )>,
+        pending: Arc<crate::approvals::PendingApprovals>,
     ) -> Self {
         Self {
             session,
@@ -213,6 +219,7 @@ impl HubSink {
             workspace,
             in_flight,
             approvals,
+            pending,
         }
     }
 
@@ -356,6 +363,11 @@ impl EventSink for HubSink {
                 // However the turn ended, the manager's early marker is released here: this is
                 // the one event every turn produces, so it is the one place the flag clears.
                 self.in_flight.store(false, Ordering::Release);
+                // Prompts still registered belong to this turn. The kernel has stopped waiting,
+                // so an answer can no longer be used — leaving them would put a prompt for a
+                // finished turn into the next `session/load`, and answering it would persist a
+                // rule for a call that never ran.
+                self.pending.cancel_session(self.session);
                 let recorded = completion.is_ok().then(|| {
                     hatchery_protocol::TurnCompletion::new(
                         completion
@@ -494,6 +506,7 @@ impl SessionRuntime {
                 workspace.clone(),
                 Arc::clone(&in_flight),
                 approval_tx,
+                Arc::clone(&approvals),
             )),
         );
         let options = ChatOptions::new(session.model.model.clone());
@@ -508,6 +521,7 @@ impl SessionRuntime {
             Arc::clone(&hub),
             Arc::clone(&approvals),
             approval_timeout,
+            Arc::clone(&in_flight),
         ));
         tokio::spawn(crate::approvals::pump_approvals(
             approval_rx,
@@ -824,6 +838,7 @@ mod tests {
             Some(workspace.clone()),
             Arc::new(AtomicBool::new(false)),
             tokio::sync::mpsc::unbounded_channel().0,
+            Arc::new(crate::approvals::PendingApprovals::new()),
         );
         let item = Item::new(
             session.id,
@@ -907,6 +922,7 @@ mod tests {
             None,
             Arc::new(AtomicBool::new(false)),
             tokio::sync::mpsc::unbounded_channel().0,
+            Arc::new(crate::approvals::PendingApprovals::new()),
         );
         let item = Item::new(
             session.id,

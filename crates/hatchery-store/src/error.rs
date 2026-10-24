@@ -75,8 +75,12 @@ impl StoreError {
     #[must_use]
     pub fn to_event_error(&self) -> EventError {
         let code = match self {
-            Self::SessionNotFound(_) | Self::ItemNotFound(_) => ErrorCode::SessionNotFound,
-            Self::ActiveHeadInside(_)
+            Self::SessionNotFound(_) => ErrorCode::SessionNotFound,
+            // A missing item under an existing session is a bad item id, not a vanished session.
+            // Collapsing the two made a mistyped `edit_item` tell the frontend to evict the
+            // whole session.
+            Self::ItemNotFound(_)
+            | Self::ActiveHeadInside(_)
             | Self::NotEditable(_)
             | Self::UnknownTurn(_)
             | Self::Invalid(_)
@@ -99,6 +103,14 @@ mod tests {
     fn a_missing_session_reads_as_a_missing_session() {
         let error = StoreError::SessionNotFound(SessionId::new());
         assert_eq!(error.to_event_error().code, ErrorCode::SessionNotFound);
+    }
+
+    #[test]
+    fn a_missing_item_is_a_bad_item_id_not_a_missing_session() {
+        // The session exists; only the item id was wrong. A frontend keyed on the code must not
+        // evict the session because a client edited an item that a branch delete removed.
+        let error = StoreError::ItemNotFound(hatchery_protocol::ItemId::new());
+        assert_eq!(error.to_event_error().code, ErrorCode::InvalidRequest);
     }
 
     #[test]

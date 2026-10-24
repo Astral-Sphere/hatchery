@@ -711,7 +711,7 @@ mod tests {
         let deleted = core
             .dispatch(&request(
                 m::SESSION_DELETE,
-                serde_json::json!({"session_id": id}),
+                serde_json::json!({"session_id": id, "confirm": true}),
             ))
             .await;
         let deleted: m::SessionDeleteResult =

@@ -149,6 +149,15 @@ pub enum StoreCmd {
         /// Its session.
         reply: Reply<SessionId>,
     },
+    /// Refuse an item that carries no editable content.
+    EnsureEditable {
+        /// Which session it must belong to.
+        session: SessionId,
+        /// Which item.
+        item: ItemId,
+        /// Editable, or the reason it is not.
+        reply: Reply<()>,
+    },
     /// The active branch, root first, payloads included.
     RebuildChain {
         /// Which session.
@@ -346,6 +355,13 @@ impl Writer {
                 }
                 StoreCmd::SessionOfItem { item, reply } => {
                     reply_send(reply, self.session_of_item(item).await);
+                }
+                StoreCmd::EnsureEditable {
+                    session,
+                    item,
+                    reply,
+                } => {
+                    reply_send(reply, self.ensure_editable(session, item).await);
                 }
                 StoreCmd::RebuildChain {
                     session,
@@ -841,6 +857,7 @@ impl Writer {
         new_content: Content,
     ) -> Result<Item, StoreError> {
         let original = self.item(session, target).await?;
+        ensure_editable_item(&original)?;
         let replacement = match &original.kind {
             ItemKind::UserMessage(_) => ItemKind::UserMessage(new_content),
             ItemKind::AssistantMessage(_) => ItemKind::AssistantMessage(new_content),
@@ -1284,6 +1301,11 @@ impl Writer {
             .ok_or(StoreError::ItemNotFound(item))
     }
 
+    /// The one editability rule, shared with `edit_fork` (see `ensure_editable_item`).
+    async fn ensure_editable(&self, session: SessionId, item: ItemId) -> Result<(), StoreError> {
+        ensure_editable_item(&self.item(session, item).await?)
+    }
+
     async fn item_session(&self, item: ItemId) -> Result<Option<SessionId>, StoreError> {
         let mut rows = self
             .conn
@@ -1371,6 +1393,17 @@ fn parse_cursor(cursor: &str) -> Result<(i64, SessionId), StoreError> {
 fn reply_send<T>(reply: Reply<T>, value: Result<T, StoreError>) {
     if reply.send(value).is_err() {
         tracing::debug!("a store caller dropped its reply slot");
+    }
+}
+
+/// Which item kinds carry content a user may replace (ADR-0003).
+///
+/// One function because `edit_fork` and `ensure_editable` must never disagree: the daemon asks
+/// the second *before* restoring the working tree, and the first *after*.
+fn ensure_editable_item(item: &Item) -> Result<(), StoreError> {
+    match item.kind {
+        ItemKind::UserMessage(_) | ItemKind::AssistantMessage(_) => Ok(()),
+        _ => Err(StoreError::NotEditable(item.id)),
     }
 }
 

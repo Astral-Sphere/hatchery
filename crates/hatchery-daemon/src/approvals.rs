@@ -100,6 +100,15 @@ impl PendingApprovals {
         self.slots().remove(&id);
     }
 
+    /// Drops every waiter a session has, without answering them.
+    ///
+    /// Called when a turn ends: the kernel has already abandoned its wait, so a prompt still in
+    /// the registry belongs to no live turn. Answered later through a stale `session/load` list,
+    /// it would persist a rule for a call that never ran.
+    pub fn cancel_session(&self, session: SessionId) {
+        self.slots().retain(|_, pending| pending.session != session);
+    }
+
     /// The requests one session is parked on, oldest request id first.
     ///
     /// `session/load` hands these to a reconnecting frontend so a prompt that arrived while it
@@ -153,6 +162,11 @@ pub struct DaemonApproval {
     hub: Arc<LiveHub>,
     pending: Arc<PendingApprovals>,
     timeout: Duration,
+    /// The runtime's in-flight marker. False means the turn that asked is already over, so there
+    /// is nobody left to use an answer. Read before registering: `TurnEnded` clears it before it
+    /// cancels the session's waiters, so a request that loses that race is denied immediately
+    /// instead of parking for the full timeout.
+    in_flight: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl DaemonApproval {
@@ -164,6 +178,7 @@ impl DaemonApproval {
         hub: Arc<LiveHub>,
         pending: Arc<PendingApprovals>,
         timeout: Duration,
+        in_flight: Arc<std::sync::atomic::AtomicBool>,
     ) -> Self {
         Self {
             session,
@@ -171,6 +186,7 @@ impl DaemonApproval {
             hub,
             pending,
             timeout,
+            in_flight,
         }
     }
 }
@@ -178,6 +194,13 @@ impl DaemonApproval {
 #[async_trait]
 impl ApprovalGate for DaemonApproval {
     async fn request(&self, request_id: ApprovalId, request: ApprovalRequest) -> ApprovalOption {
+        // A turn that already ended has nobody left to use an answer. The cancel on `TurnEnded`
+        // closes the same window from the other side; this check keeps the request from being
+        // registered and published at all.
+        if !self.in_flight.load(std::sync::atomic::Ordering::Acquire) {
+            tracing::debug!(%request_id, "approval asked after its turn ended; denying");
+            return ApprovalOption::Deny;
+        }
         // Register *before* publishing: an answer that arrives the instant the event is on the
         // wire must find the waiter. The reverse order is a real race — a scripted client answers
         // in microseconds — and its symptom would be a prompt that waits for the full timeout
@@ -627,6 +650,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancelling_a_session_drops_every_waiter_it_had() {
+        let pending = PendingApprovals::new();
+        let session = SessionId::new();
+        let other = SessionId::new();
+        let first = ApprovalId::new();
+        let second = ApprovalId::new();
+        let _first = pending.register(
+            first,
+            session,
+            request("write_file", ApprovalOption::ALL.to_vec()),
+        );
+        let _second =
+            pending.register(second, other, request("edit", ApprovalOption::ALL.to_vec()));
+
+        pending.cancel_session(session);
+
+        assert!(pending.for_session(session).is_empty());
+        assert_eq!(
+            pending.for_session(other).len(),
+            1,
+            "another session's prompt is untouched"
+        );
+        assert!(
+            !pending.respond(first, ApprovalOption::AllowOnce),
+            "a dropped waiter cannot be answered"
+        );
+    }
+
+    #[tokio::test]
     async fn an_answer_with_no_waiter_is_not_handled() {
         let pending = PendingApprovals::new();
         assert!(!pending.respond(ApprovalId::new(), ApprovalOption::AllowOnce));
@@ -644,6 +696,7 @@ mod tests {
             Arc::clone(&hub),
             Arc::clone(&pending),
             Duration::from_secs(2),
+            Arc::new(std::sync::atomic::AtomicBool::new(true)),
         ));
 
         let request_id = ApprovalId::new();
@@ -680,6 +733,7 @@ mod tests {
             hub,
             Arc::clone(&pending),
             Duration::from_millis(20),
+            Arc::new(std::sync::atomic::AtomicBool::new(true)),
         );
         let request_id = ApprovalId::new();
         let option = gate
