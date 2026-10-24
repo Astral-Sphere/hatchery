@@ -127,6 +127,7 @@ impl TerminalBackend for MemoryTerminal {
             killed: AtomicBool::new(false),
             finished: AtomicBool::new(false),
             notify: Notify::new(),
+            outcome: tokio::sync::OnceCell::new(),
         }))
     }
 }
@@ -139,12 +140,16 @@ struct MemoryHandle {
     killed: AtomicBool,
     finished: AtomicBool,
     notify: Notify,
+    /// Computed once: a later `kill` must not change an outcome the contract already returned.
+    outcome: tokio::sync::OnceCell<TerminalOutcome>,
 }
 
 impl MemoryHandle {
     fn settle(&self) {
         self.finished.store(true, Ordering::SeqCst);
-        self.notify.notify_waiters();
+        // `notify_one` stores a permit when nobody is waiting; `notify_waiters` would lose a
+        // kill that lands between a waiter's check and its first poll of `notified()`.
+        self.notify.notify_one();
     }
 }
 
@@ -172,19 +177,24 @@ impl TerminalHandle for MemoryHandle {
     }
 
     async fn wait(&self) -> Result<TerminalOutcome, TermError> {
-        if self.hang && !self.killed.load(Ordering::SeqCst) {
-            // Register before checking, or a kill between the check and the await would be lost.
-            let notified = self.notify.notified();
-            if !self.killed.load(Ordering::SeqCst) {
-                notified.await;
-            }
-        }
-        let killed = self.killed.load(Ordering::SeqCst);
-        Ok(TerminalOutcome {
-            output: self.whole.clone(),
-            exit_code: if killed { None } else { self.exit_code },
-            dropped_bytes: 0,
-        })
+        let outcome = self
+            .outcome
+            .get_or_init(|| async {
+                if self.hang && !self.killed.load(Ordering::SeqCst) {
+                    // A permit from `settle` covers a kill that lands between this check and
+                    // the first poll of `notified()`.
+                    self.notify.notified().await;
+                }
+                let killed = self.killed.load(Ordering::SeqCst);
+                TerminalOutcome {
+                    output: self.whole.clone(),
+                    exit_code: if killed { None } else { self.exit_code },
+                    dropped_bytes: 0,
+                    stream_incomplete: false,
+                }
+            })
+            .await;
+        Ok(outcome.clone())
     }
 
     fn kill(&self) {
@@ -248,5 +258,36 @@ mod tests {
             .await
             .expect("a script");
         assert_eq!(terminal.requests(), [spec]);
+    }
+
+    #[tokio::test]
+    async fn wait_is_idempotent_after_a_late_kill() {
+        let terminal = MemoryTerminal::new();
+        terminal.echo(["done"], 0);
+        let handle = terminal
+            .create(TerminalSpec::default(), CancellationToken::new())
+            .await
+            .expect("a script");
+        let first = handle.wait().await.expect("an outcome");
+        assert_eq!(first.exit_code, Some(0));
+        handle.kill();
+        let second = handle.wait().await.expect("an outcome");
+        assert_eq!(second, first, "a later kill changed a returned outcome");
+    }
+
+    #[tokio::test]
+    async fn a_kill_before_the_first_chunk_still_wakes_the_reader() {
+        let terminal = MemoryTerminal::new();
+        terminal.hang(Vec::<String>::new());
+        let handle = terminal
+            .create(TerminalSpec::default(), CancellationToken::new())
+            .await
+            .expect("a script");
+        handle.kill();
+        assert_eq!(
+            handle.next_chunk().await,
+            None,
+            "the kill woke the hanging reader"
+        );
     }
 }

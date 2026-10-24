@@ -52,17 +52,18 @@ pub trait SpillSink: Send + Sync {
 /// the network.
 pub struct FileSpill {
     dir: PathBuf,
-    sequence: AtomicU64,
 }
+
+/// Process-wide, not per sink: the daemon builds one sink per session, and two sessions whose
+/// first oversized result of the same tool lands in the same millisecond must not pick the same
+/// name (`create_new` would fail the second and degrade it to a truncation).
+static SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 impl FileSpill {
     /// Spills into `dir`, creating it on first write.
     #[must_use]
     pub fn new(dir: impl Into<PathBuf>) -> Self {
-        Self {
-            dir: dir.into(),
-            sequence: AtomicU64::new(0),
-        }
+        Self { dir: dir.into() }
     }
 
     /// The directory this sink writes to.
@@ -79,7 +80,7 @@ impl SpillSink for FileSpill {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|elapsed| elapsed.as_millis())
             .unwrap_or(0);
-        let sequence = self.sequence.fetch_add(1, Ordering::SeqCst);
+        let sequence = SEQUENCE.fetch_add(1, Ordering::SeqCst);
         let name = format!(
             "{stamp}-{}-{sequence}-{}.txt",
             std::process::id(),
@@ -275,5 +276,17 @@ mod tests {
         for (index, _) in out.char_indices() {
             assert!(out.is_char_boundary(index));
         }
+    }
+
+    #[tokio::test]
+    async fn two_sinks_in_the_same_millisecond_do_not_reuse_a_name() {
+        let dir = tempfile::tempdir().expect("a directory");
+        let first = FileSpill::new(dir.path());
+        let second = FileSpill::new(dir.path());
+        let one = first.write("shell", "one").await.expect("first spill");
+        let two = second.write("shell", "two").await.expect("second spill");
+        assert_ne!(one, two);
+        assert_eq!(std::fs::read_to_string(one).expect("first file"), "one");
+        assert_eq!(std::fs::read_to_string(two).expect("second file"), "two");
     }
 }

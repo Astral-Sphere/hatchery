@@ -148,9 +148,13 @@ impl ToolHost for ToolRegistry {
             terminal: self.backends.terminal.as_ref(),
             cancel: cancel.clone(),
             emit: &move |chunk: ToolProgress| {
+                // Progress leaves the backend through the same seam as the final output, so it
+                // gets the same redaction. A secret split across two reader chunks can still
+                // slip through; the final output (and the spill file) is redacted whole.
+                let chunk = crate::redact::redact(&chunk.chunk).into_owned();
                 // An unbounded channel with no receiver means the turn is already gone; the
                 // progress was advisory and its loss is not an error.
-                let _ = progress.send(chunk);
+                let _ = progress.send(ToolProgress { chunk });
             },
         };
         let result = tokio::select! {
@@ -479,9 +483,68 @@ mod tests {
             output: "out\nerr\n".to_owned(),
             exit_code: Some(0),
             dropped_bytes: 0,
+            stream_incomplete: false,
         };
         assert_eq!(outcome.output, "out\nerr\n");
         assert_eq!(outcome.exit_code, Some(0));
         assert!(outcome.is_success());
+    }
+
+    /// Emits one secret-bearing chunk, then a short result.
+    struct Streams;
+
+    #[async_trait]
+    impl Tool for Streams {
+        fn def(&self) -> hatchery_kernel::ToolDef {
+            hatchery_kernel::ToolDef {
+                name: "zz_streams".to_owned(),
+                description: "streams".to_owned(),
+                parameters: json!({}),
+            }
+        }
+
+        async fn needs_approval(
+            &self,
+            _ctx: &ToolCtx<'_>,
+            _args: &Value,
+        ) -> Option<hatchery_protocol::ApprovalRequest> {
+            None
+        }
+
+        fn summarize(&self, _args: &Value) -> ToolCallSummary {
+            ToolCallSummary::new("zz_streams")
+        }
+
+        async fn execute(
+            &self,
+            ctx: ToolCtx<'_>,
+            _args: Value,
+        ) -> Result<hatchery_protocol::ToolOutput, ToolError> {
+            (ctx.emit)(hatchery_protocol::ToolProgress {
+                chunk: "OPENAI_API_KEY=sk-proj-AbCdEfGhIjKlMnOpQrStUvWx\n".to_owned(),
+            });
+            Ok(hatchery_protocol::ToolOutput::text("done"))
+        }
+    }
+
+    #[tokio::test]
+    async fn progress_is_redacted_before_it_leaves_the_registry() {
+        let mut reg = ToolRegistry::new(backends_only());
+        reg.register(Arc::new(Streams));
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let invocation = reg
+            .invoke(
+                "zz_streams",
+                json!({}),
+                CancellationToken::new(),
+                tx,
+                CheckpointCollector::new(),
+            )
+            .await
+            .expect("runs");
+        assert_eq!(invocation.output.text, "done");
+        let progress = rx.try_recv().expect("one progress chunk");
+        assert!(progress.chunk.contains("[redacted"), "{}", progress.chunk);
+        assert!(!progress.chunk.contains("AbCdEfGhIjKlMnOpQrStUvWx"));
     }
 }

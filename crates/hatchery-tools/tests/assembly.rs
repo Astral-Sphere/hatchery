@@ -508,3 +508,41 @@ async fn an_oversized_tool_result_is_spilled_at_the_registry_seam() {
         "the file holds the whole result, not the preview"
     );
 }
+
+/// The command closes its stdio, so the pty reader sees EOF while the child is still alive.
+/// The tool must stay inside the guarded `select!` and kill at `timeout_secs`, not wait forever.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_shell_command_that_closes_its_stdio_still_hits_the_timeout() {
+    let ws = hatchery_testkit::TempWorkspace::new();
+    let backends = Backends {
+        fs: Arc::new(hatchery_capabilities::LocalFs::new(ws.root()).expect("a workspace")),
+        terminal: Arc::new(hatchery_capabilities::LocalPty::new(ws.root()).expect("a terminal")),
+        checkpointer: None,
+        spill: None,
+    };
+    let mut registry = ToolRegistry::new(backends);
+    registry.register(hatchery_tools::shell());
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let invocation = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        registry.invoke(
+            "shell",
+            serde_json::json!({
+                "command": "trap '' HUP; exec </dev/null >/dev/null 2>&1; sleep 60",
+                "timeout_secs": 1
+            }),
+            CancellationToken::new(),
+            tx,
+            CheckpointCollector::new(),
+        ),
+    )
+    .await
+    .expect("the timeout is enforced")
+    .expect("dispatched");
+    assert!(
+        invocation.output.text.contains("timeout"),
+        "{}",
+        invocation.output.text
+    );
+}

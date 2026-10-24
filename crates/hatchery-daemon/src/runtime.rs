@@ -231,17 +231,44 @@ fn trim_to_budget(messages: &mut Vec<Message>, budget: usize) {
 const TOOL_RESULT_KEEP_CHARS: usize = 4_000;
 
 fn shave(text: &mut String, keep: usize) {
-    let end = text
-        .char_indices()
-        .nth(keep)
-        .map(|(index, _)| index)
-        .unwrap_or(text.len());
-    if end == text.len() {
+    let count = text.chars().count();
+    if count <= keep {
         return;
     }
-    let removed = text.chars().count() - keep;
-    text.truncate(end);
-    text.push_str(&format!("\n… [{removed} characters trimmed for context]"));
+    let head_keep = keep / 2;
+    let tail_keep = keep - head_keep;
+    let head_end = text
+        .char_indices()
+        .nth(head_keep)
+        .map(|(index, _)| index)
+        .unwrap_or(text.len());
+    let tail_start = text
+        .char_indices()
+        .rev()
+        .nth(tail_keep.saturating_sub(1))
+        .map(|(index, _)| index)
+        .unwrap_or(0);
+    // A spilled result's pointer sits after the 16 KiB head; keep it even though the shave is
+    // much smaller. Losing it turns "read the full log at …" into a dead end.
+    let pointer = text
+        .lines()
+        .find(|line| line.contains("full output at"))
+        .map(str::to_owned);
+    let mut out = String::new();
+    out.push_str(&text[..head_end]);
+    out.push_str(&format!(
+        "\n… [{} characters trimmed for context] …\n",
+        count - keep
+    ));
+    if let Some(pointer) = pointer
+        && !text[..head_end].contains(&pointer)
+        && !text[tail_start..].contains(&pointer)
+    {
+        out.push_str(&pointer);
+        out.push('\n');
+    }
+    out.push_str(&text[tail_start..]);
+    *text = out;
 }
 
 fn estimate_tokens(messages: &[Message]) -> usize {
@@ -1067,6 +1094,40 @@ mod tests {
             "nothing to index without a workspace"
         );
     }
+
+    #[tokio::test]
+    async fn the_view_applies_the_context_budget() {
+        let (_dir, store) = store().await;
+        let session = session_row();
+        store.create_session(session.clone()).await.expect("create");
+        let old = Item::new(
+            session.id,
+            ItemKind::UserMessage(Content::text("old question")),
+        );
+        let new = Item::new(
+            session.id,
+            ItemKind::UserMessage(Content::text("new question")),
+        );
+        store.append_items(vec![old, new]).await.expect("append");
+
+        let view = StoreHistory::new(store, session.id, false, None, 10)
+            .view()
+            .await
+            .expect("view");
+        assert!(
+            !view
+                .messages
+                .iter()
+                .any(|message| message.content.text == "old question"),
+            "the view did not trim: {view:?}"
+        );
+        assert!(
+            view.messages
+                .iter()
+                .any(|message| message.content.text == "new question"),
+            "{view:?}"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1138,5 +1199,38 @@ mod budget_tests {
     #[test]
     fn non_ascii_text_costs_more_than_an_ascii_string_of_the_same_length() {
         assert!(text_tokens("你好世界") > text_tokens("abcd"));
+    }
+
+    #[test]
+    fn trimming_drops_a_whole_round_and_never_orphans_an_assistant() {
+        let mut messages = vec![
+            Message::system("s"),
+            Message::user("old"),
+            Message::assistant("answer"),
+            Message::user("new"),
+        ];
+        trim_to_budget(&mut messages, 1);
+        assert_eq!(messages.len(), 2, "{messages:?}");
+        assert_eq!(messages[0].role, Role::System);
+        assert_eq!(messages[1].role, Role::User);
+        assert_eq!(messages[1].content.text, "new");
+    }
+
+    #[test]
+    fn a_shaved_tool_result_keeps_its_tail_and_its_spill_pointer() {
+        let pointer = "… 1048576 bytes in total; full output at /tmp/tool-results/x.txt …";
+        let mut text = format!(
+            "{}\n{pointer}\n{}error: boom\nlast line",
+            "h".repeat(8_000),
+            "t".repeat(8_000)
+        );
+        shave(&mut text, TOOL_RESULT_KEEP_CHARS);
+        assert!(text.starts_with('h'), "{text}");
+        assert!(text.contains("error: boom"), "{text}");
+        assert!(
+            text.contains("full output at /tmp/tool-results/x.txt"),
+            "{text}"
+        );
+        assert!(text.ends_with("last line"), "{text}");
     }
 }

@@ -110,6 +110,8 @@ mod unix {
 
     use async_trait::async_trait;
     use nix::sys::signal::{Signal, killpg};
+    #[cfg(target_os = "linux")]
+    use nix::sys::wait::{Id, WaitPidFlag, WaitStatus, waitid, waitpid};
     use nix::unistd::Pid;
     use portable_pty::{Child, CommandBuilder, PtySize, native_pty_system};
     use tokio::sync::{Mutex as AsyncMutex, Notify, OnceCell, mpsc, watch};
@@ -167,7 +169,7 @@ mod unix {
         let pid = child
             .process_id()
             .ok_or_else(|| TermError::Io("the spawned process has no pid".to_owned()))?;
-        let pgid = pair.master.process_group_leader().unwrap_or(pid as i32);
+        let pgid = pid as i32;
         let reader = pair
             .master
             .try_clone_reader()
@@ -189,9 +191,9 @@ mod unix {
             Arc::clone(&reader_finished),
         );
 
-        let (exit_tx, exit_rx) = watch::channel::<Option<Exit>>(None);
+        let (exit_tx, exit_rx) = watch::channel::<Option<Result<Exit, String>>>(None);
         let (kill_tx, kill_rx) = std::sync::mpsc::channel::<()>();
-        spawn_control(child, pgid, kill_rx, exit_tx);
+        spawn_control(child, pid, pgid, kill_rx, exit_tx);
 
         let handle = Arc::new(LocalPtyHandle {
             capture,
@@ -225,7 +227,7 @@ mod unix {
     struct LocalPtyHandle {
         capture: Arc<Mutex<Capture>>,
         chunks: AsyncMutex<mpsc::Receiver<String>>,
-        exit: watch::Receiver<Option<Exit>>,
+        exit: watch::Receiver<Option<Result<Exit, String>>>,
         outcome: OnceCell<Result<TerminalOutcome, TermError>>,
         reader_done: Arc<Notify>,
         reader_finished: Arc<AtomicBool>,
@@ -285,17 +287,20 @@ mod unix {
                     if !self.reader_finished.load(Ordering::SeqCst) {
                         let _ = tokio::time::timeout(EOF_GRACE, self.reader_done.notified()).await;
                     }
+                    let stream_incomplete = !self.reader_finished.load(Ordering::SeqCst);
                     let (output, dropped_bytes) = self
                         .capture
                         .lock()
                         .unwrap_or_else(PoisonError::into_inner)
                         .render();
                     match status {
-                        Some(Exit { code }) => Ok(TerminalOutcome {
+                        Some(Ok(Exit { code })) => Ok(TerminalOutcome {
                             output,
                             exit_code: code,
                             dropped_bytes,
+                            stream_incomplete,
                         }),
+                        Some(Err(error)) => Err(TermError::Io(error)),
                         None => Err(TermError::Io(
                             "the control thread ended without an exit status".to_owned(),
                         )),
@@ -370,11 +375,87 @@ mod unix {
             .expect("a reader thread");
     }
 
+    #[cfg(target_os = "linux")]
     fn spawn_control(
-        mut child: Box<dyn Child + Send + Sync>,
+        child: Box<dyn Child + Send + Sync>,
+        pid: u32,
         pgid: i32,
         kill_rx: std::sync::mpsc::Receiver<()>,
-        exit_tx: watch::Sender<Option<Exit>>,
+        exit_tx: watch::Sender<Option<Result<Exit, String>>>,
+    ) {
+        // `waitid(WNOWAIT)` owns the reaping from here; the portable-pty handle would reap
+        // through `try_wait`, so drop it first. Dropping it neither signals nor reaps the child.
+        drop(child);
+        std::thread::Builder::new()
+            .name("pty-control".to_owned())
+            .spawn(move || {
+                let child_pid = Pid::from_raw(pid as i32);
+                let mut signalled = false;
+                let mut exited = false;
+                loop {
+                    if !exited {
+                        match waitid(
+                            Id::Pid(child_pid),
+                            WaitPidFlag::WEXITED | WaitPidFlag::WNOHANG | WaitPidFlag::WNOWAIT,
+                        ) {
+                            Ok(WaitStatus::StillAlive) => {}
+                            Ok(status) => {
+                                let _ = exit_tx.send(Some(Ok(exit_status(status))));
+                                exited = true;
+                            }
+                            Err(error) => {
+                                let _ = exit_tx.send(Some(Err(format!("wait: {error}"))));
+                                exited = true;
+                            }
+                        }
+                    }
+                    match kill_rx.recv_timeout(POLL) {
+                        Ok(()) => {
+                            if !signalled {
+                                signalled = true;
+                                // While the child is an unreaped zombie its pid — the group id —
+                                // cannot be reused, so this signal cannot hit an unrelated group.
+                                if pgid > 1 {
+                                    let _ = killpg(Pid::from_raw(pgid), Signal::SIGKILL);
+                                }
+                            }
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                            // The handle is gone; its drop queued a kill before dropping the
+                            // sender. No further group signal can arrive, so reap and stop.
+                            if !exited {
+                                let _ = waitpid(child_pid, Some(WaitPidFlag::WNOHANG));
+                            }
+                            let _ = waitpid(child_pid, None);
+                            break;
+                        }
+                    }
+                }
+            })
+            .expect("a control thread");
+    }
+
+    #[cfg(target_os = "linux")]
+    fn exit_status(status: WaitStatus) -> Exit {
+        match status {
+            WaitStatus::Exited(_, code) => Exit { code: Some(code) },
+            WaitStatus::Signaled(_, _, _) => Exit { code: None },
+            _ => Exit { code: None },
+        }
+    }
+
+    /// macOS and the other unices keep the portable-pty reaper. The post-exit group kill is
+    /// deliberately Linux-only: without `waitid(WNOWAIT)` the pid is reaped before a late kill
+    /// could be proved safe. The orphan tests that rely on the Linux behaviour are gated
+    /// accordingly.
+    #[cfg(not(target_os = "linux"))]
+    fn spawn_control(
+        mut child: Box<dyn Child + Send + Sync>,
+        _pid: u32,
+        pgid: i32,
+        kill_rx: std::sync::mpsc::Receiver<()>,
+        exit_tx: watch::Sender<Option<Result<Exit, String>>>,
     ) {
         std::thread::Builder::new()
             .name("pty-control".to_owned())
@@ -388,12 +469,12 @@ mod unix {
                             } else {
                                 i32::try_from(status.exit_code()).ok()
                             };
-                            let _ = exit_tx.send(Some(Exit { code }));
+                            let _ = exit_tx.send(Some(Ok(Exit { code })));
                             break;
                         }
                         Ok(None) => {}
-                        Err(_) => {
-                            let _ = exit_tx.send(Some(Exit { code: None }));
+                        Err(error) => {
+                            let _ = exit_tx.send(Some(Err(format!("wait: {error}"))));
                             break;
                         }
                     }
@@ -411,10 +492,7 @@ mod unix {
                             }
                         }
                         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                            // The handle is gone. Its drop sends the kill before dropping the
-                            // sender; keep polling so the child is still reaped.
-                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {}
                     }
                 }
             })
@@ -619,6 +697,14 @@ mod unix {
             assert!(rendered.starts_with('H'));
             assert!(rendered.contains("10 bytes dropped"));
             assert!(rendered.ends_with('t'));
+        }
+
+        #[test]
+        fn the_head_cap_is_enforced_on_push() {
+            let mut capture = Capture::default();
+            capture.push(&"h".repeat(HEAD_CAP + 10));
+            assert_eq!(capture.head.len(), HEAD_CAP);
+            assert_eq!(capture.tail.len(), 10);
         }
 
         #[test]

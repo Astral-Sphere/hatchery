@@ -97,6 +97,12 @@ pub struct TerminalOutcome {
     pub exit_code: Option<i32>,
     /// Bytes discarded because the capture buffer hit its cap.
     pub dropped_bytes: u64,
+    /// The process exited before the reader reached EOF (a descendant may still hold the pty).
+    ///
+    /// `dropped_bytes` cannot express this: nothing overflowed the capture, the stream simply
+    /// stopped being read. A caller that reports truncation must report this flag too, or a
+    /// partial capture looks like a short command.
+    pub stream_incomplete: bool,
 }
 
 impl TerminalOutcome {
@@ -134,8 +140,8 @@ pub trait TerminalBackend: Send + Sync {
     /// # Errors
     ///
     /// [`TermError::Unavailable`] when this session has no terminal — the default for Chat
-    /// mode (ADR-0005: read-only tools only) — or when the spec names a working directory
-    /// outside the backend's root.
+    /// mode (ADR-0005: read-only tools only). [`TermError::Io`] when the spec names a working
+    /// directory outside the backend's root, or the host refuses the spawn.
     async fn create(
         &self,
         spec: TerminalSpec,
@@ -153,6 +159,7 @@ mod tests {
             output: String::new(),
             exit_code: Some(0),
             dropped_bytes: 0,
+            stream_incomplete: false,
         };
         assert!(clean.is_success());
         assert!(

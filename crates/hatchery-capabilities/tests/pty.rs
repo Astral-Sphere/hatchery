@@ -157,6 +157,7 @@ async fn cancellation_ends_the_process() {
     assert_eq!(outcome.exit_code, None);
 }
 
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn dropping_the_handle_ends_the_process_too() {
     let workspace = tempfile::tempdir().expect("a workspace");
@@ -172,38 +173,93 @@ async fn dropping_the_handle_ends_the_process_too() {
     wait_not_running(pid).await;
 }
 
-/// The probe found `Child::kill()` leaves a background grandchild behind in 3 of 5 scenarios.
-/// The wrapper signals the process group instead; this is the scenario that proves it, and the
-/// `/proc` state is the proof because `kill -0` would still answer ALIVE for a zombie.
+/// The probe found `Child::kill()` sends SIGHUP and then SIGKILL to **one pid**. A same-group
+/// grandchild that ignores SIGHUP survives it (probe M2, "in-group but SIGHUP-immune"); the
+/// wrapper signals the process group. This is the payload that distinguishes the two — the
+/// ordinary `sleep 60 &` case dies from the foreground group's SIGHUP even under `Child::kill()`.
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn kill_reaches_a_background_child_in_the_same_process_group() {
     let workspace = tempfile::tempdir().expect("a workspace");
     let pty = LocalPty::new(workspace.path()).expect("a backend");
     let handle = pty
-        .create(sh("sleep 60 & echo $!; wait"), CancellationToken::new())
+        .create(
+            sh("trap '' HUP; sleep 60 & echo $!; wait"),
+            CancellationToken::new(),
+        )
         .await
         .expect("spawn");
 
+    let pid = read_first_pid(handle.as_ref()).await;
+    handle.kill();
+    let _ = tokio::time::timeout(Duration::from_secs(5), handle.wait()).await;
+    wait_not_running(pid).await;
+}
+
+/// The leader exits immediately and leaves a SIGHUP-immune background child in its group. The
+/// handle's drop must still be able to kill that group: the control thread keeps the zombie
+/// unreaped (so the pgid is pinned) and drains the kill request before reaping.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn dropping_the_handle_kills_a_background_child_after_the_leader_exits() {
+    let workspace = tempfile::tempdir().expect("a workspace");
+    let pty = LocalPty::new(workspace.path()).expect("a backend");
+    let handle = pty
+        .create(
+            sh("trap '' HUP; sleep 60 & echo $!; exit 0"),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("spawn");
+
+    let pid = read_first_pid(handle.as_ref()).await;
+    drop(handle);
+    wait_not_running(pid).await;
+}
+
+/// A background child holding the pty keeps the reader from seeing EOF. `wait` must return on
+/// the child's exit plus a bounded grace, and must say the stream was incomplete.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn wait_returns_when_a_grandchild_holds_the_pty() {
+    let workspace = tempfile::tempdir().expect("a workspace");
+    let pty = LocalPty::new(workspace.path()).expect("a backend");
+    let handle = pty
+        .create(
+            sh("trap '' HUP; echo job; sleep 60 &"),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("spawn");
+
+    let outcome = tokio::time::timeout(Duration::from_secs(3), handle.wait())
+        .await
+        .expect("wait returned instead of waiting for EOF")
+        .expect("an outcome");
+    assert!(outcome.output.contains("job"), "{outcome:?}");
+    assert!(outcome.stream_incomplete, "the reader never saw EOF");
+    drop(handle);
+}
+
+#[cfg(target_os = "linux")]
+async fn read_first_pid(handle: &dyn TerminalHandle) -> u32 {
     let mut seen = String::new();
-    let pid = loop {
+    loop {
         let chunk = tokio::time::timeout(Duration::from_secs(5), handle.next_chunk())
             .await
             .expect("the pid line arrives")
             .expect("the stream is open");
         seen.push_str(&chunk);
         if let Some(line) = seen.lines().find(|line| !line.trim().is_empty()) {
-            break line
+            return line
                 .trim()
                 .parse::<u32>()
                 .unwrap_or_else(|_| panic!("not a pid: {line:?}"));
         }
-    };
-
-    handle.kill();
-    let _ = tokio::time::timeout(Duration::from_secs(5), handle.wait()).await;
-    wait_not_running(pid).await;
+    }
 }
 
+#[cfg(target_os = "linux")]
 async fn read_pid(path: &std::path::Path) -> u32 {
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
@@ -221,6 +277,7 @@ async fn read_pid(path: &std::path::Path) -> u32 {
 }
 
 /// Absent or a zombie counts as stopped; anything else is a live orphan and fails.
+#[cfg(target_os = "linux")]
 async fn wait_not_running(pid: u32) {
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {

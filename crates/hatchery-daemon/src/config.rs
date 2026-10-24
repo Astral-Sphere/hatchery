@@ -586,13 +586,18 @@ impl LayeredConfig {
     pub fn context(&self) -> ContextConfig {
         let defaults = BuiltinContext::default();
         let inner = self.inner.read().expect("config is not poisoned");
-        let tokens = inner
+        let tokens = match inner
             .effective
             .get_dotted("context.max_input_tokens")
             .and_then(toml::Value::as_integer)
-            .filter(|tokens| *tokens > 0)
-            .map_or(defaults.max_input_tokens, |tokens| tokens as u64)
-            .max(MIN_INPUT_TOKENS as u64);
+        {
+            Some(value) if value > 0 => value as u64,
+            // A non-positive value is a typo, not permission to loosen the budget: clamp it to
+            // the floor rather than falling back to the much larger default.
+            Some(_) => MIN_INPUT_TOKENS as u64,
+            None => defaults.max_input_tokens,
+        }
+        .max(MIN_INPUT_TOKENS as u64);
         ContextConfig {
             max_input_tokens: usize::try_from(tokens).unwrap_or(usize::MAX),
         }
@@ -779,6 +784,7 @@ fn type_accepts(path: &str, value: &toml::Value) -> bool {
         ("approval.timeout_seconds", toml::Value::is_integer),
         ("approval.allow", is_string_array),
         ("approval.deny", is_string_array),
+        ("context.max_input_tokens", toml::Value::is_integer),
     ];
     if let Some((_, check)) = static_types.iter().find(|(key, _)| *key == path) {
         return check(value);
@@ -1240,14 +1246,14 @@ mod context_tests {
         assert_eq!(configured.context().max_input_tokens, 32_000);
 
         for value in ["0", "-5"] {
-            let defaulted = LayeredConfig::from_layers(vec![(
+            let clamped = LayeredConfig::from_layers(vec![(
                 ConfigOrigin::User,
                 table(&format!("context.max_input_tokens = {value}")),
             )]);
             assert_eq!(
-                defaulted.context().max_input_tokens,
-                96_000,
-                "{value} is not a budget; the default applies"
+                clamped.context().max_input_tokens,
+                MIN_INPUT_TOKENS,
+                "{value} is a typo; clamp to the floor rather than loosen to the default"
             );
         }
 
@@ -1256,6 +1262,19 @@ mod context_tests {
             table("context.max_input_tokens = 10"),
         )]);
         assert_eq!(clamped.context().max_input_tokens, MIN_INPUT_TOKENS);
+    }
+
+    #[test]
+    fn a_wrong_typed_budget_is_dropped_to_the_default() {
+        let config = LayeredConfig::from_layers(vec![(
+            ConfigOrigin::User,
+            table("context.max_input_tokens = \"32000\""),
+        )]);
+        assert_eq!(config.context().max_input_tokens, 96_000);
+        assert!(!type_accepts(
+            "context.max_input_tokens",
+            &toml::Value::String("32000".to_owned())
+        ));
     }
 
     #[test]

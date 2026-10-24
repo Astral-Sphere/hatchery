@@ -35,6 +35,29 @@ pub struct WebFetch {
     client: reqwest::Client,
 }
 
+/// Follows a redirect only when it stays on the same host **and** port and does not downgrade
+/// https to http. A cross-host hop is returned to the caller as its 3xx response instead: the
+/// approval named the first URL, so silently fetching another host would make the approved
+/// digest a lie (and turn any approved page into an SSRF pivot).
+fn redirect_policy() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        let Some(previous) = attempt.previous().last() else {
+            return attempt.stop();
+        };
+        let same_origin = previous.host_str() == attempt.url().host_str()
+            && previous.port() == attempt.url().port();
+        let scheme_ok = matches!(
+            (previous.scheme(), attempt.url().scheme()),
+            ("http", "http") | ("https", "https") | ("http", "https")
+        );
+        if same_origin && scheme_ok && attempt.previous().len() < 5 {
+            attempt.follow()
+        } else {
+            attempt.stop()
+        }
+    })
+}
+
 impl WebFetch {
     /// The tool with its HTTP client.
     #[must_use]
@@ -45,7 +68,10 @@ impl WebFetch {
         // provider here. First install wins, so this is a no-op inside the daemon.
         let _ = ferritls_rustls::default_provider().install_default();
         Self {
-            client: reqwest::Client::new(),
+            client: reqwest::Client::builder()
+                .redirect(redirect_policy())
+                .build()
+                .expect("the HTTP client"),
         }
     }
 }
@@ -138,18 +164,15 @@ impl Tool for WebFetch {
     }
 
     async fn needs_approval(&self, _ctx: &ToolCtx<'_>, args: &Value) -> Option<ApprovalRequest> {
-        let raw = args["url"].as_str()?;
-        let url = reqwest::Url::parse(raw).ok()?;
-        if !matches!(url.scheme(), "http" | "https") {
-            // `execute` refuses this with a precise message; asking the user about a call that
-            // cannot run would only spend their attention.
-            return None;
-        }
+        // `parse` rejects a bad URL, a non-http scheme and a bad timeout; a call certain to
+        // fail must not spend the user's attention on an approval prompt.
+        let call = parse(args).ok()?;
+        let url = call.url;
         Some(
             ApprovalRequest::new("web_fetch", format!("fetch {url}"), RiskLevel::Network)
                 .with_preview(ApprovalPreview::Excerpt(url.to_string()))
-                // See the module docs: the rule table cannot express a domain, so "always" would be
-                // a whole-tool grant the user was not shown.
+                // See the module docs: the rule table cannot express a domain, so "always"
+                // would be a whole-tool grant the user was not shown.
                 .once_only(),
         )
     }
@@ -188,6 +211,11 @@ impl Tool for WebFetch {
                 })?,
         };
         let status = response.status();
+        let location = response
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
         let content_type = response
             .headers()
             .get(reqwest::header::CONTENT_TYPE)
@@ -250,6 +278,9 @@ impl Tool for WebFetch {
                 mime.as_str()
             }
         );
+        if let Some(location) = &location {
+            output.push_str(&format!("location: {location}\n"));
+        }
         if truncated {
             output.push_str(&format!("[body truncated at {MAX_DOWNLOAD_BYTES} bytes]\n"));
         }
@@ -432,5 +463,106 @@ mod tests {
             emit: &|_| {},
         };
         assert!(request.needs_approval(&ctx, &args).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_same_host_redirect_is_followed() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/old"))
+            .respond_with(ResponseTemplate::new(302).insert_header("Location", "/new"))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/new"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw("same-host-body", "text/plain"))
+            .mount(&server)
+            .await;
+        let output = fetch(&format!("{}/old", server.uri()))
+            .await
+            .expect("fetches");
+        assert!(output.text.contains("status: 200"), "{}", output.text);
+        assert!(output.text.contains("same-host-body"), "{}", output.text);
+    }
+
+    #[tokio::test]
+    async fn a_cross_host_redirect_is_returned_not_followed() {
+        let target = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/secret"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw("cross-host-body", "text/plain"))
+            .mount(&target)
+            .await;
+        let location = format!("{}/secret", target.uri());
+        let front = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/jump"))
+            .respond_with(ResponseTemplate::new(302).insert_header("Location", location.as_str()))
+            .mount(&front)
+            .await;
+
+        let output = fetch(&format!("{}/jump", front.uri()))
+            .await
+            .expect("fetches");
+        assert!(output.text.contains("status: 302"), "{}", output.text);
+        assert!(output.text.contains("location:"), "{}", output.text);
+        assert!(
+            !output.text.contains("cross-host-body"),
+            "the redirect was followed to another host: {}",
+            output.text
+        );
+    }
+
+    #[tokio::test]
+    async fn an_invalid_timeout_gets_no_approval_prompt() {
+        let fs = MemoryFs::new();
+        let terminal = hatchery_capabilities::NoTerminal;
+        let cancel = CancellationToken::new();
+        let args = serde_json::json!({"url": "https://example.com", "timeout_secs": 0});
+        let ctx = ToolCtx {
+            fs: &fs,
+            terminal: &terminal,
+            cancel: cancel.clone(),
+            emit: &|_| {},
+        };
+        assert!(WebFetch::new().needs_approval(&ctx, &args).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_body_over_the_cap_is_truncated_and_marked() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/big"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(vec![b'x'; MAX_DOWNLOAD_BYTES + 10], "text/plain"),
+            )
+            .mount(&server)
+            .await;
+        let output = fetch(&format!("{}/big", server.uri()))
+            .await
+            .expect("fetches");
+        assert!(
+            output.text.contains("body truncated at"),
+            "{}",
+            &output.text[..output.text.len().min(200)]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_non_utf8_body_is_lossy_not_a_panic() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/latin1"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(vec![0xE9], "text/plain; charset=iso-8859-1"),
+            )
+            .mount(&server)
+            .await;
+        let output = fetch(&format!("{}/latin1", server.uri()))
+            .await
+            .expect("fetches");
+        assert!(output.text.contains('\u{FFFD}'), "{}", output.text);
     }
 }
