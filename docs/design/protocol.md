@@ -135,7 +135,7 @@ pub enum ApprovalPreview { Diff(Diff), Command { argv: Vec<String>, cwd: PathBuf
 
 **③ 审批规则的 list / delete 方法（Phase 2）**。今天一条已持久化的规则**既看不见也撤不掉**：一条误存的 `DenyAlways` 会永久废掉一个工具，除了直接改数据库没有补救。`approval_rules` 表没有排序列也没有 enabled 列（storage.md §2），所以 scope/matcher/decision 的文法与求值顺序由 **D8** 定义，协议只负责把它们列举出来、删掉。
 
-**④ `SessionLoadResult.pending_approvals`（Phase 3，已落地）**。`PendingApproval` 原先零消费者；重连的前端拿不到「有一个审批正等着我」，弹层就重画不出来。`PendingApprovals` 现在按下发时的 session 记录请求，`session/load` 把该会话仍在等待的那些按 id 排序列出；已答复（或超时）的请求在登记表里消失，因此不会在重连时复活。
+**④ `SessionLoadResult.pending_approvals`（Phase 3，已落地）**。`PendingApproval` 原先零消费者；重连的前端拿不到「有一个审批正等着我」，弹层就重画不出来。`PendingApprovals` 现在按下发时的 session 记录请求，`session/load` 把该会话仍在等待的那些按 id 排序列出；已答复、超时或 turn 已结束的请求都从登记表里消失，因此不会在重连时复活。**daemon 侧已可用，树内第一个消费者是 TUI**（它才渲染审批弹层）；CLI 的 chat 目前没有审批 UI，会忽略这个字段。
 
 **硬门不靠新增 `RiskLevel` 变体表达。** `RiskLevel::is_hard_gate()` 只认 `WritesOutside`，而 design/capabilities.md §5 把**工作区内**的 `.env*` 与 `.git/hooks` 也列为硬门——两者对不上。补一个变体是错的方向：新增枚举值属 major bump，而「未知枚举值一律硬失败」是刻意设计（§6），加一个值就要所有前端同步升级。已有的机制够用：`ApprovalRequest::once_only()` 用「不提供 `AllowAlways`/`DenyAlways`」表达「不可记忆」，而 kernel 会拒绝一个没被提供过的答复（kernel/src/agent.rs 的 `await_approval`）。所以路径门要做的只是为工作区内的敏感路径**强制 `once_only`**，协议零改动。
 
@@ -157,14 +157,14 @@ pub enum ApprovalPreview { Diff(Diff), Command { argv: Vec<String>, cwd: PathBuf
 | `session/branch/list` | `BranchListParams` → `BranchListResult` | 树 + 哪些在 active 分支（GUI 分支视图） |
 | `session/branch/switch` | `BranchSwitchParams` → `BranchSwitchResult` | 切换 active_branch_head |
 | `session/branch/delete` | `BranchDeleteParams` → `BranchDeleteResult` | 级联删除，`confirm` 为二次确认 |
-| `session/rewind` | `RewindParams` → `RewindResult` | 对话/代码/两者回滚（`purge_untracked` 默认 false） |
-| `session/delete` \| `session/rename` | `…Params` → `…Result` | 会话管理 |
+| `session/rewind` | `RewindParams` → `RewindResult` | 对话/代码/两者回滚。`purge_untracked` 默认 false，且当前**拒绝 true**：capabilities 要求审批 + 先列出待删清单，协议还没有取清单的方法 |
+| `session/delete` \| `session/rename` | `…Params` → `…Result` | 会话管理；`delete` 必须带 `confirm: true`（不可撤销，与 branch/delete 同一纪律） |
 | `approval/respond` | `ApprovalRespondParams` → `ApprovalRespondResult` | `request_id` + 选项；重复答复幂等（`handled: false`） |
 | `approval/rules/list` | `ApprovalRulesListParams` → `ApprovalRulesListResult` | 列出已持久化的 allow/deny 规则；可按会话收窄到「全局 + 该工作区」 |
 | `approval/rules/delete` | `ApprovalRulesDeleteParams` → `ApprovalRulesDeleteResult` | 删一条规则；误存的 `DenyAlways` 因此可撤销（删不存在返回 `deleted: false`） |
 | `config/get` \| `config/set` | `ConfigGetParams`/`ConfigSetParams` | 分层配置读写，返回 per-key `origin` |
 | `prompt/render` | `PromptRenderParams` → `PromptRenderResult` | 导出完整 system prompt + 每 section 来源 |
-| `store/export_jsonl` | `ExportJsonlParams` → `ExportJsonlResult` | 审计导出（ADR-0002） |
+| `store/export_jsonl` | `ExportJsonlParams` → `ExportJsonlResult` | 审计导出（ADR-0002）；`path` 必须是绝对路径，回复返回实际写入的路径 |
 
 不建路由 trait：daemon 是 M1 的事，现在只需要常量与类型（ADR-0009 反预拆分）。
 
@@ -208,7 +208,7 @@ pub enum DaemonEvent { DaemonShuttingDown { reason: String } }   // 非会话级
 - 事件顺序保证：同一 session 内严格有序（单连接 FIFO + daemon 内 per-session 广播队列）。
 - 只有 `TextDelta`/`ReasoningDelta` 允许 daemon 侧合并（`ServerEvent::is_coalescable`）；控制事件不合并、不乱序。合并**策略**本身排 M3：M2 新增的事件量主要来自 `ToolCallProgress`，而它不可合并，所以调这个窗口治不了 M2 的病。
 - 迟加入的前端：`session/load` 返回 active 分支 items（或 `replay_from` 之后的增量），随后接实时流。
-- **历史移动不加新事件**（M2 Phase 3 的约定）：`session/rewind`、`branch/switch`、`edit_item` 都会让前端已投影的链失效，但新增事件 `type` 属 major bump（§6），所以不为它开变体。`SessionUpdated.state.active_branch_head` **已经在广播里**：前端发现新 head 不是自己已投影 head 的后继，就发 `session/load` 重建；发起方本来就能在自己的回复里拿到新 Session，不需要事件。
+- **历史移动不加新事件**（M2 Phase 3 的约定）：`session/rewind`、`branch/switch`、`edit_item` 都会让前端已投影的链失效，但新增事件 `type` 属 major bump（§6），所以不为它开变体。`SessionUpdated.state.active_branch_head` **已经在广播里**：前端发现新 head 不是自己已投影 head 的后继，就发 `session/load` 重建；发起方本来就能在自己的回复里拿到新 Session，不需要事件。`session/branch/delete` 删的是不在 head 上的子树，head 不变、上述信号不会触发，所以它**额外发一次 `SessionUpdated`**（`updated_at` 已变）作为「去重列分支」的提示。
 - 终止事件唯一：`TurnFinished` 或 `TurnFailed`（`ServerEvent::ends_turn`）。
 
 ## 5. 错误模型

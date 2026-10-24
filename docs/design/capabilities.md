@@ -129,9 +129,9 @@ pub struct RestoreOptions {
     pub purge_untracked: bool,
 }
 pub struct RestoreReport { pub safety: SnapshotReport, pub rolled_back: Vec<PathBuf>, pub purged: Vec<PathBuf> }
-// rolled_back 同时算两侧：最后快照与目标之间的差异，以及「快照之后、尚未入快照」的工作区漂移。
-// 快照总在写之前拍，所以后者正是 Code rewind 的常见路径；只报 commit 级差异会说「什么都没回滚」
-// 而文件其实已经被改写。
+// rolled_back 是「目标树 vs 工作区」的 diff（含 rename 两侧），也就是 reset 真正会改的路径集合。
+// 不能拿「最后快照 vs 目标」算：快照在写之前拍，HEAD 会落后于工作区；而快照又会保留用户已删的
+// 文件，只看两个 commit 既会漏报也会误报。untracked 由 include_untracked(false) 排除，purge 单列。
 
 impl CheckpointStore {
     pub fn open(workspace: &Path, git_dir: &Path, options: &CheckpointOptions) -> Result<Arc<Self>>;

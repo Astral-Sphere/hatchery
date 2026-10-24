@@ -37,6 +37,16 @@
 
 ## 变更日志
 
+### 2026-10-24 · 评审⑧：并发读、编辑顺序与一批契约修复
+
+**两个 Critical**：① `prompt` 的 session 快照在 turn 闸门外读，而 `set_mode` 在同一闸门内写库——并发时按旧模式装配，库说 code、runtime 仍是 chat 的工具表。改为闸门内重读并复核 generation。② `edit_item` 先 `rewind_code` 再 `edit_fork`，对 ToolCall/Checkpoint 行发 `edit + both` 会先回滚工作区、再返回 `NotEditable`，用户被告知失败但文件已经变了。改为新增 `SessionStore::ensure_editable`（与 `edit_fork` 共用一个 `ensure_editable_item`），restore 前先拒绝。
+
+**生命周期与契约**：`TurnEnded` 现在调用 `PendingApprovals::cancel_session`，`DaemonApproval::request` 在 `in_flight` 为假时直接 deny——取消的 turn 不会在 `session/load` 里留下「idle + 待审批」，也不会为一次没跑的调用写持久规则。`set_mode` 装配失败时回滚模式行并广播 `SessionUpdated`，重试不会再被 `mode ==` 早退吞掉事件。`rolled_back` 改为「目标树 vs 工作区」的 tracked diff（含 rename 两侧）：原来的「commit 差异 ∪ 工作区漂移」既漏「快照之后、尚未入快照的写」，也误报「内容已经等于目标」的路径；`worktree_drift` 随之删除。导出要求绝对路径并回显 canonicalize 后的路径；`branch_delete` 补发 `SessionUpdated`（子树删除不动 head）；`ItemNotFound` 从 `SessionNotFound` 改映射 `InvalidRequest`。`Checkpoints::restore` 不再接 `RestoreOptions`（purge 硬编码 false，守卫与删除同层）；同一安全 commit 不重复插行；安全提交在 reset 前先挂 `refs/hatchery/safety`，重置中途失败仍可寻址。`SessionDeleteParams` 增加 `#[serde(default)] confirm`。
+
+**测试**：补 `edit_item` 成功/失败顺序、`Both` 成功路径、purge 拒绝的「文件确实没删」、Code 腿只在 target 之后找 checkpoint、`set_mode` 活 runtime 重组装、`load` 的重连审批、删除确认、相对导出路径、分支删除事件，以及 `cancelling_a_session_drops_every_waiter_it_had`。capabilities 的「工作区已等于目标 → rolled_back 为空」也补了一条。
+
+**验证**：`./scripts/ci.sh` 全绿；`cargo xtask coverage` 全部 gated crate 达标。`purge_untracked` 的清单/审批流程仍未做，归属不变（Phase 7）。
+
 ### 2026-10-22 · M2 Phase 3：会话级方法、rewind 三 scope 与重连审批
 
 **交付**：全部协议方法接通（`SERVED_METHODS == m::ALL`，测试钉住），`hello` 广告 chat + code。`session/set_mode` 是重组装路径：turn 闸门内写行、取走旧 runtime 并 `shutdown`、按新模式重新装配，hub 不删所以订阅者不断流，随后发 `ModeSwitched` + `SessionUpdated`；turn 进行中回 `TurnInProgress`；Code 无工作区在写库前拒绝。rewind：Code 腿沿 `rebuild_chain` 向后扫第一个 `ItemKind::Checkpoint` 取 commit（不查 `checkpoints` 表），没有则 no-op；`Both` 先 restore 成功再 `switch_branch`；restore 的安全快照由 capabilities 在破坏前拍，daemon 的 `Checkpoints::restore` 补写 `checkpoints` 行（`item_id = NULL`，写失败只记日志）。分支 list/switch/delete、`edit_item`、rename/delete、`store/export_jsonl` 全部接线；除 list/export 外都在 turn 闸门内并在 turn 进行中拒绝。`SessionLoadResult.pending_approvals` 落地：`PendingApprovals` 的值从 sender 变成 `{session, request, sender}`，`for_session` 按 id 排序返回，答复即移除。
