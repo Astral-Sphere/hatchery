@@ -102,6 +102,10 @@ fn builtin_document() -> toml::Table {
         "approval".to_owned(),
         toml_value_of(&BuiltinApproval::default()),
     );
+    document.insert(
+        "context".to_owned(),
+        toml_value_of(&BuiltinContext::default()),
+    );
     document.insert("providers".to_owned(), toml::Value::Table(providers));
     document
 }
@@ -210,6 +214,27 @@ impl Default for BuiltinApproval {
     }
 }
 
+/// The `[context]` keys the assembler reads.
+///
+/// One number, because the estimator is a heuristic and the model's context window varies:
+/// 96k is a safe default for the current generation of providers, and an operator running a
+/// 32k model needs a way to say so. A value below the floor is clamped, not honoured: a budget
+/// that cannot hold the prompt plus one exchange would trim away the conversation the user is
+/// having.
+#[derive(Clone, Debug, Serialize)]
+pub struct BuiltinContext {
+    /// The most input tokens one provider request may carry.
+    pub max_input_tokens: u64,
+}
+
+impl Default for BuiltinContext {
+    fn default() -> Self {
+        Self {
+            max_input_tokens: 96_000,
+        }
+    }
+}
+
 /// Keys whose parse failure must not degrade (M2's approval rules and friends).
 ///
 /// The strict path has two halves, both wired now: a **project-layer** assignment to one of these
@@ -235,6 +260,7 @@ pub fn is_known_key(path: &str) -> bool {
         "approval.timeout_seconds",
         "approval.allow",
         "approval.deny",
+        "context.max_input_tokens",
     ];
     if known_static.contains(&path) || STRICT_KEYS.contains(&path) {
         return true;
@@ -263,7 +289,7 @@ pub fn is_known_key(path: &str) -> bool {
         // is treated as unknown rather than honoured.
         (
             Some("ui") | Some("daemon") | Some("checkpoints") | Some("providers")
-            | Some("approval"),
+            | Some("approval") | Some("context"),
             None,
             None,
         ) => false,
@@ -551,6 +577,27 @@ impl LayeredConfig {
         }
     }
 
+    /// The `[context]` view.
+    ///
+    /// A non-positive or absent value falls back to the built-in default; a value below
+    /// [`MIN_INPUT_TOKENS`] is clamped. The clamp is the same discipline as the approval
+    /// timeout's floor: a number that would make the feature useless is not honoured.
+    #[must_use]
+    pub fn context(&self) -> ContextConfig {
+        let defaults = BuiltinContext::default();
+        let inner = self.inner.read().expect("config is not poisoned");
+        let tokens = inner
+            .effective
+            .get_dotted("context.max_input_tokens")
+            .and_then(toml::Value::as_integer)
+            .filter(|tokens| *tokens > 0)
+            .map_or(defaults.max_input_tokens, |tokens| tokens as u64)
+            .max(MIN_INPUT_TOKENS as u64);
+        ContextConfig {
+            max_input_tokens: usize::try_from(tokens).unwrap_or(usize::MAX),
+        }
+    }
+
     /// Every configured provider, built-ins deep-merged under the user's entries.
     #[must_use]
     pub fn providers(&self) -> BTreeMap<String, ProviderConfig> {
@@ -635,6 +682,18 @@ pub struct ApprovalConfig {
     /// Tools the user pre-refused, by name.
     pub deny: Vec<String>,
 }
+
+/// The `[context]` view, typed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ContextConfig {
+    /// The most input tokens one provider request may carry.
+    pub max_input_tokens: usize,
+}
+
+/// The floor a configured budget is clamped to. A budget this small still holds the system
+/// prompt and one exchange; below it the trimmer would start deleting the conversation the user
+/// is currently having, which is not a trade a configuration number should be able to make.
+pub const MIN_INPUT_TOKENS: usize = 4_096;
 
 /// Per-key validation of a layer document: unknown dotted keys are dropped, loudly, and so are
 /// known keys whose value has the wrong type (the typed views then take their defaults, and the
@@ -1155,5 +1214,53 @@ mod tests {
             "writing through a table path works"
         );
         assert_eq!(table["branch"]["leaf"].as_integer(), Some(3));
+    }
+}
+
+#[cfg(test)]
+mod context_tests {
+    use super::*;
+
+    fn table(source: &str) -> toml::Table {
+        toml::from_str(source).expect("test TOML")
+    }
+
+    #[test]
+    fn the_context_budget_defaults_to_96k() {
+        let config = LayeredConfig::from_layers(vec![]);
+        assert_eq!(config.context().max_input_tokens, 96_000);
+    }
+
+    #[test]
+    fn a_configured_budget_is_read_and_clamped_to_the_floor() {
+        let configured = LayeredConfig::from_layers(vec![(
+            ConfigOrigin::User,
+            table("context.max_input_tokens = 32000"),
+        )]);
+        assert_eq!(configured.context().max_input_tokens, 32_000);
+
+        for value in ["0", "-5"] {
+            let defaulted = LayeredConfig::from_layers(vec![(
+                ConfigOrigin::User,
+                table(&format!("context.max_input_tokens = {value}")),
+            )]);
+            assert_eq!(
+                defaulted.context().max_input_tokens,
+                96_000,
+                "{value} is not a budget; the default applies"
+            );
+        }
+
+        let clamped = LayeredConfig::from_layers(vec![(
+            ConfigOrigin::User,
+            table("context.max_input_tokens = 10"),
+        )]);
+        assert_eq!(clamped.context().max_input_tokens, MIN_INPUT_TOKENS);
+    }
+
+    #[test]
+    fn context_is_a_known_key_but_the_whole_table_is_not() {
+        assert!(is_known_key("context.max_input_tokens"));
+        assert!(!is_known_key("context"));
     }
 }

@@ -14,10 +14,13 @@ authors.workspace = true
 
 [dependencies]
 async-trait.workspace = true
+ferritls-rustls.workspace = true
 globset.workspace = true
 hatchery-capabilities.workspace = true
 hatchery-kernel.workspace = true
 hatchery-protocol.workspace = true
+htmd.workspace = true
+reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
@@ -31,6 +34,7 @@ tracing.workspace = true
 hatchery-testkit.workspace = true
 tempfile.workspace = true
 tokio-util.workspace = true
+wiremock.workspace = true
 
 # This crate does NOT inherit the workspace lints, on purpose: inherited and local lint tables
 # cannot mix (cargo refuses the manifest), and invariant 4 (ADR-0004) needs the two

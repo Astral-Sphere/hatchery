@@ -54,6 +54,11 @@ pub struct StoreHistory {
     echo_reasoning: bool,
     /// The rendered prompt, frozen for this runtime's life; `None` sends no system message.
     system: Option<String>,
+    /// The most input tokens the assembled request may claim (M2 Phase 4, `[context]`).
+    ///
+    /// The trimmer below is the only consumer. `usize::MAX` disables trimming, which the tests
+    /// use to keep their expectations about the recorded history literal.
+    budget: usize,
 }
 
 impl StoreHistory {
@@ -64,12 +69,14 @@ impl StoreHistory {
         session: SessionId,
         echo_reasoning: bool,
         system: Option<String>,
+        budget: usize,
     ) -> Self {
         Self {
             store,
             session,
             echo_reasoning,
             system,
+            budget,
         }
     }
 }
@@ -158,11 +165,113 @@ impl HistorySource for StoreHistory {
             }
         }
 
+        trim_to_budget(&mut messages, self.budget);
+
         Ok(HistoryView {
             head: session.active_branch_head,
             messages,
         })
     }
+}
+
+/// Trims a reassembled conversation to a token budget (kernel.md §6, M2 Phase 4).
+///
+/// Two steps, in this order, because they cost different things:
+///
+/// 1. **Shave tool results**, oldest first. A shell log is the largest thing in a request and
+///    the least useful in full once it is several rounds old.
+/// 2. **Drop the oldest round**, where a round is a user message plus everything until the next
+///    user message, so an assistant's tool calls never survive without their results.
+///
+/// The system prompt and the newest user message are never dropped: the first is the
+/// instructions, the second is the request. If the newest round alone exceeds the budget, it is
+/// sent anyway — a provider rejecting an oversized request is a visible failure, while silently
+/// deleting the user's question is not.
+///
+/// The estimate is deliberately crude: ASCII at four characters per token, every non-ASCII
+/// character as one token (CJK is close to one per character), four tokens of per-message
+/// overhead. It is a guardrail, not a tokenizer; the `[context]` key is where an operator
+/// corrects it for a model whose window differs.
+fn trim_to_budget(messages: &mut Vec<Message>, budget: usize) {
+    if budget == 0 || estimate_tokens(messages) <= budget {
+        return;
+    }
+    for index in 0..messages.len() {
+        if !messages[index].is_tool_result()
+            || messages[index].content.text.chars().count() <= TOOL_RESULT_KEEP_CHARS
+        {
+            continue;
+        }
+        shave(&mut messages[index].content.text, TOOL_RESULT_KEEP_CHARS);
+        if estimate_tokens(messages) <= budget {
+            return;
+        }
+    }
+    loop {
+        if estimate_tokens(messages) <= budget {
+            return;
+        }
+        let Some(start) = messages
+            .iter()
+            .position(|message| message.role == Role::User)
+        else {
+            return;
+        };
+        let Some(offset) = messages[start + 1..]
+            .iter()
+            .position(|message| message.role == Role::User)
+        else {
+            return;
+        };
+        messages.drain(start..start + 1 + offset);
+    }
+}
+
+/// How much of one old tool result survives the shave, in characters.
+const TOOL_RESULT_KEEP_CHARS: usize = 4_000;
+
+fn shave(text: &mut String, keep: usize) {
+    let end = text
+        .char_indices()
+        .nth(keep)
+        .map(|(index, _)| index)
+        .unwrap_or(text.len());
+    if end == text.len() {
+        return;
+    }
+    let removed = text.chars().count() - keep;
+    text.truncate(end);
+    text.push_str(&format!("\n… [{removed} characters trimmed for context]"));
+}
+
+fn estimate_tokens(messages: &[Message]) -> usize {
+    messages.iter().map(message_tokens).sum()
+}
+
+fn message_tokens(message: &Message) -> usize {
+    const OVERHEAD: usize = 4;
+    let mut tokens = OVERHEAD + text_tokens(&message.content.text);
+    if let Some(reasoning) = &message.reasoning {
+        tokens += text_tokens(&reasoning.text);
+    }
+    for call in &message.tool_calls {
+        tokens += text_tokens(&call.name);
+        tokens += text_tokens(&call.args.to_string());
+    }
+    tokens
+}
+
+fn text_tokens(text: &str) -> usize {
+    let mut ascii = 0_usize;
+    let mut non_ascii = 0_usize;
+    for character in text.chars() {
+        if character.is_ascii() {
+            ascii += 1;
+        } else {
+            non_ascii += 1;
+        }
+    }
+    ascii.div_ceil(4) + non_ascii
 }
 
 /// Projects kernel events onto the hub and the store.
@@ -429,6 +538,8 @@ pub struct RuntimeParts {
     pub approvals: Arc<crate::approvals::PendingApprovals>,
     /// How long the local gate waits before answering deny (fail closed).
     pub approval_timeout: std::time::Duration,
+    /// The input-token budget the assembler trims to (`[context] max_input_tokens`).
+    pub history_budget: usize,
 }
 
 /// One assembled, running session.
@@ -480,6 +591,7 @@ impl SessionRuntime {
             prompt,
             approvals,
             approval_timeout,
+            history_budget,
         } = parts;
         let in_flight = Arc::new(AtomicBool::new(false));
         let (approval_tx, approval_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -497,6 +609,7 @@ impl SessionRuntime {
                 session.id,
                 echo_reasoning,
                 Some(crate::prompt::join(&prompt)),
+                history_budget,
             )),
             Arc::new(HubSink::new(
                 session.id,
@@ -685,7 +798,7 @@ mod tests {
     #[tokio::test]
     async fn the_chain_rebuilds_the_provider_request_exactly() {
         let (_dir, store, session) = store_with_items(true).await;
-        let history = StoreHistory::new(store, session, true, None);
+        let history = StoreHistory::new(store, session, true, None, usize::MAX);
         let view = history.view().await.expect("view");
 
         assert_eq!(
@@ -718,7 +831,7 @@ mod tests {
     #[tokio::test]
     async fn reasoning_is_dropped_when_the_provider_does_not_echo() {
         let (_dir, store, session) = store_with_items(false).await;
-        let view = StoreHistory::new(store, session, false, None)
+        let view = StoreHistory::new(store, session, false, None, usize::MAX)
             .view()
             .await
             .expect("view");
@@ -758,7 +871,7 @@ mod tests {
             .await
             .expect("append");
 
-        let view = StoreHistory::new(store, session_id, false, None)
+        let view = StoreHistory::new(store, session_id, false, None, usize::MAX)
             .view()
             .await
             .expect("view");
@@ -774,7 +887,7 @@ mod tests {
     #[tokio::test]
     async fn checkpoints_are_not_provider_visible() {
         let (_dir, store, session) = store_with_items(true).await;
-        let view = StoreHistory::new(store, session, true, None)
+        let view = StoreHistory::new(store, session, true, None, usize::MAX)
             .view()
             .await
             .expect("view");
@@ -792,8 +905,13 @@ mod tests {
     #[tokio::test]
     async fn the_prompt_leads_the_view_and_does_not_move_between_views() {
         let (_dir, store, session) = store_with_items(true).await;
-        let history =
-            StoreHistory::new(store, session, true, Some("the shipped prompt".to_owned()));
+        let history = StoreHistory::new(
+            store,
+            session,
+            true,
+            Some("the shipped prompt".to_owned()),
+            usize::MAX,
+        );
 
         let first = history.view().await.expect("view");
         assert_eq!(
@@ -948,5 +1066,77 @@ mod tests {
                 .is_empty(),
             "nothing to index without a workspace"
         );
+    }
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+
+    /// Two rounds, one oversized tool result, and the user's current message.
+    fn conversation() -> Vec<Message> {
+        vec![
+            Message::system("system"),
+            Message::user("first question"),
+            Message::assistant("first answer"),
+            Message::user("second question"),
+            Message::tool_result("call", "x".repeat(TOOL_RESULT_KEEP_CHARS * 2), false),
+            Message::assistant("second answer"),
+            Message::user("latest"),
+        ]
+    }
+
+    #[test]
+    fn a_conversation_under_budget_is_untouched() {
+        let mut messages = conversation();
+        let before = messages.clone();
+        trim_to_budget(&mut messages, usize::MAX);
+        assert_eq!(messages, before);
+    }
+
+    #[test]
+    fn tool_results_are_shaved_before_a_round_is_dropped() {
+        let mut messages = conversation();
+        trim_to_budget(&mut messages, 1_300);
+        assert_eq!(messages.len(), 7, "nothing was dropped");
+        assert!(
+            messages[4].content.text.contains("trimmed for context"),
+            "{}",
+            messages[4].content.text
+        );
+        assert!(estimate_tokens(&messages) <= 1_300);
+    }
+
+    #[test]
+    fn the_oldest_round_goes_first_and_the_system_prompt_stays() {
+        let mut messages = conversation();
+        trim_to_budget(&mut messages, 40);
+        assert_eq!(messages[0].role, Role::System);
+        assert_eq!(messages[0].content.text, "system");
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.content.text == "latest"),
+            "{messages:?}"
+        );
+        assert!(
+            !messages
+                .iter()
+                .any(|message| message.content.text == "first question"),
+            "the oldest round was not dropped: {messages:?}"
+        );
+    }
+
+    #[test]
+    fn the_latest_user_message_is_never_dropped() {
+        let mut messages = vec![Message::system("s"), Message::user("only question")];
+        trim_to_budget(&mut messages, 1);
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[1].content.text, "only question");
+    }
+
+    #[test]
+    fn non_ascii_text_costs_more_than_an_ascii_string_of_the_same_length() {
+        assert!(text_tokens("你好世界") > text_tokens("abcd"));
     }
 }

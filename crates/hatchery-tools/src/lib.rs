@@ -54,13 +54,17 @@ mod grep;
 mod hard_gate;
 mod preview;
 mod read_file;
+mod shell;
 mod walk;
+mod web_fetch;
 mod write_file;
 
 pub use edit::Edit;
 pub use glob::Glob;
 pub use grep::Grep;
 pub use read_file::{DEFAULT_MAX_BYTES, ReadFile};
+pub use shell::{MAX_TIMEOUT_SECS, Shell};
+pub use web_fetch::WebFetch;
 pub use write_file::WriteFile;
 
 /// The `read_file` tool, boxed for registry assembly.
@@ -93,6 +97,18 @@ pub fn edit() -> std::sync::Arc<dyn Tool> {
     std::sync::Arc::new(Edit::new())
 }
 
+/// The `shell` tool, boxed for registry assembly.
+#[must_use]
+pub fn shell() -> std::sync::Arc<dyn Tool> {
+    std::sync::Arc::new(Shell::new())
+}
+
+/// The `web_fetch` tool, boxed for registry assembly.
+#[must_use]
+pub fn web_fetch() -> std::sync::Arc<dyn Tool> {
+    std::sync::Arc::new(WebFetch::new())
+}
+
 /// A built-in tool by name, boxed for registry assembly.
 ///
 /// There is no per-tool configuration parameter yet: nothing in the tree assembles tools from a
@@ -106,6 +122,8 @@ pub fn builtin(name: &str) -> Option<std::sync::Arc<dyn Tool>> {
         "grep" => Some(grep()),
         "write_file" => Some(write_file()),
         "edit" => Some(edit()),
+        "shell" => Some(shell()),
+        "web_fetch" => Some(web_fetch()),
         _ => None,
     }
 }
@@ -119,11 +137,22 @@ pub fn chat_tools() -> Vec<std::sync::Arc<dyn Tool>> {
     vec![read_file(), glob(), grep()]
 }
 
-/// Code mode's toolset: Chat's trio plus the write pair.
+/// Code mode's toolset: Chat's trio plus the write pair, the shell and the network fetch.
 ///
 /// Same contract as [`chat_tools`] — the list is the decision about what Code may be shown, and
-/// every tool that writes is here and nowhere in Chat.
+/// every tool that writes, runs processes or reaches the network is here and nowhere in Chat.
+/// `web_fetch` is deliberately absent from Chat: ADR-0005 calls Chat approval-free, and a
+/// Network-risk tool there would either hang on an approval nobody can answer or need a second
+/// policy (capabilities.md §3 records the deviation).
 #[must_use]
 pub fn code_tools() -> Vec<std::sync::Arc<dyn Tool>> {
-    vec![read_file(), glob(), grep(), write_file(), edit()]
+    vec![
+        read_file(),
+        glob(),
+        grep(),
+        write_file(),
+        edit(),
+        shell(),
+        web_fetch(),
+    ]
 }

@@ -18,6 +18,7 @@ use hatchery_protocol::{ToolCallSummary, ToolProgress};
 
 use crate::checkpointed_fs::{CheckpointedFs, Checkpointer};
 use crate::fs::FsBackend;
+use crate::spill::{self, SpillSink};
 use crate::terminal::TerminalBackend;
 use crate::tool::{Tool, ToolCtx, ToolError};
 
@@ -33,6 +34,9 @@ pub struct Backends {
     /// `None` for a Chat session. For a Code one the daemon supplies an implementation that owns the
     /// budget decision (D9) and delegates to the workspace's [`crate::CheckpointStore`].
     pub checkpointer: Option<Arc<dyn Checkpointer>>,
+    /// Where oversized tool output is written (D12). `None` means the registry truncates instead:
+    /// the model still gets a bounded result, it just cannot follow the reference.
+    pub spill: Option<Arc<dyn SpillSink>>,
 }
 
 /// The tools of one session, keyed by name.
@@ -154,19 +158,23 @@ impl ToolHost for ToolRegistry {
             _ = cancel.cancelled() => Err(ToolError::Cancelled),
             executed = tool.execute(ctx, args) => executed,
         };
-        Ok(match result {
-            Ok(output) => ToolInvocation::ok(output),
+        let (output, is_error) = match result {
+            Ok(output) => (output, false),
             Err(ToolError::Cancelled) => {
                 // The kernel treats the tool as interrupted and records `Cancelled` itself; the
                 // message only has to explain if it ever leaks into a result.
-                ToolInvocation::failed(hatchery_protocol::ToolOutput::text(
-                    "the call was cancelled",
-                ))
+                (
+                    hatchery_protocol::ToolOutput::text("the call was cancelled"),
+                    true,
+                )
             }
-            Err(error) => {
-                ToolInvocation::failed(hatchery_protocol::ToolOutput::text(error.to_string()))
-            }
-        })
+            Err(error) => (hatchery_protocol::ToolOutput::text(error.to_string()), true),
+        };
+        // The seam is where the output leaves the backend: redact once, then bound the text.
+        // Doing either later would make the stored history differ from the request it is meant
+        // to reproduce (invariant 2), and would let a secret reach the model in between.
+        let output = spill::contain(name, output, self.backends.spill.as_deref()).await;
+        Ok(ToolInvocation { output, is_error })
     }
 }
 
@@ -255,6 +263,7 @@ mod tests {
             fs: Arc::new(NoFs),
             terminal: Arc::new(NoTerminal),
             checkpointer: None,
+            spill: None,
         }
     }
 
@@ -343,6 +352,7 @@ mod tests {
             fs: Arc::new(NoFs),
             terminal: Arc::new(NoTerminal),
             checkpointer: Some(Arc::new(OneCheckpoint)),
+            spill: None,
         });
         reg.register(Arc::new(Writes));
 
@@ -461,16 +471,17 @@ mod tests {
         );
     }
 
-    // TerminalOutcome is part of the seam's M1 shape; keep it exercised even though no M1 tool
+    // TerminalOutcome is part of the seam's shape; keep it exercised even though no M1 tool
     // runs a process.
     #[test]
-    fn terminal_outcome_carries_both_streams_and_the_code() {
+    fn terminal_outcome_carries_the_merged_stream_and_the_code() {
         let outcome = TerminalOutcome {
-            stdout: "out".to_owned(),
-            stderr: "err".to_owned(),
+            output: "out\nerr\n".to_owned(),
             exit_code: Some(0),
+            dropped_bytes: 0,
         };
-        assert_eq!(outcome.stdout, "out");
+        assert_eq!(outcome.output, "out\nerr\n");
         assert_eq!(outcome.exit_code, Some(0));
+        assert!(outcome.is_success());
     }
 }

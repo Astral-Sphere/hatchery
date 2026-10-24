@@ -35,6 +35,22 @@ regex = "1.13.1"
 # Write-approval previews (D14): the same structured-diff producer the TUI uses for its own
 # diffs. `text` alone is enough — no inline/serde/git feature reaches the binary.
 similar = { version = "2.7", default-features = false, features = ["text"] }
+# The PTY substrate for `shell` (D10). Unix only: the Windows column is deferred until after the
+# TUI, and containment there needs a Job Object portable-pty 0.9 does not have. `nix` is used for
+# one thing the library does not offer — a process-group SIGKILL — and is already in
+# portable-pty's own graph, so naming it directly adds no crate to the lock.
+portable-pty = "0.9.0"
+nix = { version = "0.30", default-features = false, features = ["signal", "process"] }
+# `web_fetch` (D17): the HTTP client is the version the LLM adapter already links, with TLS
+# provided process-wide by the daemon at startup. `htmd` is the HTML-to-markdown half; both were
+# chosen together because the dependency surface is one decision.
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
+htmd = "0.5.6"
+# The project's rustls backend (already in the tree through the LLM adapter). `web_fetch` names
+# it because reqwest with `rustls-no-provider` needs a process-wide provider even for plain HTTP
+# client construction, and a tools-only test has no daemon to install one. Default features are
+# off to match openai-interface: `simd` is nightly-only (`portable_simd`).
+ferritls-rustls = { version = "0.8.1", default-features = false }
 async-trait = "0.1.92"
 futures = "0.3.34"
 # ADR-0013: the daemon's local socket on the platform tokio cannot give one to. tokio gates

@@ -36,6 +36,7 @@
 //!     terminal: Arc::new(hatchery_capabilities::NoTerminal),
 //!     // `None` is Chat: nothing writes, so there is nothing to checkpoint.
 //!     checkpointer: None,
+//!     spill: None,
 //! };
 //! let mut registry = ToolRegistry::new(backends);
 //! // registry.register(Arc::new(hatchery_tools::read_file())); — in the daemon's assembly
@@ -51,8 +52,11 @@ mod checkpoint;
 mod checkpointed_fs;
 mod fs;
 mod local_fs;
+mod local_pty;
 mod mode;
+mod redact;
 mod registry;
+mod spill;
 mod terminal;
 mod tool;
 
@@ -64,8 +68,11 @@ pub use checkpoint::{
 pub use checkpointed_fs::{CheckpointedFs, Checkpointer, PreWrite};
 pub use fs::{FsBackend, FsEntry, FsError, FsMetadata};
 pub use local_fs::LocalFs;
+pub use local_pty::LocalPty;
 pub use mode::ToolPolicy;
+pub use redact::redact;
 pub use registry::{Backends, ToolRegistry};
+pub use spill::{FileSpill, MAX_INLINE_BYTES, SpillSink};
 pub use terminal::{
     NoTerminal, TermError, TerminalBackend, TerminalHandle, TerminalOutcome, TerminalSpec,
 };

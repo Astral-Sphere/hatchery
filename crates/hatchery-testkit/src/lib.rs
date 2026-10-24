@@ -27,6 +27,7 @@ pub mod history;
 pub mod model;
 pub mod provider;
 pub mod sink;
+pub mod terminal;
 pub mod tools;
 pub mod wire;
 
@@ -38,5 +39,6 @@ pub use history::MemoryHistory;
 pub use model::{ChainShape, ReferenceTree};
 pub use provider::{RecordedRequest, ScriptedProvider};
 pub use sink::RecordingSink;
+pub use terminal::{MemoryTerminal, Script};
 pub use tools::{RecordedCall, ScriptedApproval, ScriptedToolHost, answer_approvals};
 pub use wire::{MockWire, RecordedWireRequest, json_fixture, sse_fixture};

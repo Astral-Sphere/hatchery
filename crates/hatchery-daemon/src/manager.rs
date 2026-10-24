@@ -1196,6 +1196,7 @@ impl SessionManager {
                     prompt,
                     approvals: Arc::clone(&self.pending),
                     approval_timeout: self.config.approval().timeout,
+                    history_budget: self.config.context().max_input_tokens,
                 },
             )
             .await
@@ -1329,7 +1330,7 @@ impl SessionManager {
             .workspace
             .clone()
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| self.data_dir.clone()));
-        let fs = hatchery_capabilities::LocalFs::new(root)
+        let fs = hatchery_capabilities::LocalFs::new(&root)
             .map_err(|error| ManagerError::new(ErrorCode::InternalError, error.to_string()))?;
         let checkpointer = match &session.workspace {
             Some(workspace) => Some(
@@ -1342,10 +1343,29 @@ impl SessionManager {
             ),
             None => None,
         };
+        // Code is the only mode that may run processes (ADR-0005). Chat keeps `NoTerminal`, so
+        // a model that invents a `shell` call is told the session has no terminal instead of
+        // the registry failing to dispatch.
+        let terminal: Arc<dyn hatchery_capabilities::TerminalBackend> =
+            if session.mode.as_str() == hatchery_protocol::SessionModeId::CODE {
+                Arc::new(
+                    hatchery_capabilities::LocalPty::new(&root).map_err(|error| {
+                        ManagerError::new(ErrorCode::InternalError, error.to_string())
+                    })?,
+                )
+            } else {
+                Arc::new(hatchery_capabilities::NoTerminal)
+            };
         let backends = hatchery_capabilities::Backends {
             fs: Arc::new(fs),
-            terminal: Arc::new(hatchery_capabilities::NoTerminal),
+            terminal,
             checkpointer,
+            // D12: the daemon's own directory, beside the store and the shadow repositories.
+            // The design sketch said `~/.local/state`; the manager already owns one root and
+            // threading a second XDG root through every constructor would buy nothing.
+            spill: Some(Arc::new(hatchery_capabilities::FileSpill::new(
+                self.data_dir.join("tool-results"),
+            ))),
         };
         let policy = Self::policy_for(&session.mode);
         let mut registry = hatchery_capabilities::ToolRegistry::new(backends);

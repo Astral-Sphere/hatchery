@@ -17,6 +17,7 @@ async-trait.workspace = true
 git2.workspace = true
 hatchery-kernel.workspace = true
 hatchery-protocol.workspace = true
+regex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
@@ -31,6 +32,10 @@ uuid.workspace = true
 [dev-dependencies]
 hatchery-testkit.workspace = true
 tempfile.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+portable-pty.workspace = true
+nix.workspace = true
 
 [lints]
 workspace = true

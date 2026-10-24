@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use hatchery_capabilities::{Backends, Tool, ToolRegistry};
+use hatchery_capabilities::{Backends, FsBackend as _, Tool, ToolRegistry};
 use hatchery_kernel::{ApprovalNeed, CheckpointCollector, ToolHost};
 use hatchery_protocol::ApprovalOption;
 use hatchery_testkit::MemoryFs;
@@ -19,6 +19,7 @@ fn registry_on_disk(root: &std::path::Path) -> ToolRegistry {
         // None, as in a Chat session: these tools only read, so there is nothing to checkpoint.
         // The write path's checkpoint wiring is covered in `hatchery-capabilities`.
         checkpointer: None,
+        spill: None,
     };
     let mut registry = ToolRegistry::new(backends);
     for tool in hatchery_tools::chat_tools() {
@@ -40,6 +41,7 @@ fn registry_with(fs: Arc<MemoryFs>, tools: Vec<Arc<dyn Tool>>) -> ToolRegistry {
         fs,
         terminal: Arc::new(hatchery_capabilities::NoTerminal),
         checkpointer: None,
+        spill: None,
     };
     let mut registry = ToolRegistry::new(backends);
     for tool in tools {
@@ -72,13 +74,21 @@ fn the_chat_catalogue_is_sorted_and_matches_the_dispatch_table() {
 }
 
 #[test]
-fn the_code_catalogue_adds_the_write_pair_and_stays_sorted() {
+fn the_code_catalogue_adds_the_write_pair_the_shell_and_the_network() {
     let registry = code_registry_on(Arc::new(MemoryFs::new()));
     let snapshot = registry.snapshot();
     let names: Vec<&str> = snapshot.iter().map(|def| def.name.as_str()).collect();
     assert_eq!(
         names,
-        ["edit", "glob", "grep", "read_file", "write_file"],
+        [
+            "edit",
+            "glob",
+            "grep",
+            "read_file",
+            "shell",
+            "web_fetch",
+            "write_file"
+        ],
         "sorted for prompt-cache stability"
     );
     for def in &snapshot {
@@ -88,6 +98,18 @@ fn the_code_catalogue_adds_the_write_pair_and_stays_sorted() {
             def.name
         );
     }
+}
+
+#[test]
+fn chat_does_not_offer_the_shell_or_the_network() {
+    let registry = registry_on(Arc::new(MemoryFs::new()));
+    let names: Vec<String> = registry
+        .snapshot()
+        .into_iter()
+        .map(|def| def.name)
+        .collect();
+    assert!(!names.contains(&"shell".to_owned()), "{names:?}");
+    assert!(!names.contains(&"web_fetch".to_owned()), "{names:?}");
 }
 
 #[tokio::test]
@@ -381,5 +403,108 @@ async fn a_symlink_loop_is_skipped_not_fatal_for_the_walk() {
         found.output.text.contains("plain.txt"),
         "{}",
         found.output.text
+    );
+}
+
+/// Both halves of Phase 4 in one path: the shell tool, the real PTY, the registry's progress
+/// channel and its output containment.
+#[cfg(unix)]
+#[tokio::test]
+async fn the_shell_tool_runs_a_real_command_through_the_pty_seam() {
+    let ws = hatchery_testkit::TempWorkspace::new();
+    let backends = Backends {
+        fs: Arc::new(hatchery_capabilities::LocalFs::new(ws.root()).expect("a workspace")),
+        terminal: Arc::new(hatchery_capabilities::LocalPty::new(ws.root()).expect("a terminal")),
+        checkpointer: None,
+        spill: None,
+    };
+    let mut registry = ToolRegistry::new(backends);
+    registry.register(hatchery_tools::shell());
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let invocation = registry
+        .invoke(
+            "shell",
+            serde_json::json!({"command": "printf 'hi\\n'; exit 2"}),
+            CancellationToken::new(),
+            tx,
+            CheckpointCollector::new(),
+        )
+        .await
+        .expect("dispatched");
+
+    assert!(!invocation.is_error, "{}", invocation.output.text);
+    assert!(
+        invocation.output.text.contains("hi"),
+        "{}",
+        invocation.output.text
+    );
+    assert!(
+        invocation.output.text.contains("[exit code: 2]"),
+        "a non-zero exit is reported, not hidden: {}",
+        invocation.output.text
+    );
+    let mut progress = String::new();
+    while let Ok(chunk) = rx.try_recv() {
+        progress.push_str(&chunk.chunk);
+    }
+    assert!(
+        progress.contains("hi"),
+        "progress reached the kernel channel"
+    );
+}
+
+#[tokio::test]
+async fn an_oversized_tool_result_is_spilled_at_the_registry_seam() {
+    let ws = hatchery_testkit::TempWorkspace::new();
+    let terminal = Arc::new(hatchery_testkit::MemoryTerminal::new());
+    terminal.echo(
+        ["x".repeat(hatchery_capabilities::MAX_INLINE_BYTES + 10)],
+        0,
+    );
+    let backends = Backends {
+        fs: Arc::new(MemoryFs::new()),
+        terminal,
+        checkpointer: None,
+        spill: Some(Arc::new(hatchery_capabilities::FileSpill::new(
+            ws.root().join("tool-results"),
+        ))),
+    };
+    let mut registry = ToolRegistry::new(backends);
+    registry.register(hatchery_tools::shell());
+
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let invocation = registry
+        .invoke(
+            "shell",
+            serde_json::json!({"command": "big"}),
+            CancellationToken::new(),
+            tx,
+            CheckpointCollector::new(),
+        )
+        .await
+        .expect("dispatched");
+
+    let spilled = invocation.output.spilled.expect("spilled");
+    assert!(
+        invocation.output.text.contains("full output at"),
+        "{}",
+        invocation.output.text
+    );
+    let relative = spilled
+        .path
+        .strip_prefix(ws.root())
+        .expect("the spill is inside the workspace");
+    // Read it back through the same seam the tools use: invariant 4 forbids this crate from
+    // touching the disk directly, tests included, and this also proves the file landed in the
+    // workspace rather than somewhere else.
+    let written = ws
+        .fs()
+        .read_text_file(&relative.to_string_lossy())
+        .await
+        .expect("the file");
+    assert!(
+        written.len() > hatchery_capabilities::MAX_INLINE_BYTES,
+        "the file holds the whole result, not the preview"
     );
 }
